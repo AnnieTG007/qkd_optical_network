@@ -1,22 +1,17 @@
-"""离散噪声功率谱生成脚本（终版）。
+"""Phase 4 噪声功率谱绘图脚本。
+
+生成以下对比图：
+  1. C 波段 4 种信号模型（Discrete / Rectangular / Raised Cosine / OSA）
+     的 FWM 噪声谱、SpRS 噪声谱、总噪声谱、信号谱 — 2×2 布局，W/dBm 各一张
+  2. 固定量子信道频率处，噪声功率随光纤长度（1–100 km）变化 — 1×3 布局
 
 运行方式：
     python scripts/plot_noise_spectrum.py
 
-物理模型（可在 CONFIG 块修改）：
-  - C 波段 WDM 网格，80 信道，50 GHz 间隔，中心 193.4 THz
-  - 经典信道（泵浦）由 CLASSICAL_INDICES 指定，其余信道同时作为量子信道
-  - 一次 compute_noise 计算全部量子信道的 SpRS + FWM 噪声
-  - 物理假设：经典信道与量子信道同向传播（co-propagating）
-  - 前向噪声 → 接收端 z=L（Bob）；后向噪声 → 发射端 z=0（Alice）
-
-输出（outputs/discrete_N{N_ch}_C{n_classical}/ 目录）：
-  signal_spectrum_W.png / signal_spectrum_dBm.png
-  sprs_noise_spectrum_W.png / sprs_noise_spectrum_dBm.png
-  fwm_noise_spectrum_W.png  / fwm_noise_spectrum_dBm.png
-  total_noise_spectrum_W.png / total_noise_spectrum_dBm.png
-  signal_spectrum.csv        （每行一个 WDM 信道，for Origin）
-  noise_spectrum.csv         （每行一个量子信道，含全部噪声分量 W/dBm）
+输出（outputs/phase4_N80_C3/ 目录）：
+  phase4_model_comparison_W.png
+  phase4_model_comparison_dBm.png
+  phase4_noise_vs_length.png
 """
 
 from __future__ import annotations
@@ -24,181 +19,312 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import numpy as np
 import matplotlib
-matplotlib.use("Agg")   # 无 GUI 后端，适合脚本保存文件
+import numpy as np
 
-# 将 src 加入路径（兼容直接 python 调用和 pytest）
+matplotlib.use("Agg")
+
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 
 from qkd_sim.config.schema import FiberConfig, WDMConfig
 from qkd_sim.physical.fiber import Fiber
-from qkd_sim.physical.signal import WDMGrid, SpectrumType, build_wdm_grid
-from qkd_sim.physical.noise import DiscreteSPRSSolver, DiscreteFWMSolver, compute_noise
-from qkd_sim.physical.spectrum import make_noise_figures
+from qkd_sim.physical.noise import DiscreteFWMSolver, DiscreteSPRSSolver, compute_noise
+from qkd_sim.physical.signal import (
+    SpectrumType, WDMGrid, build_frequency_grid, build_wdm_grid,
+)
+from qkd_sim.physical.spectrum import (
+    ModelLengthSweepResult,
+    ModelSpectrumResult,
+    get_model_color,
+    make_model_comparison_figure,
+    make_noise_vs_length_figure,
+)
 
 # ===========================================================================
-# CONFIG — 在此修改仿真参数
+# CONFIG
 # ===========================================================================
 
 FIBER_PARAMS = dict(
-    alpha_dB_per_km=0.2,        # 衰减 [dB/km]
-    gamma_per_W_km=1.3,         # 非线性系数 [1/(W·km)]
-    D_ps_nm_km=17.0,           # 色散 [ps/(nm·km)]
-    D_slope_ps_nm2_km=0.056,   # 色散斜率 [ps/(nm²·km)]
-    L_km=50.0,                 # 光纤长度 [km]
-    A_eff=80e-12,              # 有效模场面积 [m²]
-    rayleigh_coeff=4.8e-8,     # 瑞利散射系数 [1/m³]
-    T_kelvin=300.0,            # 温度 [K]
+    alpha_dB_per_km=0.2,
+    gamma_per_W_km=1.3,
+    D_ps_nm_km=17.0,
+    D_slope_ps_nm2_km=0.056,
+    L_km=50.0,
+    A_eff=80e-12,
+    rayleigh_coeff=4.8e-8,
+    T_kelvin=300.0,
 )
 
-# C 波段 WDM 网格（80 信道，50 GHz 间隔，中心 193.4 THz，~191.4–195.4 THz）
 WDM_PARAMS = dict(
-    f_center=193.4e12,         # C 波段中心频率 [Hz]
-    N_ch=80,                   # C 波段总信道数（50 GHz 间隔，~191.4–195.4 THz）
-    channel_spacing=50e9,     # 信道间隔 [Hz]
-    B_s=32e9,                  # 信号带宽 [Hz]
-    P0=1e-3,                   # 经典信道发射功率 [W] (0 dBm)
+    f_center=193.4e12,
+    N_ch=80,
+    channel_spacing=50e9,
+    B_s=32e9,
+    P0=1e-3,
+    beta_rolloff=0.2,
 )
 
-# -----------------------------------------------------------------------------
-# 预设经典信道位置（取消注释其中一个，或自定义 CLASSICAL_INDICES）
-# 物理假设：经典信道与量子信道同向传播（co-propagating）
-# 前向噪声 → 接收端 z=L（Bob）；后向噪声 → 发射端 z=0（Alice）
-# -----------------------------------------------------------------------------
+CLASSICAL_INDICES = [39, 40, 41]
 
-# --- 1 个经典信道 ---
-# CLASSICAL_INDICES = [40]              # 居中（193.4 THz）
-# CLASSICAL_INDICES = [1]              # 居左（低频端）
+FREQ_GRID_RESOLUTION_HZ = 0.1e9
+FREQ_GRID_PADDING_FACTOR = 1.5
 
-# --- 3 个经典信道 ---
-CLASSICAL_INDICES = [39, 40, 41]       # 居中（C 波段中间）
-# CLASSICAL_INDICES = [1, 2, 3]        # 居左（低频端）
+OSA_RBW_HZ = 1.0e9  # OSA 分辨率带宽 [Hz]（仅影响中间 PSD 标定，归一化后无影响）
 
-# --- 24 个经典信道 ---
-# CLASSICAL_INDICES = list(range(28, 52))   # 居中（连续 24 个）
-# CLASSICAL_INDICES = list(range(0, 24))    # 居左
+FIXED_QUANTUM_TARGET_FREQ_HZ = 193.4e12  # 固定量子信道目标频率
+LENGTH_SWEEP_KM = np.linspace(1.0, 100.0, 100)
 
-# -----------------------------------------------------------------------------
+OSA_CSV_PATH = _PROJECT_ROOT / "data" / "osa"
 
-RUN_TAG = ""      # 留空时自动生成为 discrete_N{N_ch}_C{n_classical}
-SAVE_CSV = True   # True：保存 CSV 文件（for Origin 绘图）
+MODEL_SPECS = {
+    "discrete": {
+        "label": "Discrete",
+        "spectrum_type": SpectrumType.SINGLE_FREQ,
+        "continuous": False,
+    },
+    "rectangular": {
+        "label": "Rectangular",
+        "spectrum_type": SpectrumType.RECTANGULAR,
+        "continuous": True,
+    },
+    "raised_cosine": {
+        "label": "Raised Cosine",
+        "spectrum_type": SpectrumType.RAISED_COSINE,
+        "continuous": True,
+    },
+    "osa": {
+        "label": "OSA",
+        "spectrum_type": SpectrumType.OSA_SAMPLED,
+        "continuous": True,
+    },
+}
+
 
 # ===========================================================================
-# 核心函数
+# Helper functions
 # ===========================================================================
 
-def compute_all_quantum_noise(
-    fiber: Fiber,
-    wdm_params: dict,
-    classical_indices: list[int],
-) -> tuple[np.ndarray, dict[str, np.ndarray], WDMGrid]:
-    """一次性计算 C 波段全部量子信道的 SpRS 和 FWM 噪声。
+def _resolve_osa_csv() -> Path:
+    csv_files = sorted(OSA_CSV_PATH.glob("*.csv"))
+    if not csv_files:
+        raise FileNotFoundError(f"No OSA CSV files found in {OSA_CSV_PATH}")
+    return csv_files[0]
 
-    Parameters
-    ----------
-    classical_indices : list[int]
-        经典信道索引（0-based）；其余信道自动设为量子信道。
-        物理假设：经典/量子信道同向传播，泵浦总功率 = wdm_params['P0']。
 
-    Returns
-    -------
-    f_q_hz : ndarray, shape (N_q,)
-        量子信道中心频率 [Hz]
-    noise_dict : dict, 每值 shape (N_q,)
-        'sprs_fwd', 'sprs_bwd', 'fwm_fwd', 'fwm_bwd'
-    wdm_grid_ref : WDMGrid
-        参考 WDMGrid（含全部信道配置，用于信号功率谱图）
-    """
-    N_ch = wdm_params["N_ch"]
-    q_indices = [i for i in range(N_ch) if i not in classical_indices]
-    assert len(q_indices) > 0, "至少需要 1 个量子信道"
-    assert len(classical_indices) > 0, "至少需要 1 个经典信道（泵浦）"
+def _channel_center_frequencies(config: WDMConfig) -> np.ndarray:
+    indices = np.arange(-(config.N_ch - 1) / 2, (config.N_ch + 1) / 2)
+    return config.f_center + indices * config.channel_spacing
 
-    cfg = WDMConfig(**wdm_params, quantum_channel_indices=q_indices)
-    grid = build_wdm_grid(cfg, spectrum_type=SpectrumType.SINGLE_FREQ)
 
-    result = compute_noise(
-        "all", fiber, grid,
-        sprs_solver=DiscreteSPRSSolver(),
-        fwm_solver=DiscreteFWMSolver(),
+def _complement_indices(n_ch: int, classical_indices: list[int]) -> list[int]:
+    classical_set = set(classical_indices)
+    return [i for i in range(n_ch) if i not in classical_set]
+
+
+def _build_wdm_config(quantum_indices: list[int]) -> WDMConfig:
+    return WDMConfig(**WDM_PARAMS, quantum_channel_indices=list(quantum_indices))
+
+
+def _build_model_grid(
+    model_key: str,
+    config: WDMConfig,
+    f_grid: np.ndarray,
+    osa_csv_path: Path,
+) -> WDMGrid:
+    spec = MODEL_SPECS[model_key]
+    if spec["spectrum_type"] == SpectrumType.OSA_SAMPLED:
+        return build_wdm_grid(
+            config=config,
+            spectrum_type=spec["spectrum_type"],
+            f_grid=f_grid,
+            osa_csv_path=osa_csv_path,
+            osa_rbw=OSA_RBW_HZ,
+            classical_channel_indices=CLASSICAL_INDICES,
+        )
+    return build_wdm_grid(
+        config=config,
+        spectrum_type=spec["spectrum_type"],
+        f_grid=f_grid,
+        classical_channel_indices=CLASSICAL_INDICES,
     )
 
-    f_q_hz = np.array([ch.f_center for ch in grid.get_quantum_channels()])
-    return f_q_hz, result, grid
+
+def _build_discrete_signal_psd(wdm_grid: WDMGrid, f_grid: np.ndarray) -> np.ndarray:
+    """离散模型信号 PSD：delta 近似，G = P/df 放在最近格点。"""
+    df = float(np.mean(np.diff(f_grid)))
+    psd = np.zeros_like(f_grid, dtype=np.float64)
+    for ch in wdm_grid.get_classical_channels():
+        idx = int(np.argmin(np.abs(f_grid - ch.f_center)))
+        psd[idx] += ch.power / df
+    return psd
+
+
+def _get_signal_psd(wdm_grid: WDMGrid, f_grid: np.ndarray, model_key: str) -> np.ndarray:
+    if model_key == "discrete":
+        return _build_discrete_signal_psd(wdm_grid, f_grid)
+    return wdm_grid.get_total_psd()
+
+
+def _select_reference_quantum_slot(
+    config: WDMConfig,
+    classical_indices: list[int],
+    target_freq_hz: float,
+) -> tuple[int, float]:
+    """选择 C 波段中心最近的可用量子信道。"""
+    all_freqs = _channel_center_frequencies(config)
+    quantum_indices = _complement_indices(config.N_ch, classical_indices)
+    q_freqs = all_freqs[quantum_indices]
+    nearest_local = int(np.argmin(np.abs(q_freqs - target_freq_hz)))
+    channel_index = quantum_indices[nearest_local]
+    return channel_index, float(all_freqs[channel_index])
 
 
 # ===========================================================================
-# 主流程
+# Scenario 1: C-band model comparison
+# ===========================================================================
+
+def _compute_spectrum_comparison_results(
+    fiber: Fiber,
+    config: WDMConfig,
+    f_grid: np.ndarray,
+    osa_csv_path: Path,
+) -> list[ModelSpectrumResult]:
+    results: list[ModelSpectrumResult] = []
+    for model_key, spec in MODEL_SPECS.items():
+        grid = _build_model_grid(model_key, config, f_grid, osa_csv_path)
+        noise = compute_noise(
+            "all",
+            fiber,
+            grid,
+            sprs_solver=DiscreteSPRSSolver(),
+            fwm_solver=DiscreteFWMSolver(),
+            continuous=spec["continuous"],
+        )
+        q_freqs = np.array(
+            [ch.f_center for ch in grid.get_quantum_channels()], dtype=np.float64
+        )
+        signal_psd = _get_signal_psd(grid, f_grid, model_key)
+        results.append(
+            ModelSpectrumResult(
+                key=model_key,
+                label=spec["label"],
+                color=get_model_color(model_key),
+                f_signal_hz=f_grid,
+                signal_psd_W_per_Hz=signal_psd,
+                f_quantum_hz=q_freqs,
+                fwm_W=np.asarray(noise["fwm_fwd"], dtype=np.float64),
+                sprs_W=np.asarray(noise["sprs_fwd"], dtype=np.float64),
+            )
+        )
+    return results
+
+
+# ===========================================================================
+# Scenario 2: Noise vs fiber length
+# ===========================================================================
+
+def _compute_length_sweep_results(
+    quantum_index: int,
+    f_grid: np.ndarray,
+    osa_csv_path: Path,
+) -> list[ModelLengthSweepResult]:
+    config = _build_wdm_config([quantum_index])
+    results: list[ModelLengthSweepResult] = []
+    for model_key, spec in MODEL_SPECS.items():
+        grid = _build_model_grid(model_key, config, f_grid, osa_csv_path)
+        fwm_vals: list[float] = []
+        sprs_vals: list[float] = []
+        for length_km in LENGTH_SWEEP_KM:
+            fp = dict(FIBER_PARAMS)
+            fp["L_km"] = float(length_km)
+            fiber = Fiber(FiberConfig(**fp))
+            noise = compute_noise(
+                "all",
+                fiber,
+                grid,
+                sprs_solver=DiscreteSPRSSolver(),
+                fwm_solver=DiscreteFWMSolver(),
+                continuous=spec["continuous"],
+            )
+            fwm_vals.append(float(noise["fwm_fwd"][0]))
+            sprs_vals.append(float(noise["sprs_fwd"][0]))
+        results.append(
+            ModelLengthSweepResult(
+                key=model_key,
+                label=spec["label"],
+                color=get_model_color(model_key),
+                length_km=np.asarray(LENGTH_SWEEP_KM, dtype=np.float64),
+                fwm_W=np.asarray(fwm_vals, dtype=np.float64),
+                sprs_W=np.asarray(sprs_vals, dtype=np.float64),
+            )
+        )
+    return results
+
+
+# ===========================================================================
+# Main
 # ===========================================================================
 
 def main() -> None:
-    print("=" * 60)
-    print("离散噪声功率谱生成脚本（C 波段）")
-    print("=" * 60)
+    print("=" * 72)
+    print("Phase 4 — 多信号模型噪声功率谱对比")
+    print("=" * 72)
 
-    # 构造光纤
+    osa_csv_path = _resolve_osa_csv()
+    print(f"OSA CSV: {osa_csv_path.name}")
+
+    base_quantum_indices = _complement_indices(WDM_PARAMS["N_ch"], CLASSICAL_INDICES)
+    wdm_config = _build_wdm_config(base_quantum_indices)
     fiber = Fiber(FiberConfig(**FIBER_PARAMS))
-    print(f"\n光纤参数：")
-    print(f"  L = {FIBER_PARAMS['L_km']} km")
-    print(f"  α = {FIBER_PARAMS['alpha_dB_per_km']} dB/km → {fiber.alpha:.4e} /m")
-    print(f"  γ = {FIBER_PARAMS['gamma_per_W_km']} 1/(W·km) → {fiber.gamma:.4e} 1/(W·m)")
-    print(f"  D = {FIBER_PARAMS['D_ps_nm_km']} ps/(nm·km)")
-    print(f"  T = {FIBER_PARAMS['T_kelvin']} K")
 
-    N_ch = WDM_PARAMS["N_ch"]
-    n_classical = len(CLASSICAL_INDICES)
-    n_quantum = N_ch - n_classical
-
-    print(f"\nWDM 参数（C 波段）：")
-    print(f"  N_ch = {N_ch}，间隔 = {WDM_PARAMS['channel_spacing']/1e9:.0f} GHz")
-    print(f"  f_center = {WDM_PARAMS['f_center']/1e12:.1f} THz")
-    print(f"  P0 = {WDM_PARAMS['P0']*1e3:.1f} mW ({10*np.log10(WDM_PARAMS['P0']*1e3):.1f} dBm)")
-
-    # C 波段覆盖率（~5 THz = 191.4–196.4 THz）
-    c_band_coverage = N_ch * WDM_PARAMS["channel_spacing"] / 5e12 * 100
-    print(f"\nC 波段覆盖：{N_ch} 信道 × 50 GHz = {c_band_coverage:.0f}% （C 波段 ~5 THz）")
-    print(f"  经典信道：{n_classical} 个（索引 {CLASSICAL_INDICES}）")
-    print(f"  量子信道：{n_quantum} 个")
-
-    print(f"\n计算量子信道噪声（共 {n_quantum} 个）...")
-    f_q_hz, noise_dict, wdm_grid_ref = compute_all_quantum_noise(
-        fiber, WDM_PARAMS, CLASSICAL_INDICES
+    f_grid = build_frequency_grid(
+        wdm_config,
+        resolution=FREQ_GRID_RESOLUTION_HZ,
+        padding_factor=FREQ_GRID_PADDING_FACTOR,
     )
 
-    # 打印各噪声分量范围
-    print(f"\n噪声功率范围：")
-    for key in ["sprs_fwd", "sprs_bwd", "fwm_fwd", "fwm_bwd"]:
-        vals = noise_dict[key]
-        print(f"  {key:12s}：min={vals.min():.3e} W，max={vals.max():.3e} W")
-
-    # 输出目录
-    tag = RUN_TAG or f"discrete_N{N_ch}_C{n_classical}"
-    output_dir = _PROJECT_ROOT / "outputs" / tag
-    print(f"\n输出目录：{output_dir}")
+    n_classical = len(CLASSICAL_INDICES)
+    n_quantum = WDM_PARAMS["N_ch"] - n_classical
+    run_tag = f"phase4_N{WDM_PARAMS['N_ch']}_C{n_classical}"
+    output_dir = _PROJECT_ROOT / "outputs" / run_tag
+    print(f"Output: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n生成噪声功率谱图（8 PNG + CSV）...")
-    figs = make_noise_figures(
-        f_q_hz=f_q_hz,
-        noise_dict=noise_dict,
-        wdm_grid_ref=wdm_grid_ref,
-        output_dir=output_dir,
-        dpi=150,
-        discrete=True,
-        save_csv=SAVE_CSV,
+    # ---- Scenario 1 ----
+    print("\nScenario 1: C-band model comparison")
+    spectrum_results = _compute_spectrum_comparison_results(
+        fiber=fiber, config=wdm_config, f_grid=f_grid, osa_csv_path=osa_csv_path
     )
-    print(f"  已生成 {len(figs)} 张图 + {('2 CSV' if SAVE_CSV else '0 CSV')}")
 
-    # 打印文件列表
-    if SAVE_CSV:
-        csv_files = list(output_dir.glob("*.csv"))
-        print(f"\nCSV 文件：")
-        for f in csv_files:
-            print(f"  {f.name}")
+    fig_W = make_model_comparison_figure(spectrum_results, unit="W")
+    fig_dBm = make_model_comparison_figure(spectrum_results, unit="dBm")
+    fig_W.savefig(output_dir / "phase4_model_comparison_W.png", dpi=150, bbox_inches="tight")
+    fig_dBm.savefig(output_dir / "phase4_model_comparison_dBm.png", dpi=150, bbox_inches="tight")
+    import matplotlib.pyplot as plt
+    plt.close("all")
+    print(f"  Saved: phase4_model_comparison_W.png")
+    print(f"  Saved: phase4_model_comparison_dBm.png")
 
-    print("\n完成。")
+    # ---- Scenario 2 ----
+    print("\nScenario 2: Noise vs fiber length")
+    q_index, q_freq_hz = _select_reference_quantum_slot(
+        wdm_config, CLASSICAL_INDICES, FIXED_QUANTUM_TARGET_FREQ_HZ
+    )
+    print(
+        f"  Target {FIXED_QUANTUM_TARGET_FREQ_HZ/1e12:.3f} THz "
+        f"→ quantum slot {q_index} @ {q_freq_hz/1e12:.3f} THz"
+    )
+
+    length_results = _compute_length_sweep_results(
+        quantum_index=q_index, f_grid=f_grid, osa_csv_path=osa_csv_path
+    )
+    fig_len = make_noise_vs_length_figure(length_results)
+    fig_len.savefig(output_dir / "phase4_noise_vs_length.png", dpi=150, bbox_inches="tight")
+    plt.close("all")
+    print(f"  Saved: phase4_noise_vs_length.png")
+
+    print("\nDone.")
 
 
 if __name__ == "__main__":

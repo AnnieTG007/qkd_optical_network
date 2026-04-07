@@ -419,3 +419,195 @@ def _save_noise_csv(f_q_hz: np.ndarray, noise_plot: dict[str, np.ndarray], out: 
                 row_strs.append(f"{v:.6f}")
         lines.append(",".join(row_strs))
     (out / "noise_spectrum.csv").write_text("\n".join(lines), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: 多信号模型对比绘图（连续 vs 离散）
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass
+from typing import Sequence
+
+_MODEL_COLORS = {
+    "discrete": "#202020",
+    "rectangular": "#1f77b4",
+    "raised_cosine": "#d95f02",
+    "osa": "#2ca02c",
+}
+
+
+def _ylabel_psd(unit: str) -> str:
+    return "Launch PSD [W/Hz]" if unit == "W" else "Launch PSD [dBm/Hz]"
+
+
+@dataclass
+class ModelSpectrumResult:
+    """单信号模型的噪声频谱结果（用于模型对比图）。"""
+    key: str
+    label: str
+    color: str
+    f_signal_hz: np.ndarray
+    signal_psd_W_per_Hz: np.ndarray
+    f_quantum_hz: np.ndarray
+    fwm_W: np.ndarray
+    sprs_W: np.ndarray
+
+    @property
+    def total_W(self) -> np.ndarray:
+        return self.fwm_W + self.sprs_W
+
+
+@dataclass
+class ModelLengthSweepResult:
+    """单信号模型的噪声-光纤长度扫描结果。"""
+    key: str
+    label: str
+    color: str
+    length_km: np.ndarray
+    fwm_W: np.ndarray
+    sprs_W: np.ndarray
+
+    @property
+    def total_W(self) -> np.ndarray:
+        return self.fwm_W + self.sprs_W
+
+
+def make_model_comparison_figure(
+    results: Sequence[ModelSpectrumResult],
+    unit: str = "W",
+) -> Figure:
+    """绘制 2×2 多信号模型噪声功率谱对比图。
+
+    子图布局：
+      (0,0) FWM 噪声 vs 量子信道频率
+      (0,1) SpRS 噪声 vs 量子信道频率
+      (1,0) 总噪声 vs 量子信道频率
+      (1,1) 信号发射 PSD（离散=竖线，连续=曲线）
+
+    Parameters
+    ----------
+    results : Sequence[ModelSpectrumResult]
+        各信号模型的计算结果
+    unit : {"W", "dBm"}
+        显示单位
+
+    Returns
+    -------
+    Figure
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+    ax_fwm, ax_sprs = axes[0]
+    ax_total, ax_signal = axes[1]
+
+    for result in results:
+        f_q_THz = result.f_quantum_hz / 1e12
+        ax_fwm.plot(
+            f_q_THz, _to_display(result.fwm_W, unit),
+            color=result.color, linewidth=2.0, label=result.label,
+        )
+        ax_sprs.plot(
+            f_q_THz, _to_display(result.sprs_W, unit),
+            color=result.color, linewidth=2.0, label=result.label,
+        )
+        ax_total.plot(
+            f_q_THz, _to_display(result.total_W, unit),
+            color=result.color, linewidth=2.0, label=result.label,
+        )
+
+    for ax, title in [
+        (ax_fwm, "FWM Noise"),
+        (ax_sprs, "SpRS Noise"),
+        (ax_total, "Total Noise"),
+    ]:
+        ax.set_title(title)
+        ax.set_xlabel("Quantum Channel Frequency [THz]")
+        ax.set_ylabel(_ylabel(unit))
+        ax.grid(True, alpha=0.3)
+
+    # 信号 PSD 子图
+    reference = results[0]
+    for result in results:
+        f_signal_THz = result.f_signal_hz / 1e12
+        y_signal = _to_display(result.signal_psd_W_per_Hz, unit)
+        if result.key == "discrete":
+            mask = result.signal_psd_W_per_Hz > 0.0
+            markerline, stemlines, _ = ax_signal.stem(
+                f_signal_THz[mask], y_signal[mask],
+                linefmt=result.color, markerfmt=" ", basefmt=" ",
+                label=result.label,
+            )
+            stemlines.set_linewidth(1.5)
+            markerline.set_visible(False)
+        else:
+            ax_signal.plot(
+                f_signal_THz, y_signal,
+                color=result.color, linewidth=2.0, label=result.label,
+            )
+
+    for fq in reference.f_quantum_hz / 1e12:
+        ax_signal.axvline(fq, color="#999999", linestyle=":", linewidth=0.5, alpha=0.15)
+
+    ax_signal.set_title("Signal Launch Spectrum")
+    ax_signal.set_xlabel("Frequency [THz]")
+    ax_signal.set_ylabel(_ylabel_psd(unit))
+    ax_signal.grid(True, alpha=0.3)
+
+    handles, labels = ax_fwm.get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=len(results), frameon=False)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+    return fig
+
+
+def make_noise_vs_length_figure(
+    results: Sequence[ModelLengthSweepResult],
+) -> Figure:
+    """绘制 1×3 噪声功率随光纤长度变化对比图。
+
+    子图布局：
+      (0,) FWM 噪声 vs L
+      (1,) SpRS 噪声 vs L
+      (2,) 总噪声 vs L
+
+    X 轴: 光纤长度 [km], Y 轴: 噪声功率 [W] (log scale)
+
+    Parameters
+    ----------
+    results : Sequence[ModelLengthSweepResult]
+        各信号模型的 L 扫描结果
+
+    Returns
+    -------
+    Figure
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), sharex=True)
+    panels = [
+        ("FWM Noise", "fwm_W"),
+        ("SpRS Noise", "sprs_W"),
+        ("Total Noise", "total_W"),
+    ]
+
+    floor = np.finfo(np.float64).tiny
+
+    for ax, (title, field_name) in zip(axes, panels):
+        for result in results:
+            y = getattr(result, field_name)
+            ax.plot(
+                result.length_km,
+                np.maximum(y, floor),
+                color=result.color, linewidth=2.0, label=result.label,
+            )
+        ax.set_title(title)
+        ax.set_xlabel("Fiber Length [km]")
+        ax.set_ylabel("Noise Power [W]")
+        ax.set_yscale("log")
+        ax.grid(True, alpha=0.3, which="both")
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=len(results), frameon=False)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.93))
+    return fig
+
+
+def get_model_color(model_key: str) -> str:
+    """返回信号模型对应的绘图颜色。"""
+    return _MODEL_COLORS[model_key]

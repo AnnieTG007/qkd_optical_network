@@ -25,8 +25,9 @@ def compute_noise(
     wdm_grid: WDMGrid,
     sprs_solver: DiscreteSPRSSolver | None = None,
     fwm_solver: DiscreteFWMSolver | None = None,
+    continuous: bool = False,
 ) -> dict[str, np.ndarray]:
-    """计算量子信道的离散噪声功率。
+    """计算量子信道噪声功率。
 
     Parameters
     ----------
@@ -43,6 +44,9 @@ def compute_noise(
         SpRS 求解器实例。None 时使用默认参数构造。
     fwm_solver : DiscreteFWMSolver or None
         FWM 求解器实例。None 时使用默认参数构造。
+    continuous : bool
+        False（默认）：使用离散模型；
+        True：使用连续模型（要求 wdm_grid.f_grid 非空）
 
     Returns
     -------
@@ -57,6 +61,8 @@ def compute_noise(
     ------
     ValueError
         noise_type 不在允许值内时。
+    ValueError
+        continuous=True 但 wdm_grid.f_grid 未设置时。
 
     Examples
     --------
@@ -67,16 +73,29 @@ def compute_noise(
     if noise_type not in ("sprs", "fwm", "all"):
         raise ValueError(f"noise_type 须为 'sprs'/'fwm'/'all'，得到 '{noise_type}'")
 
+    if continuous and wdm_grid.f_grid is None:
+        raise ValueError(
+            "continuous=True 时需要在 wdm_grid.f_grid 提供频率网格"
+        )
+
     result: dict[str, np.ndarray] = {}
 
     if noise_type in ("sprs", "all"):
         solver = sprs_solver if sprs_solver is not None else DiscreteSPRSSolver()
-        result["sprs_fwd"] = solver.compute_forward(fiber, wdm_grid)
-        result["sprs_bwd"] = solver.compute_backward(fiber, wdm_grid)
+        if continuous:
+            result["sprs_fwd"] = solver.compute_forward_conti(fiber, wdm_grid, wdm_grid.f_grid)
+            result["sprs_bwd"] = solver.compute_backward_conti(fiber, wdm_grid, wdm_grid.f_grid)
+        else:
+            result["sprs_fwd"] = solver.compute_forward(fiber, wdm_grid)
+            result["sprs_bwd"] = solver.compute_backward(fiber, wdm_grid)
 
     if noise_type in ("fwm", "all"):
         solver_fwm = fwm_solver if fwm_solver is not None else DiscreteFWMSolver()
-        result["fwm_fwd"] = solver_fwm.compute_forward(fiber, wdm_grid)
-        result["fwm_bwd"] = solver_fwm.compute_backward(fiber, wdm_grid)
+        if continuous:
+            result["fwm_fwd"] = solver_fwm.compute_forward_conti(fiber, wdm_grid, wdm_grid.f_grid)
+            result["fwm_bwd"] = solver_fwm.compute_backward_conti(fiber, wdm_grid, wdm_grid.f_grid)
+        else:
+            result["fwm_fwd"] = solver_fwm.compute_forward(fiber, wdm_grid)
+            result["fwm_bwd"] = solver_fwm.compute_backward(fiber, wdm_grid)
 
     return result

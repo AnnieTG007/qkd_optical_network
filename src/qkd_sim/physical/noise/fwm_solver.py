@@ -21,7 +21,7 @@ from __future__ import annotations
 import numpy as np
 
 from qkd_sim.physical.fiber import Fiber
-from qkd_sim.physical.signal import WDMGrid
+from qkd_sim.physical.signal import SpectrumType, WDMGrid
 from qkd_sim.physical.noise.base import NoiseSolver
 
 
@@ -366,4 +366,218 @@ class DiscreteFWMSolver(NoiseSolver):
             for i in range(len(f_q))
         ])
         assert P_bwd.shape == (len(f_q),)
+        return P_bwd
+
+    # --- 连续模型方法 -------------------------------------------------------
+
+    @staticmethod
+    def _validate_frequency_grid(f_grid: np.ndarray) -> float:
+        """验证 1D 积分网格并返回频率步长。
+
+        公式 2.3.1-2.3.6 (formulas_fwm.md) 使用均匀网格黎曼和计算。
+        """
+        f_grid = np.asarray(f_grid, dtype=np.float64)
+        assert f_grid.ndim == 1 and f_grid.size >= 2, (
+            f"f_grid must be 1D with at least 2 points, got shape {f_grid.shape}"
+        )
+        diffs = np.diff(f_grid)
+        assert np.all(diffs > 0.0), "f_grid must be strictly increasing"
+        df = float(np.mean(diffs))
+        assert np.allclose(diffs, df, rtol=1e-6, atol=0.0), (
+            "f_grid must be approximately uniform for continuous integration"
+        )
+        return df
+
+    @staticmethod
+    def _build_total_classical_psd(
+        wdm_grid: WDMGrid,
+        f_grid: np.ndarray,
+        df: float,
+    ) -> np.ndarray:
+        """在 f_grid 上构建经典信道总发射 PSD。
+
+        SINGLE_FREQ 信道：使用 G=P/df 放在最近格点，
+        使得 sum(G*df) ≈ P，用于离散/连续交叉验证极限。
+        """
+        classical_channels = wdm_grid.get_classical_channels()
+        assert len(classical_channels) > 0, "WDMGrid 中无经典信道（泵浦）"
+
+        total_psd = np.zeros(f_grid.size, dtype=np.float64)
+        for ch in classical_channels:
+            if ch.spectrum_type == SpectrumType.SINGLE_FREQ:
+                idx = int(np.argmin(np.abs(f_grid - ch.f_center)))
+                total_psd[idx] += ch.power / df
+            else:
+                total_psd += ch.get_psd(f_grid)
+        return total_psd
+
+    @staticmethod
+    def _target_noise_bandwidth(ch, df: float) -> float:
+        """返回公式 2.3.6 的目标积分带宽。
+
+        SINGLE_FREQ 量子信道使用一个频率 bins df。
+        """
+        if ch.spectrum_type == SpectrumType.SINGLE_FREQ:
+            return df
+        return ch.B_s
+
+    def compute_forward_conti(
+        self,
+        fiber: Fiber,
+        wdm_grid: WDMGrid,
+        f_grid: np.ndarray,
+    ) -> np.ndarray:
+        """连续前向 FWM 噪声功率 [公式 2.3.1 + 2.3.6]。
+
+        在量子信道中心频率处计算 G_{f,1}(L) PSD，
+        再乘以带宽得 in-band 噪声功率。
+        当所有经典信道均为 SINGLE_FREQ 时，退化为离散模型（交叉验证极限）。
+        """
+        c_chs = wdm_grid.get_classical_channels()
+        if len(c_chs) > 0 and all(
+            ch.spectrum_type == SpectrumType.SINGLE_FREQ for ch in c_chs
+        ):
+            return self.compute_forward(fiber, wdm_grid)
+
+        df = self._validate_frequency_grid(f_grid)
+        q_chs = wdm_grid.get_quantum_channels()
+        assert len(q_chs) > 0, "WDMGrid 中无量子信道"
+
+        f_grid = np.asarray(f_grid, dtype=np.float64)
+        G_tx = self._build_total_classical_psd(wdm_grid, f_grid, df)
+        alpha_grid = np.asarray(fiber.get_loss_at_freq(f_grid), dtype=np.float64)
+
+        active = G_tx > 0.0
+        if not np.any(active):
+            return np.zeros(len(q_chs), dtype=np.float64)
+
+        f_active = f_grid[active]
+        G_active = G_tx[active]
+        alpha_active = alpha_grid[active]
+
+        Fi, Fj = np.meshgrid(f_active, f_active, indexing="ij")
+        Gi, Gj = np.meshgrid(G_active, G_active, indexing="ij")
+        alpha_i, alpha_j = np.meshgrid(alpha_active, alpha_active, indexing="ij")
+
+        D = np.where(np.abs(Fi - Fj) <= 0.5 * df, 3.0, 6.0)
+
+        L = fiber.L
+        gamma = fiber.gamma
+
+        P_fwd = np.zeros(len(q_chs), dtype=np.float64)
+
+        for iq, q_ch in enumerate(q_chs):
+            f1 = float(q_ch.f_center)
+            alpha1 = float(np.asarray(fiber.get_loss_at_freq(f1), dtype=np.float64))
+
+            Fk = Fi + Fj - f1
+            Gk = np.interp(Fk, f_grid, G_tx, left=0.0, right=0.0)
+            if not np.any(Gk > 0.0):
+                continue
+
+            alpha_k = np.interp(Fk, f_grid, alpha_grid, left=alpha_grid[0], right=alpha_grid[-1])
+            delta_alpha = alpha_k + alpha_i + alpha_j - alpha1
+            delta_beta = fiber.get_phase_mismatch(f2=Fk, f3=Fi, f4=Fj)
+
+            eta = _fwm_efficiency(delta_alpha=delta_alpha, delta_beta=delta_beta, L=L)
+            integrand = (D ** 2) * eta * Gi * Gj * Gk
+            integral_ij = np.sum(integrand) * df * df
+
+            G_fwd_psd = 4.0 * (gamma ** 2) * np.exp(-alpha1 * L) * integral_ij / 9.0
+            bw_q = self._target_noise_bandwidth(q_ch, df)
+            P_fwd[iq] = G_fwd_psd * bw_q
+
+        assert P_fwd.shape == (len(q_chs),)
+        return P_fwd
+
+    def compute_backward_conti(
+        self,
+        fiber: Fiber,
+        wdm_grid: WDMGrid,
+        f_grid: np.ndarray,
+    ) -> np.ndarray:
+        """连续后向 FWM 噪声功率 [公式 2.3.2-2.3.6]。
+
+        通过瑞利重分配的前向 FWM 计算 G_{b,1}(0) PSD，
+        再乘以带宽得 in-band 噪声功率。
+        当所有经典信道均为 SINGLE_FREQ 时，退化为离散模型（交叉验证极限）。
+        """
+        c_chs = wdm_grid.get_classical_channels()
+        if len(c_chs) > 0 and all(
+            ch.spectrum_type == SpectrumType.SINGLE_FREQ for ch in c_chs
+        ):
+            return self.compute_backward(fiber, wdm_grid)
+
+        df = self._validate_frequency_grid(f_grid)
+        q_chs = wdm_grid.get_quantum_channels()
+        assert len(q_chs) > 0, "WDMGrid 中无量子信道"
+
+        f_grid = np.asarray(f_grid, dtype=np.float64)
+        G_tx = self._build_total_classical_psd(wdm_grid, f_grid, df)
+        alpha_grid = np.asarray(fiber.get_loss_at_freq(f_grid), dtype=np.float64)
+
+        active = G_tx > 0.0
+        if not np.any(active):
+            return np.zeros(len(q_chs), dtype=np.float64)
+
+        f_active = f_grid[active]
+        G_active = G_tx[active]
+        alpha_active = alpha_grid[active]
+
+        Fi, Fj = np.meshgrid(f_active, f_active, indexing="ij")
+        Gi, Gj = np.meshgrid(G_active, G_active, indexing="ij")
+        alpha_i, alpha_j = np.meshgrid(alpha_active, alpha_active, indexing="ij")
+
+        D = np.where(np.abs(Fi - Fj) <= 0.5 * df, 3.0, 6.0)
+
+        L = fiber.L
+        gamma = fiber.gamma
+
+        P_bwd = np.zeros(len(q_chs), dtype=np.float64)
+
+        for iq, q_ch in enumerate(q_chs):
+            f1 = float(q_ch.f_center)
+            alpha1 = float(np.asarray(fiber.get_loss_at_freq(f1), dtype=np.float64))
+
+            Fk = Fi + Fj - f1
+            Gk = np.interp(Fk, f_grid, G_tx, left=0.0, right=0.0)
+            if not np.any(Gk > 0.0):
+                continue
+
+            alpha_k = np.interp(Fk, f_grid, alpha_grid, left=alpha_grid[0], right=alpha_grid[-1])
+            delta_alpha = alpha_k + alpha_i + alpha_j - alpha1
+            delta_beta = fiber.get_phase_mismatch(f2=Fk, f3=Fi, f4=Fj)
+
+            A = delta_alpha + 2.0 * alpha1
+            B = delta_alpha / 2.0 + 2.0 * alpha1
+            C = 2.0 * alpha1 * np.ones_like(A)
+            denom = delta_alpha ** 2 / 4.0 + delta_beta ** 2
+
+            F_L = _F_antiderivative(
+                l=np.full_like(A, L),
+                z_obs=0.0,
+                alpha1=alpha1,
+                A=A,
+                B=B,
+                C=C,
+                denom=denom,
+            )
+            F_0 = _F_antiderivative(
+                l=np.zeros_like(A),
+                z_obs=0.0,
+                alpha1=alpha1,
+                A=A,
+                B=B,
+                C=C,
+                denom=denom,
+            )
+
+            integrand = (D ** 2) * Gi * Gj * Gk * (F_L - F_0)
+            integral_ij = np.sum(integrand) * df * df
+
+            G_bwd_psd = fiber.rayleigh_coeff * (gamma ** 2) * integral_ij / 9.0
+            bw_q = self._target_noise_bandwidth(q_ch, df)
+            P_bwd[iq] = G_bwd_psd * bw_q
+
+        assert P_bwd.shape == (len(q_chs),)
         return P_bwd
