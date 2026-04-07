@@ -1,0 +1,181 @@
+"""光纤物理参数模型。
+
+提供波长/频率相关的衰减、色散、拉曼增益系数等。
+公开接口统一使用频率 (Hz)，内部按需通过 λ = c/f 转换。
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from scipy.constants import c as c_light
+
+from qkd_sim.config.schema import FiberConfig
+
+
+class Fiber:
+    """光纤参数容器，支持频率相关的物理参数查询。
+
+    当前实现：C波段常数参数 + 色散斜率修正。
+    C+L 扩展预留：get_loss_at_freq / get_dispersion_at_freq 接口
+    支持未来替换为查表或拟合模型。
+
+    Parameters
+    ----------
+    config : FiberConfig
+        光纤配置（SI 单位，由 __post_init__ 已转换）
+    """
+
+    def __init__(self, config: FiberConfig) -> None:
+        self.config = config
+        # 缓存常用参数
+        self._alpha = config.alpha            # 1/m
+        self._gamma = config.gamma            # 1/(W·m)
+        self._D_c = config.D_c                # s/m²
+        self._D_slope = config.D_slope        # s/m³
+        self._L = config.L                    # m
+        self._A_eff = config.A_eff            # m²
+        self._rayleigh_coeff = config.rayleigh_coeff  # 1/m³
+        self._T = config.T_kelvin             # K
+
+    # ---- 属性访问 ----
+
+    @property
+    def alpha(self) -> float:
+        """光纤衰减系数 [1/m]。"""
+        return self._alpha
+
+    @property
+    def gamma(self) -> float:
+        """非线性系数 [1/(W·m)]。"""
+        return self._gamma
+
+    @property
+    def L(self) -> float:
+        """光纤长度 [m]。"""
+        return self._L
+
+    @property
+    def A_eff(self) -> float:
+        """有效模场面积 [m²]。"""
+        return self._A_eff
+
+    @property
+    def rayleigh_coeff(self) -> float:
+        """瑞利散射系数 S·α_R [1/m³]。"""
+        return self._rayleigh_coeff
+
+    @property
+    def T_kelvin(self) -> float:
+        """工作温度 [K]。"""
+        return self._T
+
+    # ---- 频率相关参数 ----
+
+    def get_loss_at_freq(self, freq: float | np.ndarray) -> float | np.ndarray:
+        """获取给定频率处的衰减系数。
+
+        当前实现：返回常数 alpha（C波段近似）。
+        C+L 扩展时可替换为波长相关模型。
+
+        Parameters
+        ----------
+        freq : float or ndarray
+            频率 [Hz]
+
+        Returns
+        -------
+        float or ndarray
+            衰减系数 [1/m]
+        """
+        if isinstance(freq, np.ndarray):
+            return np.full_like(freq, self._alpha)
+        return self._alpha
+
+    def get_dispersion_at_freq(self, freq: float | np.ndarray) -> float | np.ndarray:
+        """获取给定频率处的色散系数 D_c。
+
+        使用色散斜率线性修正：D_c(λ) = D_c(λ₀) + D_slope × (λ - λ₀)
+        其中 λ₀ 对应参考频率 (默认 193.5 THz)。
+
+        Parameters
+        ----------
+        freq : float or ndarray
+            频率 [Hz]
+
+        Returns
+        -------
+        float or ndarray
+            色散系数 [s/m²]
+        """
+        # 参考波长: C波段中心 193.5 THz
+        f_ref = 193.5e12
+        lambda_ref = c_light / f_ref
+        wavelength = c_light / np.asarray(freq)
+        return self._D_c + self._D_slope * (wavelength - lambda_ref)
+
+    def get_phase_mismatch(
+        self,
+        f2: float | np.ndarray,
+        f3: float | np.ndarray,
+        f4: float | np.ndarray,
+    ) -> float | np.ndarray:
+        """计算 FWM 相位失配 Δβ。
+
+        公式 2.2.3 (formulas_fwm.md):
+        Δβ = (2π λ² / c) × |f₃ - f₂| × |f₄ - f₂|
+             × [D_c + (λ²/(2c)) × (|f₃ - f₂| + |f₄ - f₂|) × dD_c/dλ]
+
+        其中 λ 取中心波长（f₂ 对应的波长）。
+
+        Parameters
+        ----------
+        f2 : float or ndarray
+            频率 f₂ [Hz] (由频率匹配确定: f₂ = f₃ + f₄ - f₁)
+        f3 : float or ndarray
+            频率 f₃ [Hz]
+        f4 : float or ndarray
+            频率 f₄ [Hz]
+
+        Returns
+        -------
+        float or ndarray
+            相位失配 Δβ [rad/m]
+        """
+        f2 = np.asarray(f2, dtype=np.float64)
+        f3 = np.asarray(f3, dtype=np.float64)
+        f4 = np.asarray(f4, dtype=np.float64)
+
+        # 使用 f₂ 对应波长作为展开中心
+        lambda_c = c_light / f2
+
+        df32 = np.abs(f3 - f2)
+        df42 = np.abs(f4 - f2)
+
+        # D_c 取 f₂ 处的色散
+        D_c = self.get_dispersion_at_freq(f2)
+
+        delta_beta = (
+            (2.0 * np.pi * lambda_c**2 / c_light)
+            * df32 * df42
+            * (D_c + (lambda_c**2 / (2.0 * c_light)) * (df32 + df42) * self._D_slope)
+        )
+        return delta_beta
+
+    def get_effective_length(self, freq: float | np.ndarray | None = None) -> float:
+        """计算有效长度 L_eff = (1 - exp(-α·L)) / α。
+
+        Parameters
+        ----------
+        freq : float or ndarray or None
+            频率 [Hz]，用于获取频率相关的衰减。None 使用默认 alpha。
+
+        Returns
+        -------
+        float
+            有效长度 [m]
+        """
+        if freq is not None:
+            alpha = np.asarray(self.get_loss_at_freq(freq))
+        else:
+            alpha = self._alpha
+        return (1.0 - np.exp(-alpha * self._L)) / alpha

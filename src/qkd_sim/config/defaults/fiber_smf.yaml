@@ -1,0 +1,11 @@
+# 标准单模光纤 (SSMF) 参数
+# 所有值使用常用单位，加载时自动转换为 SI
+
+alpha_dB_per_km: 0.2            # 衰减 [dB/km]
+gamma_per_W_km: 1.3             # 非线性系数 [1/(W·km)]
+D_ps_nm_km: 17.0                # 色散系数 [ps/(nm·km)]
+D_slope_ps_nm2_km: 0.056        # 色散斜率 [ps/(nm²·km)]
+L_km: 50.0                      # 光纤长度 [km]
+A_eff: 8.0e-11                   # 有效模场面积 [m²] (80 μm²)
+rayleigh_coeff: 4.8e-8           # 瑞利散射系数 S·α_R [1/m³]
+T_kelvin: 300.0                  # 工作温度 [K]
