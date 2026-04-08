@@ -465,3 +465,93 @@ class DiscreteSPRSSolver(NoiseSolver):
         P_bwd = np.sum(G_bwd, axis=1) * df  # formula 3.2.4
         assert P_bwd.shape == (len(q_chs),)
         return P_bwd
+
+    # --- 噪声 PSD 谱计算（在 f_grid 每点计算 G_sprs(f)）-----------
+
+    def _compute_sprs_psd_at_f1(
+        self,
+        fiber: Fiber,
+        f_grid: np.ndarray,
+        G_pump: np.ndarray,
+        alpha2: np.ndarray,
+        f1: float,
+        direction: str,
+    ) -> float:
+        """在单个输出频率 f1 处计算 SpRS 噪声 PSD G_sprs(f1) [W/Hz]。
+
+        用于 compute_sprs_spectrum_conti，在 f_grid 每个频率点调用。
+        """
+        f_grid_arr = np.asarray(f_grid, dtype=np.float64).reshape(1, -1)
+        G_pump_arr = np.asarray(G_pump, dtype=np.float64).reshape(1, -1)
+        alpha2_arr = np.asarray(alpha2, dtype=np.float64).reshape(1, -1)
+
+        f1_arr = np.full_like(f_grid_arr, f1, dtype=np.float64)
+        alpha1_val = float(np.asarray(fiber.get_loss_at_freq(f1), dtype=np.float64))
+        alpha1_arr = np.full_like(f_grid_arr, alpha1_val)
+
+        delta_f = np.abs(f1_arr - f_grid_arr)
+        g_R = get_raman_gain(delta_f=delta_f, f_pump=f_grid_arr, A_eff=fiber.A_eff)
+        n_th = _phonon_occupation(delta_f, fiber.T_kelvin)
+        sigma = _raman_cross_section(
+            f_q=f1_arr, f_c=f_grid_arr, g_R=g_R, n_th=n_th, delta_f=delta_f
+        )
+
+        if direction == "forward":
+            integrand = _forward_propagation(
+                sigma=sigma, P_pump=G_pump_arr,
+                alpha1=alpha1_arr, alpha2=alpha2_arr, L=fiber.L,
+            )
+        elif direction == "backward":
+            integrand = _backward_propagation(
+                sigma=sigma, P_pump=G_pump_arr,
+                alpha1=alpha1_arr, alpha2=alpha2_arr, L=fiber.L,
+            )
+        else:
+            raise ValueError(f"Unsupported direction: {direction}")
+
+        df = float(np.mean(np.diff(f_grid)))
+        return float(np.sum(integrand) * df)
+
+    def compute_sprs_spectrum_conti(
+        self,
+        fiber: Fiber,
+        wdm_grid: WDMGrid,
+        f_grid: np.ndarray,
+        direction: str = "forward",
+    ) -> np.ndarray:
+        """计算 SpRS 噪声 PSD G_sprs(f) [W/Hz]，在 f_grid 每个频率点评估。
+
+        返回 shape (N_f,) 的噪声功率谱密度数组。
+        用于绘制连续噪声功率谱曲线（而非信道积分噪声标量）。
+
+        Parameters
+        ----------
+        fiber : Fiber
+        wdm_grid : WDMGrid
+        f_grid : ndarray
+            输出频率网格 [Hz]
+        direction : {"forward", "backward"}
+
+        Returns
+        -------
+        ndarray, shape (N_f,)
+            G_sprs(f) [W/Hz] at each f_grid point
+        """
+        f_grid = np.asarray(f_grid, dtype=np.float64)
+        df = self._validate_frequency_grid(f_grid)
+
+        G_classical = self._build_classical_psd_matrix(wdm_grid, f_grid, df)
+        G_pump = G_classical.sum(axis=0)
+        if not np.any(G_pump > 0.0):
+            return np.zeros_like(f_grid, dtype=np.float64)
+
+        alpha2 = np.asarray(fiber.get_loss_at_freq(f_grid), dtype=np.float64)
+
+        out = np.zeros_like(f_grid, dtype=np.float64)
+        for idx, f1 in enumerate(f_grid):
+            out[idx] = self._compute_sprs_psd_at_f1(
+                fiber=fiber, f_grid=f_grid,
+                G_pump=G_pump, alpha2=alpha2,
+                f1=float(f1), direction=direction,
+            )
+        return out

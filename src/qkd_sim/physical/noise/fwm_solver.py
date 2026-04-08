@@ -581,3 +581,168 @@ class DiscreteFWMSolver(NoiseSolver):
 
         assert P_bwd.shape == (len(q_chs),)
         return P_bwd
+
+    # --- 噪声 PSD 谱计算（向量优化版）-----------
+
+    def compute_fwm_spectrum_conti(
+        self,
+        fiber: Fiber,
+        wdm_grid: WDMGrid,
+        f_grid: np.ndarray,
+        direction: str = "forward",
+    ) -> np.ndarray:
+        """计算 FWM 噪声 PSD G_fwm(f) [W/Hz]，在 f_grid 每个频率点评估。
+
+        返回 shape (N_f,) 的噪声功率谱密度数组。
+        用于绘制连续噪声功率谱曲线（而非信道积分噪声标量）。
+
+        Parameters
+        ----------
+        fiber : Fiber
+        wdm_grid : WDMGrid
+        f_grid : ndarray
+            输出频率网格 [Hz]
+        direction : {"forward", "backward"}
+
+        Returns
+        -------
+        ndarray, shape (N_f,)
+            G_fwm(f) [W/Hz] at each f_grid point
+        """
+        f_grid = np.asarray(f_grid, dtype=np.float64)
+        self._validate_frequency_grid(f_grid)
+
+        df = float(np.mean(np.diff(f_grid)))
+        G_tx = self._build_total_classical_psd(wdm_grid, f_grid, df)
+        alpha_grid = np.asarray(fiber.get_loss_at_freq(f_grid), dtype=np.float64)
+
+        active = G_tx > 0.0
+        if not np.any(active):
+            return np.zeros_like(f_grid, dtype=np.float64)
+
+        f_active = f_grid[active]
+        G_active = G_tx[active]
+        alpha_active = alpha_grid[active]
+
+        Fi, Fj = np.meshgrid(f_active, f_active, indexing="ij")
+        Gi, Gj = np.meshgrid(G_active, G_active, indexing="ij")
+        alpha_i, alpha_j = np.meshgrid(alpha_active, alpha_active, indexing="ij")
+        D = np.where(np.abs(Fi - Fj) <= 0.5 * df, 3.0, 6.0)
+
+        # Precompute 2D pump-pair frequency sum (independent of output f1)
+        Fk_ij = Fi + Fj  # shape (N_active, N_active)
+
+        # Fully vectorized: precompute pump-pair arrays once (float32 to save memory)
+        Fi_f32 = Fi.astype(np.float32)
+        Fj_f32 = Fj.astype(np.float32)
+        Gi_f32 = Gi.astype(np.float32)
+        Gj_f32 = Gj.astype(np.float32)
+        alpha_i_f32 = alpha_i.astype(np.float32)
+        alpha_j_f32 = alpha_j.astype(np.float32)
+        D_f32 = D.astype(np.float32)
+        Fk_ij_f32 = (Fi_f32 + Fj_f32).astype(np.float32)
+
+        pump_grid_f32 = f_grid.astype(np.float32)
+        pump_G_f32 = G_tx.astype(np.float32)
+        alpha_grid_f32 = alpha_grid.astype(np.float32)
+
+        n_f = f_grid.size
+        out = np.zeros(n_f, dtype=np.float64)
+
+        # For large N_active, fall back to per-point evaluation to avoid
+        # O(N_f × N_active²) batched memory pressure. Use chunk_size=10
+        # to keep memory bounded while batching searchsorted calls.
+        N_a = Fi_f32.shape[0]
+        N_pairs = N_a * N_a
+        chunk_size = 10 if N_pairs * N_a > 50_000_000 else 50
+
+        for start in range(0, n_f, chunk_size):
+            end = min(start + chunk_size, n_f)
+            f1_chunk = f_grid[start:end]  # shape (chunk,)
+            n_chunk = end - start
+
+            # Fk for all pump pairs × all f1 in this chunk
+            # Fk_ij: (N_a, N_a), f1_chunk: (chunk,) → (N_a, N_a, chunk)
+            Fk = Fk_ij_f32[:, :, np.newaxis] - f1_chunk[np.newaxis, np.newaxis, :]
+
+            # ---- batch interpolation for Gk: pump power at Fk ----
+            Fk_T = Fk.transpose(2, 0, 1).reshape(n_chunk, -1)  # (chunk, N_pairs)
+            sorted_idx = np.searchsorted(pump_grid_f32, Fk_T)
+            sorted_idx = np.clip(sorted_idx, 1, len(pump_grid_f32) - 1)
+
+            x0 = pump_grid_f32[sorted_idx - 1]
+            x1 = pump_grid_f32[sorted_idx]
+            y0 = pump_G_f32[sorted_idx - 1]
+            y1 = pump_G_f32[sorted_idx]
+            t = np.clip((Fk_T - x0) / (x1 - x0), 0.0, 1.0)
+            Gk_T = (y0 + (y1 - y0) * t).astype(np.float32)  # (chunk, N_pairs)
+
+            # ---- batch interpolation for alpha_k: fiber loss at Fk ----
+            a0 = alpha_grid_f32[sorted_idx - 1]
+            a1 = alpha_grid_f32[sorted_idx]
+            alpha_k_T = (a0 + (a1 - a0) * t).astype(np.float32)  # (chunk, N_pairs)
+
+            for j in range(n_chunk):
+                alpha1 = float(np.asarray(fiber.get_loss_at_freq(f1_chunk[j]), dtype=np.float64))
+                Gk_j = Gk_T[j, :]  # (N_pairs,)
+                alpha_k_j = alpha_k_T[j, :]
+                valid_mask_2d = (Gk_j > 0.0).reshape(N_a, N_a)
+
+                if not np.any(valid_mask_2d):
+                    out[start + j] = 0.0
+                    continue
+
+                Gk_2d = Gk_j.reshape(N_a, N_a)
+                alpha_k_2d = alpha_k_j.reshape(N_a, N_a)
+
+                delta_alpha = alpha_k_2d + alpha_i_f32 + alpha_j_f32 - float(alpha1)
+                delta_beta = fiber.get_phase_mismatch(
+                    f2=(Fk_ij_f32 - float(f1_chunk[j])).astype(np.float64),
+                    f3=Fi_f32.astype(np.float64),
+                    f4=Fj_f32.astype(np.float64),
+                )
+
+                if direction == "forward":
+                    eta = _fwm_efficiency(
+                        delta_alpha=delta_alpha.astype(np.float64),
+                        delta_beta=delta_beta,
+                        L=fiber.L,
+                    )
+                    integrand = (D_f32 ** 2) * eta * Gi_f32 * Gj_f32 * Gk_2d
+                    integral_ij = np.sum(integrand[valid_mask_2d]) * df * df
+                    out[start + j] = (
+                        4.0 * (fiber.gamma ** 2)
+                        * np.exp(-alpha1 * fiber.L)
+                        * integral_ij
+                        / 9.0
+                    )
+                else:
+                    A = delta_alpha + 2.0 * alpha1
+                    B = delta_alpha / 2.0 + 2.0 * alpha1
+                    C = 2.0 * alpha1 * np.ones_like(A)
+                    denom = np.asarray(
+                        delta_alpha ** 2 / 4.0 + delta_beta ** 2,
+                        dtype=np.float64,
+                    )
+                    alpha1_f64 = float(alpha1)
+                    F_L = _F_antiderivative(
+                        l=np.full_like(A, fiber.L, dtype=np.float64),
+                        z_obs=0.0,
+                        alpha1=alpha1_f64, A=A.astype(np.float64),
+                        B=B.astype(np.float64), C=C.astype(np.float64), denom=denom,
+                    )
+                    F_0 = _F_antiderivative(
+                        l=np.zeros_like(A, dtype=np.float64),
+                        z_obs=0.0,
+                        alpha1=alpha1_f64, A=A.astype(np.float64),
+                        B=B.astype(np.float64), C=C.astype(np.float64), denom=denom,
+                    )
+                    integrand = (D_f32 ** 2) * Gi_f32 * Gj_f32 * Gk_2d * (
+                        F_L - F_0
+                    ).astype(np.float32)
+                    integral_ij = np.sum(integrand[valid_mask_2d]) * df * df
+                    out[start + j] = (
+                        fiber.rayleigh_coeff * (fiber.gamma ** 2) * integral_ij / 9.0
+                    )
+
+        return out

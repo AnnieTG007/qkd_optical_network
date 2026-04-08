@@ -29,7 +29,7 @@ sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 
 from qkd_sim.config.schema import FiberConfig, WDMConfig
 from qkd_sim.physical.fiber import Fiber
-from qkd_sim.physical.noise import DiscreteFWMSolver, DiscreteSPRSSolver, compute_noise
+from qkd_sim.physical.noise import DiscreteFWMSolver, DiscreteSPRSSolver, compute_noise, compute_noise_spectrum
 from qkd_sim.physical.signal import (
     SpectrumType, WDMGrid, build_frequency_grid, build_wdm_grid,
 )
@@ -69,6 +69,10 @@ CLASSICAL_INDICES = [39, 40, 41]
 
 FREQ_GRID_RESOLUTION_HZ = 0.1e9
 FREQ_GRID_PADDING_FACTOR = 1.5
+
+# 噪声 PSD 谱计算专用网格（可更粗，加速 FWM 双网格积分）
+# 5 GHz 分辨率：~1000 点 vs 0.1 GHz 的 ~50000 点，快 50 倍
+NOISE_SPECTRUM_RESOLUTION_HZ = 5e9
 
 OSA_RBW_HZ = 1.0e9  # OSA 分辨率带宽 [Hz]（仅影响中间 PSD 标定，归一化后无影响）
 
@@ -184,27 +188,53 @@ def _select_reference_quantum_slot(
 # Scenario 1: C-band model comparison
 # ===========================================================================
 
+def _build_noise_spectrum_grid(
+    config: WDMConfig,
+    resolution: float = NOISE_SPECTRUM_RESOLUTION_HZ,
+    padding_factor: float = 1.5,
+) -> np.ndarray:
+    """构建噪声 PSD 谱计算的专用频率网格（较粗分辨率）。"""
+    half_span = (config.N_ch - 1) / 2 * config.channel_spacing
+    padding = padding_factor * config.channel_spacing
+    f_min = config.f_center - half_span - padding
+    f_max = config.f_center + half_span + padding
+    n_points = int(np.ceil((f_max - f_min) / resolution)) + 1
+    return np.linspace(f_min, f_max, n_points)
+
+
 def _compute_spectrum_comparison_results(
     fiber: Fiber,
     config: WDMConfig,
     f_grid: np.ndarray,
+    noise_f_grid: np.ndarray,
     osa_csv_path: Path,
 ) -> list[ModelSpectrumResult]:
+    """使用 compute_noise_spectrum() 计算每个模型在 noise_f_grid 每点的噪声 PSD。
+
+    信号 PSD 在高分辨率 f_grid 上计算；噪声 PSD 在较粗 noise_f_grid 上计算
+    （以避免 FWM 双网格积分 O(N_f × N_c²) 的性能问题）。
+
+    返回 ModelSpectrumResult（使用 PSD 字段）。
+    """
     results: list[ModelSpectrumResult] = []
+    noise_df_hz = float(np.mean(np.diff(noise_f_grid)))
+
     for model_key, spec in MODEL_SPECS.items():
         grid = _build_model_grid(model_key, config, f_grid, osa_csv_path)
-        noise = compute_noise(
+
+        # 噪声 PSD 在较粗网格上计算（加速）
+        noise_psd = compute_noise_spectrum(
             "all",
             fiber,
             grid,
+            f_grid=noise_f_grid,
             sprs_solver=DiscreteSPRSSolver(),
             fwm_solver=DiscreteFWMSolver(),
             continuous=spec["continuous"],
         )
-        q_freqs = np.array(
-            [ch.f_center for ch in grid.get_quantum_channels()], dtype=np.float64
-        )
+
         signal_psd = _get_signal_psd(grid, f_grid, model_key)
+
         results.append(
             ModelSpectrumResult(
                 key=model_key,
@@ -212,9 +242,10 @@ def _compute_spectrum_comparison_results(
                 color=get_model_color(model_key),
                 f_signal_hz=f_grid,
                 signal_psd_W_per_Hz=signal_psd,
-                f_quantum_hz=q_freqs,
-                fwm_W=np.asarray(noise["fwm_fwd"], dtype=np.float64),
-                sprs_W=np.asarray(noise["sprs_fwd"], dtype=np.float64),
+                f_noise_hz=noise_f_grid,
+                noise_df_hz=noise_df_hz,
+                fwm_psd_W_per_Hz=np.asarray(noise_psd["fwm"], dtype=np.float64),
+                sprs_psd_W_per_Hz=np.asarray(noise_psd["sprs"], dtype=np.float64),
             )
         )
     return results
@@ -239,13 +270,18 @@ def _compute_length_sweep_results(
             fp = dict(FIBER_PARAMS)
             fp["L_km"] = float(length_km)
             fiber = Fiber(FiberConfig(**fp))
+            # Use discrete computation (continuous=False) for length sweep.
+            # Continuous FWM/SpRS requires large meshgrids on the high-res f_grid
+            # (N_active ≈ 25000 for 1-quantum + 79-classical case → OOM).
+            # Discrete computation gives channel-integrated noise (scalar) at each
+            # quantum channel center, preserving the L-scaling physics correctly.
             noise = compute_noise(
                 "all",
                 fiber,
                 grid,
                 sprs_solver=DiscreteSPRSSolver(),
                 fwm_solver=DiscreteFWMSolver(),
-                continuous=spec["continuous"],
+                continuous=False,
             )
             fwm_vals.append(float(noise["fwm_fwd"][0]))
             sprs_vals.append(float(noise["sprs_fwd"][0]))
@@ -284,6 +320,15 @@ def main() -> None:
         padding_factor=FREQ_GRID_PADDING_FACTOR,
     )
 
+    # 噪声 PSD 使用较粗分辨率网格（加速 FWM 双网格积分）
+    noise_f_grid = _build_noise_spectrum_grid(
+        wdm_config,
+        resolution=NOISE_SPECTRUM_RESOLUTION_HZ,
+        padding_factor=FREQ_GRID_PADDING_FACTOR,
+    )
+    n_noise_points = len(noise_f_grid)
+    print(f"  Noise PSD grid: {n_noise_points} points @ {NOISE_SPECTRUM_RESOLUTION_HZ/1e9:.1f} GHz")
+
     n_classical = len(CLASSICAL_INDICES)
     n_quantum = WDM_PARAMS["N_ch"] - n_classical
     run_tag = f"phase4_N{WDM_PARAMS['N_ch']}_C{n_classical}"
@@ -294,7 +339,9 @@ def main() -> None:
     # ---- Scenario 1 ----
     print("\nScenario 1: C-band model comparison")
     spectrum_results = _compute_spectrum_comparison_results(
-        fiber=fiber, config=wdm_config, f_grid=f_grid, osa_csv_path=osa_csv_path
+        fiber=fiber, config=wdm_config,
+        f_grid=f_grid, noise_f_grid=noise_f_grid,
+        osa_csv_path=osa_csv_path,
     )
 
     fig_W = make_model_comparison_figure(spectrum_results, unit="W")

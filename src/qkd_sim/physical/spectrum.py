@@ -442,19 +442,24 @@ def _ylabel_psd(unit: str) -> str:
 
 @dataclass
 class ModelSpectrumResult:
-    """单信号模型的噪声频谱结果（用于模型对比图）。"""
+    """单信号模型的噪声频谱结果（用于模型对比图）。
+
+    使用噪声 PSD（连续曲线）而非信道积分噪声（标量）。
+    f_noise_hz 上的 G_noise(f) 即为噪声功率谱密度 [W/Hz]。
+    """
     key: str
     label: str
     color: str
     f_signal_hz: np.ndarray
     signal_psd_W_per_Hz: np.ndarray
-    f_quantum_hz: np.ndarray
-    fwm_W: np.ndarray
-    sprs_W: np.ndarray
+    f_noise_hz: np.ndarray
+    noise_df_hz: float
+    fwm_psd_W_per_Hz: np.ndarray
+    sprs_psd_W_per_Hz: np.ndarray
 
     @property
-    def total_W(self) -> np.ndarray:
-        return self.fwm_W + self.sprs_W
+    def total_psd_W_per_Hz(self) -> np.ndarray:
+        return self.fwm_psd_W_per_Hz + self.sprs_psd_W_per_Hz
 
 
 @dataclass
@@ -472,16 +477,32 @@ class ModelLengthSweepResult:
         return self.fwm_W + self.sprs_W
 
 
+def _noise_bin_power(psd: np.ndarray, df: float, unit: str) -> np.ndarray:
+    """将噪声 PSD [W/Hz] 转换为每 bin 功率用于绘图。"""
+    floor_W = np.finfo(np.float64).tiny
+    power_W = np.maximum(psd * df, floor_W)
+    if unit == "W":
+        return power_W
+    return _to_display(power_W, unit)
+
+
+def _ylabel_noise_bin(unit: str) -> str:
+    return "G_noise(f) × df [W]" if unit == "W" else "G_noise(f) × df [dBm]"
+
+
 def make_model_comparison_figure(
     results: Sequence[ModelSpectrumResult],
     unit: str = "W",
 ) -> Figure:
-    """绘制 2×2 多信号模型噪声功率谱对比图。
+    """绘制 2×2 多信号模型噪声功率谱对比图（使用噪声 PSD 曲线）。
+
+    噪声子图使用 G_noise(f) × df 曲线，而非信道积分噪声标量。
+    这使得连续模型的宽带低峰特性得以体现。
 
     子图布局：
-      (0,0) FWM 噪声 vs 量子信道频率
-      (0,1) SpRS 噪声 vs 量子信道频率
-      (1,0) 总噪声 vs 量子信道频率
+      (0,0) FWM 噪声 PSD 谱 vs 频率
+      (0,1) SpRS 噪声 PSD 谱 vs 频率
+      (1,0) 总噪声 PSD 谱 vs 频率
       (1,1) 信号发射 PSD（离散=竖线，连续=曲线）
 
     Parameters
@@ -500,29 +521,34 @@ def make_model_comparison_figure(
     ax_total, ax_signal = axes[1]
 
     for result in results:
-        f_q_THz = result.f_quantum_hz / 1e12
+        f_noise_THz = result.f_noise_hz / 1e12
         ax_fwm.plot(
-            f_q_THz, _to_display(result.fwm_W, unit),
+            f_noise_THz,
+            _noise_bin_power(result.fwm_psd_W_per_Hz, result.noise_df_hz, unit),
             color=result.color, linewidth=2.0, label=result.label,
         )
         ax_sprs.plot(
-            f_q_THz, _to_display(result.sprs_W, unit),
+            f_noise_THz,
+            _noise_bin_power(result.sprs_psd_W_per_Hz, result.noise_df_hz, unit),
             color=result.color, linewidth=2.0, label=result.label,
         )
         ax_total.plot(
-            f_q_THz, _to_display(result.total_W, unit),
+            f_noise_THz,
+            _noise_bin_power(result.total_psd_W_per_Hz, result.noise_df_hz, unit),
             color=result.color, linewidth=2.0, label=result.label,
         )
 
     for ax, title in [
-        (ax_fwm, "FWM Noise"),
-        (ax_sprs, "SpRS Noise"),
-        (ax_total, "Total Noise"),
+        (ax_fwm, "FWM Noise PSD Spectrum"),
+        (ax_sprs, "SpRS Noise PSD Spectrum"),
+        (ax_total, "Total Noise PSD Spectrum"),
     ]:
         ax.set_title(title)
-        ax.set_xlabel("Quantum Channel Frequency [THz]")
-        ax.set_ylabel(_ylabel(unit))
-        ax.grid(True, alpha=0.3)
+        ax.set_xlabel("Frequency [THz]")
+        ax.set_ylabel(_ylabel_noise_bin(unit))
+        ax.grid(True, alpha=0.3, which="both")
+        if unit == "W":
+            ax.set_yscale("log")
 
     # 信号 PSD 子图
     reference = results[0]
@@ -544,10 +570,10 @@ def make_model_comparison_figure(
                 color=result.color, linewidth=2.0, label=result.label,
             )
 
-    for fq in reference.f_quantum_hz / 1e12:
+    for fq in reference.f_noise_hz / 1e12:
         ax_signal.axvline(fq, color="#999999", linestyle=":", linewidth=0.5, alpha=0.15)
 
-    ax_signal.set_title("Signal Launch Spectrum")
+    ax_signal.set_title("Signal Launch PSD")
     ax_signal.set_xlabel("Frequency [THz]")
     ax_signal.set_ylabel(_ylabel_psd(unit))
     ax_signal.grid(True, alpha=0.3)

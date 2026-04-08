@@ -11,11 +11,12 @@ NoiseSolver         — 抽象基类（用于自定义求解器）
 from qkd_sim.physical.noise.base import NoiseSolver
 from qkd_sim.physical.noise.sprs_solver import DiscreteSPRSSolver
 from qkd_sim.physical.noise.fwm_solver import DiscreteFWMSolver
-from qkd_sim.physical.noise.dispatcher import compute_noise
+from qkd_sim.physical.noise.dispatcher import compute_noise, compute_noise_spectrum
 
 __all__ = [
     "NoiseSolver",
     "DiscreteSPRSSolver",
     "DiscreteFWMSolver",
     "compute_noise",
+    "compute_noise_spectrum",
 ]
