@@ -63,17 +63,16 @@ def _F_antiderivative(
     l: np.ndarray,
     z_obs: float,
     alpha1: float,
-    A: np.ndarray,
-    B: np.ndarray,
-    C: np.ndarray,
-    denom: np.ndarray,
+    delta_alpha: np.ndarray,
+    delta_beta: np.ndarray,
+    L: float,
 ) -> np.ndarray:
     """后向 FWM 积分原函数 F(l)。
 
     公式 2.2.6 (formulas_fwm.md):
         F(l) = exp(α₁·z_obs) / denom × [-exp(-A·l)/A - exp(-B·l)/B² - exp(-C·l)/C]
 
-    其中辅助变量：
+    辅助变量（函数内部计算）：
         A = Δα + 2·α₁
         B = Δα/2 + 2·α₁   （注：分母中为 B²，源自二次项积分，见公式推导）
         C = 2·α₁
@@ -89,16 +88,24 @@ def _F_antiderivative(
         观测位置 [m]（评估后向噪声的位置，通常为 0）
     alpha1 : float
         量子信道衰减 α₁ [1/m]
-    A, B, C : ndarray
-        辅助变量（与 l 广播兼容）
-    denom : ndarray
-        (Δα)²/4 + (Δβ)² [1/m²]
+    delta_alpha : ndarray
+        衰减失配 Δα = α_k + α_i + α_j - α₁ [1/m]
+    delta_beta : ndarray
+        相位失配 Δβ [rad/m]
+    L : float
+        光纤长度 [m]
 
     Returns
     -------
     ndarray
         F(l) 的值
     """
+    # 辅助变量（内部计算）
+    A = delta_alpha + 2.0 * alpha1
+    B = delta_alpha / 2.0 + 2.0 * alpha1
+    C = 2.0 * alpha1 * np.ones_like(delta_alpha)
+    denom = (delta_alpha ** 2) / 4.0 + delta_beta ** 2
+
     exp_z = np.exp(alpha1 * z_obs)
     term_A = -np.exp(-A * l) / A
     term_B = -np.exp(-B * l) / (B ** 2)  # 注：B² 来自二次项的部分分数展开
@@ -233,20 +240,15 @@ class DiscreteFWMSolver(NoiseSolver):
 
         else:  # backward
             # 公式 2.2.4-2.2.7：瑞利散射积分解析式
-            # 辅助变量（公式 2.2.5）
-            A = delta_alpha + 2.0 * alpha  # shape (N_valid,)
-            B = delta_alpha / 2.0 + 2.0 * alpha
-            C = 2.0 * alpha * np.ones_like(A)
-            denom = delta_alpha ** 2 / 4.0 + delta_beta ** 2
-
             # z_obs = 0（光纤发射端），exp(α₁·0) = 1
+            # 辅助变量 A、B、C、denom 由 _F_antiderivative 内部计算
             F_L = _F_antiderivative(
-                l=np.full_like(A, L), z_obs=0.0,
-                alpha1=alpha, A=A, B=B, C=C, denom=denom,
+                l=np.full_like(delta_alpha, L), z_obs=0.0,
+                alpha1=alpha, delta_alpha=delta_alpha, delta_beta=delta_beta, L=L,
             )
             F_0 = _F_antiderivative(
-                l=np.zeros_like(A), z_obs=0.0,
-                alpha1=alpha, A=A, B=B, C=C, denom=denom,
+                l=np.zeros_like(delta_alpha), z_obs=0.0,
+                alpha1=alpha, delta_alpha=delta_alpha, delta_beta=delta_beta, L=L,
             )
 
             contributions = (
@@ -548,28 +550,22 @@ class DiscreteFWMSolver(NoiseSolver):
             delta_alpha = alpha_k + alpha_i + alpha_j - alpha1
             delta_beta = fiber.get_phase_mismatch(f2=Fk, f3=Fi, f4=Fj)
 
-            A = delta_alpha + 2.0 * alpha1
-            B = delta_alpha / 2.0 + 2.0 * alpha1
-            C = 2.0 * alpha1 * np.ones_like(A)
-            denom = delta_alpha ** 2 / 4.0 + delta_beta ** 2
-
+            # 辅助变量 A、B、C、denom 由 _F_antiderivative 内部计算
             F_L = _F_antiderivative(
-                l=np.full_like(A, L),
+                l=np.full_like(delta_alpha, L),
                 z_obs=0.0,
                 alpha1=alpha1,
-                A=A,
-                B=B,
-                C=C,
-                denom=denom,
+                delta_alpha=delta_alpha,
+                delta_beta=delta_beta,
+                L=L,
             )
             F_0 = _F_antiderivative(
-                l=np.zeros_like(A),
+                l=np.zeros_like(delta_alpha),
                 z_obs=0.0,
                 alpha1=alpha1,
-                A=A,
-                B=B,
-                C=C,
-                denom=denom,
+                delta_alpha=delta_alpha,
+                delta_beta=delta_beta,
+                L=L,
             )
 
             integrand = (D ** 2) * Gi * Gj * Gk * (F_L - F_0)
@@ -717,25 +713,22 @@ class DiscreteFWMSolver(NoiseSolver):
                         / 9.0
                     )
                 else:
-                    A = delta_alpha + 2.0 * alpha1
-                    B = delta_alpha / 2.0 + 2.0 * alpha1
-                    C = 2.0 * alpha1 * np.ones_like(A)
-                    denom = np.asarray(
-                        delta_alpha ** 2 / 4.0 + delta_beta ** 2,
-                        dtype=np.float64,
-                    )
                     alpha1_f64 = float(alpha1)
                     F_L = _F_antiderivative(
-                        l=np.full_like(A, fiber.L, dtype=np.float64),
+                        l=np.full_like(delta_alpha, fiber.L),
                         z_obs=0.0,
-                        alpha1=alpha1_f64, A=A.astype(np.float64),
-                        B=B.astype(np.float64), C=C.astype(np.float64), denom=denom,
+                        alpha1=alpha1_f64,
+                        delta_alpha=delta_alpha,
+                        delta_beta=delta_beta,
+                        L=fiber.L,
                     )
                     F_0 = _F_antiderivative(
-                        l=np.zeros_like(A, dtype=np.float64),
+                        l=np.zeros_like(delta_alpha),
                         z_obs=0.0,
-                        alpha1=alpha1_f64, A=A.astype(np.float64),
-                        B=B.astype(np.float64), C=C.astype(np.float64), denom=denom,
+                        alpha1=alpha1_f64,
+                        delta_alpha=delta_alpha,
+                        delta_beta=delta_beta,
+                        L=fiber.L,
                     )
                     integrand = (D_f32 ** 2) * Gi_f32 * Gj_f32 * Gk_2d * (
                         F_L - F_0
