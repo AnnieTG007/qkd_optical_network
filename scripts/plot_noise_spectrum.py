@@ -27,6 +27,7 @@ matplotlib.use("Agg")
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 
+from qkd_sim.config.plot_config import get_color, load_model_specs
 from qkd_sim.config.schema import FiberConfig, WDMConfig
 from qkd_sim.physical.fiber import Fiber
 from qkd_sim.physical.noise import DiscreteFWMSolver, DiscreteSPRSSolver, compute_noise, compute_noise_spectrum
@@ -36,7 +37,6 @@ from qkd_sim.physical.signal import (
 from qkd_sim.physical.spectrum import (
     ModelLengthSweepResult,
     ModelSpectrumResult,
-    get_model_color,
     make_model_comparison_figure,
     make_noise_vs_length_figure,
 )
@@ -81,63 +81,11 @@ LENGTH_SWEEP_KM = np.linspace(1.0, 100.0, 100)
 
 OSA_CSV_PATH = _PROJECT_ROOT / "data" / "osa"
 
-MODEL_SPECS = {
-    "discrete": {
-        "label": "Discrete",
-        "spectrum_type": SpectrumType.SINGLE_FREQ,
-        "continuous": False,
-    },
-    "raised_cosine": {
-        "label": "Raised Cosine (β=0 ≡ Rectangular)",
-        "spectrum_type": SpectrumType.RAISED_COSINE,
-        "continuous": True,
-    },
-    "osa": {
-        "label": "OSA",
-        "spectrum_type": SpectrumType.OSA_SAMPLED,
-        "continuous": True,
-    },
-}
+# ---- 噪声谱对比模型列表（从 YAML 加载）----
+MODEL_SPECS = load_model_specs("noise_spectrum")
 
-# 信号发射 PSD 对比专用模型列表（支持多种 RC 滚降系数）
-SIGNAL_TX_SPECS = {
-    "discrete": {
-        "label": "Discrete",
-        "spectrum_type": SpectrumType.SINGLE_FREQ,
-        "continuous": False,
-        "beta_rolloff": None,
-    },
-    "rc_beta0": {
-        "label": "RC (β=0, ≡Rect)",
-        "spectrum_type": SpectrumType.RAISED_COSINE,
-        "continuous": True,
-        "beta_rolloff": 0.0,
-    },
-    "rc_beta001": {
-        "label": "RC (β=0.01)",
-        "spectrum_type": SpectrumType.RAISED_COSINE,
-        "continuous": True,
-        "beta_rolloff": 0.01,
-    },
-    "rc_beta01": {
-        "label": "RC (β=0.1)",
-        "spectrum_type": SpectrumType.RAISED_COSINE,
-        "continuous": True,
-        "beta_rolloff": 0.1,
-    },
-    "rc_beta05": {
-        "label": "RC (β=0.5)",
-        "spectrum_type": SpectrumType.RAISED_COSINE,
-        "continuous": True,
-        "beta_rolloff": 0.5,
-    },
-    "osa": {
-        "label": "OSA",
-        "spectrum_type": SpectrumType.OSA_SAMPLED,
-        "continuous": True,
-        "beta_rolloff": None,
-    },
-}
+# ---- 信号发射 PSD 对比模型列表（从 YAML 加载）----
+SIGNAL_TX_SPECS = load_model_specs("signal_tx")
 
 
 # ===========================================================================
@@ -315,15 +263,37 @@ def _compute_spectrum_comparison_results(
         grid = _build_model_grid(model_key, config, f_grid, osa_csv_path)
 
         # 噪声 PSD 在较粗网格上计算（加速）
-        noise_psd = compute_noise_spectrum(
-            "all",
-            fiber,
-            grid,
-            f_grid=noise_f_grid,
-            sprs_solver=DiscreteSPRSSolver(),
-            fwm_solver=DiscreteFWMSolver(),
-            continuous=spec["continuous"],
-        )
+        # continuous=False → 离散模型用 compute_noise()（返回积分噪声标量）
+        # continuous=True  → 连续模型用 compute_noise_spectrum()（返回 PSD 数组）
+        if spec["continuous"]:
+            noise_psd = compute_noise_spectrum(
+                "all",
+                fiber,
+                grid,
+                f_grid=noise_f_grid,
+                sprs_solver=DiscreteSPRSSolver(),
+                fwm_solver=DiscreteFWMSolver(),
+            )
+        else:
+            noise_dict = compute_noise(
+                "all",
+                fiber,
+                grid,
+                sprs_solver=DiscreteSPRSSolver(),
+                fwm_solver=DiscreteFWMSolver(),
+                continuous=False,
+            )
+            # 离散模型：每个量子信道频率处放置积分噪声，其余频率为零
+            noise_psd_f = np.zeros(len(noise_f_grid), dtype=np.float64)
+            noise_sprs_f = np.zeros(len(noise_f_grid), dtype=np.float64)
+            df = float(np.mean(np.diff(noise_f_grid)))
+            q_chs = grid.get_quantum_channels()
+            f_q_arr = np.array([ch.f_center for ch in q_chs])
+            for i, f_ch in enumerate(f_q_arr):
+                idx = int(np.argmin(np.abs(noise_f_grid - f_ch)))
+                noise_psd_f[idx] = noise_dict["fwm_fwd"][i] / df
+                noise_sprs_f[idx] = noise_dict["sprs_fwd"][i] / df
+            noise_psd = dict(fwm=noise_psd_f, sprs=noise_sprs_f)
 
         signal_psd = _get_signal_psd(grid, f_grid, model_key)
 
@@ -331,7 +301,7 @@ def _compute_spectrum_comparison_results(
             ModelSpectrumResult(
                 key=model_key,
                 label=spec["label"],
-                color=get_model_color(model_key),
+                color=get_color(model_key),
                 f_signal_hz=f_grid,
                 signal_psd_W_per_Hz=signal_psd,
                 f_noise_hz=noise_f_grid,
@@ -344,7 +314,7 @@ def _compute_spectrum_comparison_results(
 
 
 # ===========================================================================
-# Scenario 2: Noise vs fiber length
+# Scenario 2: FWM_Noise vs fiber length
 # ===========================================================================
 
 def _compute_length_sweep_results(
@@ -381,7 +351,7 @@ def _compute_length_sweep_results(
             ModelLengthSweepResult(
                 key=model_key,
                 label=spec["label"],
-                color=get_model_color(model_key),
+                color=get_color(model_key),
                 length_km=np.asarray(LENGTH_SWEEP_KM, dtype=np.float64),
                 fwm_W=np.asarray(fwm_vals, dtype=np.float64),
                 sprs_W=np.asarray(sprs_vals, dtype=np.float64),
@@ -419,7 +389,7 @@ def main() -> None:
         padding_factor=FREQ_GRID_PADDING_FACTOR,
     )
     n_noise_points = len(noise_f_grid)
-    print(f"  Noise PSD grid: {n_noise_points} points @ {NOISE_SPECTRUM_RESOLUTION_HZ/1e9:.1f} GHz")
+    print(f"  FWM_Noise PSD grid: {n_noise_points} points @ {NOISE_SPECTRUM_RESOLUTION_HZ/1e9:.1f} GHz")
 
     n_classical = len(CLASSICAL_INDICES)
     n_quantum = WDM_PARAMS["N_ch"] - n_classical
@@ -446,7 +416,7 @@ def main() -> None:
     print(f"  Saved: phase4_model_comparison_dBm.png")
 
     # ---- Scenario 2 ----
-    print("\nScenario 2: Noise vs fiber length")
+    print("\nScenario 2: FWM_Noise vs fiber length")
     q_index, q_freq_hz = _select_reference_quantum_slot(
         wdm_config, CLASSICAL_INDICES, FIXED_QUANTUM_TARGET_FREQ_HZ
     )

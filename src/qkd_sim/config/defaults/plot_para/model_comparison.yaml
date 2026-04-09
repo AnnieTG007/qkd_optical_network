@@ -1,0 +1,98 @@
+# 统一绘图模型配置
+# 所有对比绘图脚本（signal_tx, fwm_noise 等）共用此配置
+# Usage: load_model_config() -> dict
+
+# =============================================================================
+# 模型定义（所有可用模型）
+# =============================================================================
+models:
+
+  # ---- 离散模型 ----
+  discrete:
+    label: "Discrete"
+    spectrum_type: SINGLE_FREQ
+    continuous: false
+    beta_rolloff: null
+
+  # ---- Raised Cosine 系列 ----
+  raised_cosine:   # 别名，plot_noise_spectrum.py 兼容
+    label: "Raised Cosine (β=0 ≡ Rectangular)"
+    spectrum_type: RAISED_COSINE
+    continuous: true
+    beta_rolloff: 0.0
+
+  rc_beta0:       # 同 raised_cosine（别名，用于 signal_tx 等）
+    label: "RC (β=0, ≡Rect)"
+    spectrum_type: RAISED_COSINE
+    continuous: true
+    beta_rolloff: 0.0
+
+  rc_beta001:
+    label: "RC (β=0.01)"
+    spectrum_type: RAISED_COSINE
+    continuous: true
+    beta_rolloff: 0.01
+
+  rc_beta02:
+    label: "RC (β=0.2)"
+    spectrum_type: RAISED_COSINE
+    continuous: true
+    beta_rolloff: 0.2
+
+  rc_beta05:
+    label: "RC (β=0.5)"
+    spectrum_type: RAISED_COSINE
+    continuous: true
+    beta_rolloff: 0.5
+
+  rc_beta1:
+    label: "RC (β=1)"
+    spectrum_type: RAISED_COSINE
+    continuous: true
+    beta_rolloff: 1.0
+
+  # ---- OSA 模型 ----
+  osa:
+    label: "OSA"
+    spectrum_type: OSA_SAMPLED
+    continuous: true
+    beta_rolloff: null
+
+# =============================================================================
+# 绘图颜色（与模型 key 一一对应）
+# =============================================================================
+colors:
+  discrete:       "#202020"
+  raised_cosine:  "#1f77b4"
+  rc_beta0:       "#1f77b4"
+  rc_beta001:     "#aec7e8"
+  rc_beta02:      "#ff7f0e"
+  rc_beta05:      "#ff7f0e"
+  rc_beta1:       "#d95f02"
+  osa:            "#2ca02c"
+
+# =============================================================================
+# 模型分组（不同绘图场景使用的模型列表）
+# =============================================================================
+model_groups:
+
+  # Signal TX 对比：6 个模型
+  signal_tx:
+    - discrete
+    - rc_beta0
+    - rc_beta001
+    - rc_beta05
+    - rc_beta1
+    - osa
+
+  # FWM Noise PSD 对比：3 个模型
+  fwm_noise:
+    - discrete
+    - rc_beta02
+    - osa
+
+  # Phase 4 噪声谱综合对比（离散 / RC(β=0) / OSA）
+  noise_spectrum:
+    - discrete
+    - raised_cosine
+    - osa

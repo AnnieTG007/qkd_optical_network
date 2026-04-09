@@ -4,8 +4,8 @@
   - Discrete: delta 近似（stem）
   - Raised Cosine β=0 (≡矩形)
   - Raised Cosine β=0.01
-  - Raised Cosine β=0.1
   - Raised Cosine β=0.5
+  - Raised Cosine β=1
   - OSA
 
 输出到: outputs/phase4_N80_C3/Signal_TX/
@@ -19,6 +19,14 @@ from pathlib import Path
 
 import numpy as np
 
+# Plotly 用于交互式绘图（支持点击图例动态开关各模型曲线）
+try:
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    _PLOTLY_AVAILABLE = True
+except ImportError:
+    _PLOTLY_AVAILABLE = False
+
 # ---- 项目路径 setup ----
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _SCRIPT_DIR.parent
@@ -27,12 +35,8 @@ sys.path.insert(0, str(_PROJECT_ROOT))   # 让 scripts/ 可作为包导入
 sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 
 from qkd_sim.config.schema import WDMConfig
-from qkd_sim.physical.signal import build_wdm_grid, SpectrumType
-from qkd_sim.physical.spectrum import (
-    make_signal_psd_comparison_figure,
-    SignalPSDResult,
-    get_model_color,
-)
+from qkd_sim.config.plot_config import get_color, load_model_specs
+from qkd_sim.physical.spectrum import SignalPSDResult
 
 # ============================================================================
 # 配置参数（与 plot_noise_spectrum.py 保持一致）
@@ -55,45 +59,6 @@ FREQ_GRID_PADDING_FACTOR = 1.5
 OSA_RBW_HZ = 1.0e9
 OSA_CSV_PATH = _PROJECT_ROOT / "data" / "osa"
 
-# ---- 信号 PSD 对比专用模型列表（与 plot_noise_spectrum.py 保持一致） ----
-SIGNAL_TX_SPECS = {
-    "discrete": {
-        "label": "Discrete",
-        "spectrum_type": SpectrumType.SINGLE_FREQ,
-        "continuous": False,
-        "beta_rolloff": None,
-    },
-    "rc_beta0": {
-        "label": "RC (β=0, ≡Rect)",
-        "spectrum_type": SpectrumType.RAISED_COSINE,
-        "continuous": True,
-        "beta_rolloff": 0.0,
-    },
-    "rc_beta001": {
-        "label": "RC (β=0.01)",
-        "spectrum_type": SpectrumType.RAISED_COSINE,
-        "continuous": True,
-        "beta_rolloff": 0.01,
-    },
-    "rc_beta01": {
-        "label": "RC (β=0.1)",
-        "spectrum_type": SpectrumType.RAISED_COSINE,
-        "continuous": True,
-        "beta_rolloff": 0.1,
-    },
-    "rc_beta05": {
-        "label": "RC (β=0.5)",
-        "spectrum_type": SpectrumType.RAISED_COSINE,
-        "continuous": True,
-        "beta_rolloff": 0.5,
-    },
-    "osa": {
-        "label": "OSA",
-        "spectrum_type": SpectrumType.OSA_SAMPLED,
-        "continuous": True,
-        "beta_rolloff": None,
-    },
-}
 
 
 def _resolve_osa_csv() -> Path:
@@ -151,6 +116,7 @@ def _compute_signal_tx_results(
     wdm_config: WDMConfig,
     f_grid: np.ndarray,
     osa_csv_path: Path,
+    specs: dict[str, dict],
 ) -> list[SignalPSDResult]:
     """计算所有信号模型的 PSD 结果。
 
@@ -162,6 +128,8 @@ def _compute_signal_tx_results(
         频率网格
     osa_csv_path : Path
         OSA CSV 文件路径
+    specs : dict[str, dict]
+        从 load_model_specs("signal_tx") 获取的模型规格字典
 
     Returns
     -------
@@ -171,12 +139,7 @@ def _compute_signal_tx_results(
 
     results: list[SignalPSDResult] = []
 
-    for model_key, spec in SIGNAL_TX_SPECS.items():
-        grid = _build_signal_tx_grid(model_key, wdm_config, f_grid, osa_csv_path)
-
-    results: list[SignalPSDResult] = []
-
-    for model_key, spec in SIGNAL_TX_SPECS.items():
+    for model_key, spec in specs.items():
         grid = _build_signal_tx_grid(model_key, wdm_config, f_grid, osa_csv_path)
 
         if model_key == "discrete":
@@ -190,7 +153,7 @@ def _compute_signal_tx_results(
             SignalPSDResult(
                 key=model_key,
                 label=spec["label"],
-                color=get_model_color(model_key),
+                color=spec["color"],
                 f_hz=f_grid,
                 psd_W_per_Hz=psd,
                 integrated_power_W=integrated_power,
@@ -238,6 +201,238 @@ def _export_csv(results: list[SignalPSDResult], out_dir: Path) -> None:
     (out_dir / "signal_tx.csv").write_text("\n".join(csv_lines), encoding="utf-8")
 
 
+def _to_dBm_for_plotly(v: np.ndarray | float) -> np.ndarray | float:
+    """将功率 [W] 转换为 dBm（向量化，支持数组输入）。"""
+    v_arr = np.asarray(v, dtype=np.float64)
+    return 10.0 * np.log10(np.maximum(v_arr, 1e-30)) + 30.0
+
+
+def _compute_power_per_bin(result: SignalPSDResult) -> np.ndarray:
+    """计算每 bin 功率 [W]（离散模型直接返回 psd，连续模型返回 psd × df）。"""
+    if result.key == "discrete":
+        return result.psd_W_per_Hz  # 信道功率 P [W]
+    df = float(np.mean(np.diff(result.f_hz)))
+    return result.psd_W_per_Hz * df  # [W]
+
+
+def make_signal_psd_plotly(results: list[SignalPSDResult]) -> go.Figure:
+    """生成 Plotly 交互式信号 PSD 对比图（双 y 轴：线性 + 对数）。
+
+    通过点击图例可以动态开关各模型曲线。
+    """
+    if not _PLOTLY_AVAILABLE:
+        raise ImportError("Plotly is not installed. Run: pip install plotly")
+
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=("Signal Launch Power per Bin (W, Log Scale)",
+                        "Signal Launch Power per Bin (dBm, Linear Scale)"),
+        shared_xaxes=False,
+    )
+
+    for idx, result in enumerate(results):
+        f_THz = result.f_hz / 1e12
+        power_bin_W = _compute_power_per_bin(result)
+        power_bin_dBm = _to_dBm_for_plotly(power_bin_W)
+
+        # 过滤零功率点
+        mask = power_bin_W > 0
+        f_plot = f_THz[mask]
+        y_lin = power_bin_W[mask]
+        y_log = power_bin_dBm[mask]
+
+        if result.key == "discrete":
+            # 离散模型：散点（marker）
+            # legendgroup 确保点击图例时同时切换左右子图的曲线
+            # col=1 的 trace 在图例中显示
+            fig.add_trace(
+                go.Scatter(
+                    x=f_plot, y=y_lin,
+                    mode="markers",
+                    marker=dict(size=6, color=result.color, symbol="circle"),
+                    name=result.label,
+                    legendgroup=result.key,
+                    showlegend=True,
+                    hovertemplate=f"f={{x:.4f}} THz<br>P={{y:.3e}} W<extra>{result.label}</extra>",
+                ),
+                row=1, col=1,
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=f_plot, y=y_log,
+                    mode="markers",
+                    marker=dict(size=6, color=result.color, symbol="circle"),
+                    name=result.label,
+                    legendgroup=result.key,
+                    showlegend=False,
+                    hovertemplate=f"f={{x:.4f}} THz<br>P={{y:.2f}} dBm<extra>{result.label}</extra>",
+                ),
+                row=1, col=2,
+            )
+        else:
+            # 连续模型：线状曲线
+            # legendgroup 确保点击图例时同时切换左右子图的曲线
+            fig.add_trace(
+                go.Scatter(
+                    x=f_plot, y=y_lin,
+                    mode="lines",
+                    line=dict(color=result.color, width=2.0),
+                    name=result.label,
+                    legendgroup=result.key,
+                    showlegend=True,
+                    hovertemplate=f"f={{x:.4f}} THz<br>P={{y:.3e}} W<extra>{result.label}</extra>",
+                ),
+                row=1, col=1,
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=f_plot, y=y_log,
+                    mode="lines",
+                    line=dict(color=result.color, width=2.0),
+                    name=result.label,
+                    legendgroup=result.key,
+                    showlegend=False,
+                    hovertemplate=f"f={{x:.4f}} THz<br>P={{y:.2f}} dBm<extra>{result.label}</extra>",
+                ),
+                row=1, col=2,
+            )
+
+    # ---- 计算动态 xlim（基于非零功率频率范围）----
+    all_f_nonzero: list[np.ndarray] = []
+    for result in results:
+        power_bin = _compute_power_per_bin(result)
+        all_f_nonzero.append((result.f_hz / 1e12)[power_bin > 0])
+    if all_f_nonzero:
+        all_f = np.concatenate(all_f_nonzero)
+        f_min = float(all_f.min()) - 0.1
+        f_max = float(all_f.max()) + 0.1
+    else:
+        f_min, f_max = 191.0, 196.0
+
+    # ---- 计算动态 ylim ----
+    all_pmax: list[float] = []
+    for result in results:
+        power_bin = _compute_power_per_bin(result)
+        nonzero = power_bin[power_bin > 0]
+        if nonzero.size > 0:
+            all_pmax.append(float(nonzero.max()))
+    if all_pmax:
+        y_bot_lin = min(all_pmax) / 10.0
+        y_top_lin = max(all_pmax) * 10.0
+        y_bot_log_dBm = _to_dBm_for_plotly(y_bot_lin)
+        y_top_log_dBm = _to_dBm_for_plotly(y_top_lin)
+    else:
+        y_bot_lin, y_top_lin = 1e-7, 1e-1
+        y_bot_log_dBm, y_top_log_dBm = -50.0, 10.0
+
+    # ---- 更新子图布局 ----
+    # 左图（col=1）：W 单位 → 对数刻度；右图（col=2）：dBm 单位 → 线性刻度
+    fig.update_xaxes(title_text="Frequency [THz]", range=[f_min, f_max], row=1, col=1)
+    fig.update_xaxes(title_text="Frequency [THz]", range=[f_min, f_max], row=1, col=2)
+    fig.update_yaxes(title_text="Power per Bin [W]", range=[y_bot_lin, y_top_lin], row=1, col=1)
+    fig.update_yaxes(title_text="Power per Bin [dBm]", range=[y_bot_log_dBm, y_top_log_dBm], row=1, col=2)
+
+    # 左图切换为对数刻度
+    fig.update_yaxes(type="log", row=1, col=1)
+
+    # ---- 样式更新 ----
+    fig.update_layout(
+        title=dict(
+            text="Signal Launch Power per Bin — Interactive (click legend to toggle models, double-click to isolate)",
+            x=0.5, xanchor="center",
+        ),
+        legend=dict(
+            title=dict(text="Signal Model"),
+            groupclick="toggleitem",
+        ),
+        template="plotly_white",
+        width=1400,
+        height=500,
+    )
+
+    return fig
+
+
+_LEGEND_SYNC_JS = """
+function syncLegendClicks() {
+    var gd = document.querySelector('.plotly-graph-div');
+    if (!gd) return;
+
+    // 从 legend item DOM 节点找到对应的 curveNumber
+    function getCurveNumber(node) {
+        if (node._plotlyCurveNumber !== undefined) return node._plotlyCurveNumber;
+        var parent = node.parentElement;
+        while (parent) {
+            if (parent._plotlyCurveNumber !== undefined) return parent._plotlyCurveNumber;
+            parent = parent.parentElement;
+        }
+        return null;
+    }
+
+    // 单击图例项：切换该模型的显示/隐藏
+    gd.on('plotly_legendclick', function(eventData) {
+        var curveNumber = getCurveNumber(eventData.node);
+        var fullData = gd._fullData || [];
+        var clickedGroup = null;
+
+        if (curveNumber !== null && fullData[curveNumber]) {
+            clickedGroup = fullData[curveNumber].legendgroup;
+        }
+        if (!clickedGroup) return true;
+
+        var groupOn = false;
+        for (var k = 0; k < gd.data.length; k++) {
+            if (gd.data[k].legendgroup === clickedGroup && gd.data[k].visible === true) {
+                groupOn = true;
+                break;
+            }
+        }
+
+        var newVal = groupOn ? 'legendonly' : true;
+        for (var m = 0; m < gd.data.length; m++) {
+            if (gd.data[m].legendgroup === clickedGroup) {
+                gd.data[m].visible = newVal;
+            }
+        }
+        Plotly.redraw(gd);
+        return false;
+    });
+
+    // 双击图例项：利用 Plotly 内置隔离行为（默认在 handler 之前执行），
+    // 在 handler 内检测是否有隐藏项：
+    //   - 有隐藏项（Plotly 刚做完隔离）→ 恢复全部
+    //   - 无隐藏项（当前全部可见）→ 无操作（Plotly 已完成隔离，保持）
+    // 效果：单击图例切换显示/隐藏；双击图例隔离单个模型，再次双击任意图例恢复全部
+    gd.on('plotly_legenddoubleclick', function(eventData) {
+        var curveNumber = getCurveNumber(eventData.node);
+        var fullData = gd._fullData || [];
+        if (!curveNumber || !fullData[curveNumber]) return true;
+
+        // Plotly 默认隔离行为已经执行，检查是否有 legendonly 项
+        var hasHidden = false;
+        for (var h = 0; h < gd.data.length; h++) {
+            if (gd.data[h].visible === 'legendonly') { hasHidden = true; break; }
+        }
+
+        if (hasHidden) {
+            // Plotly 刚隔离了某个模型，恢复全部显示
+            for (var ri = 0; ri < gd.data.length; ri++) {
+                gd.data[ri].visible = true;
+            }
+            Plotly.redraw(gd);
+        }
+        // 如果无隐藏项（当前全部可见），Plotly 的隔离已生效，无需额外操作
+        return false;
+    });
+}
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', syncLegendClicks);
+} else {
+    syncLegendClicks();
+}
+"""
+
+
 # ============================================================================
 # 主函数
 # ============================================================================
@@ -252,28 +447,33 @@ def main() -> None:
     osa_csv_path = _resolve_osa_csv()
 
     print("Computing signal PSD for all models...")
-    results = _compute_signal_tx_results(wdm_config, f_grid, osa_csv_path)
+    specs = load_model_specs("signal_tx")
+    results = _compute_signal_tx_results(wdm_config, f_grid, osa_csv_path, specs)
 
     # 打印积分功率验证
     print("\nIntegrated powers (should all be ~P0 = 1e-3 W):")
     for r in results:
         print(f"  {r.key:15s}: {r.integrated_power_W:.6e} W")
 
-    print("\nGenerating figures...")
-    fig_W = make_signal_psd_comparison_figure(results, unit="W")
-    fig_dBm = make_signal_psd_comparison_figure(results, unit="dBm")
+    print("\nGenerating Plotly interactive figure...")
+    fig = make_signal_psd_plotly(results)
+    html_path = output_dir / "signal_tx_interactive.html"
+    fig.write_html(
+        str(html_path),
+        post_script=_LEGEND_SYNC_JS,
+        include_plotlyjs="cdn",
+        full_html=True,
+    )
+    print(f"  Saved: {html_path}")
 
-    fig_W.savefig(output_dir / "signal_tx_linear.png", dpi=150, bbox_inches="tight")
-    fig_dBm.savefig(output_dir / "signal_tx_log.png", dpi=150, bbox_inches="tight")
-
-    print(f"  Saved: {output_dir / 'signal_tx_linear.png'}")
-    print(f"  Saved: {output_dir / 'signal_tx_log.png'}")
+    # 同时导出 PNG（静态备份）
+    png_path = output_dir / "signal_tx.png"
+    fig.write_image(str(png_path), width=1400, height=500, scale=2)
+    print(f"  Saved: {png_path}")
 
     _export_csv(results, output_dir)
     print(f"  Saved: {output_dir / 'signal_tx.csv'}")
 
-    import matplotlib.pyplot as plt
-    plt.close("all")
     print("\nDone.")
 
 
