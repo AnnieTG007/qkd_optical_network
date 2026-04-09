@@ -39,11 +39,11 @@ import sys
 sys.path.insert(0, str(_PROJECT_ROOT))
 sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 
+from qkd_sim.config.plot_config import get_color, load_model_specs
 from qkd_sim.config.schema import FiberConfig, WDMConfig
 from qkd_sim.physical.fiber import Fiber
 from qkd_sim.physical.signal import SpectrumType, WDMGrid, build_wdm_grid
 from qkd_sim.physical.noise import DiscreteFWMSolver
-from qkd_sim.physical.spectrum import get_model_color
 
 # ============================================================================
 # 配置参数
@@ -73,28 +73,6 @@ LENGTHS_KM = np.array([1, 2, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100])
 OSA_RBW_HZ = 1.0e9
 OSA_CSV_PATH = _PROJECT_ROOT / "data" / "osa"
 
-# ---- FWM 专用模型列表（仅 3 种）----
-FWM_MODEL_SPECS = {
-    "discrete": {
-        "label": "Discrete",
-        "spectrum_type": SpectrumType.SINGLE_FREQ,
-        "continuous": False,
-        "beta_rolloff": None,
-    },
-    "rc": {
-        "label": "RC (β=0.2)",
-        "spectrum_type": SpectrumType.RAISED_COSINE,
-        "continuous": True,
-        "beta_rolloff": 0.2,
-        "color": "#ff7f0e",   # 橙色，独立于 spectrum.py 的 rc_beta* 键（专用于 RC β=0.2）
-    },
-    "osa": {
-        "label": "OSA",
-        "spectrum_type": SpectrumType.OSA_SAMPLED,
-        "continuous": True,
-        "beta_rolloff": None,
-    },
-}
 
 # ---- 光纤参数（defaults/fiber_para/fiber_smf.yaml）----
 FIBER_PARAMS = dict(
@@ -142,13 +120,26 @@ def _build_signal_frequency_grid(config: WDMConfig) -> np.ndarray:
 
 def _build_model_wdm_grid(
     model_key: str,
+    spec: dict,
     base_config: WDMConfig,
     f_grid: np.ndarray,
     osa_csv_path: Path,
 ) -> WDMGrid:
-    """为指定信号模型构建独立的 WDMGrid（支持 per-model beta_rolloff）。"""
-    spec = FWM_MODEL_SPECS[model_key]
+    """为指定信号模型构建独立的 WDMGrid（支持 per-model beta_rolloff）。
 
+    Parameters
+    ----------
+    model_key : str
+        模型键名
+    spec : dict
+        从 load_model_specs() 获取的模型规格字典（已含 spectrum_type/color/continuous 等）
+    base_config : WDMConfig
+        基础 WDM 配置
+    f_grid : ndarray
+        频率网格
+    osa_csv_path : Path
+        OSA CSV 文件路径
+    """
     if spec["beta_rolloff"] is not None:
         model_config = WDMConfig(
             f_center=base_config.f_center,
@@ -230,9 +221,10 @@ def compute_fwm_psd_results(
     fiber = Fiber(FiberConfig(**fp))
 
     results: list[FWMPSDResult] = []
+    specs = load_model_specs("fwm_noise")
 
-    for model_key, spec in FWM_MODEL_SPECS.items():
-        grid = _build_model_wdm_grid(model_key, base_config, f_grid, osa_csv_path)
+    for model_key, spec in specs.items():
+        grid = _build_model_wdm_grid(model_key, spec, base_config, f_grid, osa_csv_path)
 
         # 量子信道频率（用于离散模型竖线定位）
         q_chs = grid.get_quantum_channels()
@@ -283,9 +275,10 @@ def compute_fwm_length_sweep_results(
     f_grid = _build_noise_frequency_grid(base_config)
 
     results: list[FWMLengthSweepResult] = []
+    specs = load_model_specs("fwm_noise")
 
-    for model_key, spec in FWM_MODEL_SPECS.items():
-        grid = _build_model_wdm_grid(model_key, base_config, f_grid, osa_csv_path)
+    for model_key, spec in specs.items():
+        grid = _build_model_wdm_grid(model_key, spec, base_config, f_grid, osa_csv_path)
 
         # 找到中心量子信道索引
         q_chs = grid.get_quantum_channels()
