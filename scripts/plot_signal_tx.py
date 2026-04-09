@@ -60,6 +60,31 @@ OSA_RBW_HZ = 1.0e9
 OSA_CSV_PATH = _PROJECT_ROOT / "data" / "osa"
 
 
+def _build_signal_tx_annotation() -> dict:
+    """构建信号 TX 仿真参数注释。"""
+    n_classical = len(CLASSICAL_INDICES)
+    text = (
+        f"Sim Parameters\n"
+        f"  N_ch = {WDM_PARAMS['N_ch']}\n"
+        f"  N_classical = {n_classical}\n"
+        f"  Spacing = {WDM_PARAMS['channel_spacing']/1e9:.0f} GHz\n"
+        f"  B_s = {WDM_PARAMS['B_s']/1e9:.0f} GHz\n"
+        f"  P0 = {WDM_PARAMS['P0']*1e3:.0f} mW ({10*np.log10(WDM_PARAMS['P0']*1e3):.1f} dBm)"
+    )
+    return dict(
+        text=text,
+        align="left",
+        showarrow=False,
+        bordercolor="#cccccc",
+        borderwidth=1,
+        borderpad=6,
+        bgcolor="#f9f9f9",
+        font=dict(size=9, family="Courier New"),
+        xref="paper", yref="paper",
+        x=1.02, y=0.98,
+    )
+
+
 
 def _resolve_osa_csv() -> Path:
     csv_files = sorted(OSA_CSV_PATH.glob("*.csv"))
@@ -253,7 +278,7 @@ def make_signal_psd_plotly(results: list[SignalPSDResult]) -> go.Figure:
                     name=result.label,
                     legendgroup=result.key,
                     showlegend=True,
-                    hovertemplate=f"f={{x:.4f}} THz<br>P={{y:.3e}} W<extra>{result.label}</extra>",
+                    hovertemplate=f"f=%{{x:.4f}} THz<br>P=%{{y:.3e}} W<extra>{result.label}</extra>",
                 ),
                 row=1, col=1,
             )
@@ -265,7 +290,7 @@ def make_signal_psd_plotly(results: list[SignalPSDResult]) -> go.Figure:
                     name=result.label,
                     legendgroup=result.key,
                     showlegend=False,
-                    hovertemplate=f"f={{x:.4f}} THz<br>P={{y:.2f}} dBm<extra>{result.label}</extra>",
+                    hovertemplate=f"f=%{{x:.4f}} THz<br>P=%{{y:.2f}} dBm<extra>{result.label}</extra>",
                 ),
                 row=1, col=2,
             )
@@ -280,7 +305,7 @@ def make_signal_psd_plotly(results: list[SignalPSDResult]) -> go.Figure:
                     name=result.label,
                     legendgroup=result.key,
                     showlegend=True,
-                    hovertemplate=f"f={{x:.4f}} THz<br>P={{y:.3e}} W<extra>{result.label}</extra>",
+                    hovertemplate=f"f=%{{x:.4f}} THz<br>P=%{{y:.3e}} W<extra>{result.label}</extra>",
                 ),
                 row=1, col=1,
             )
@@ -292,7 +317,7 @@ def make_signal_psd_plotly(results: list[SignalPSDResult]) -> go.Figure:
                     name=result.label,
                     legendgroup=result.key,
                     showlegend=False,
-                    hovertemplate=f"f={{x:.4f}} THz<br>P={{y:.2f}} dBm<extra>{result.label}</extra>",
+                    hovertemplate=f"f=%{{x:.4f}} THz<br>P=%{{y:.2f}} dBm<extra>{result.label}</extra>",
                 ),
                 row=1, col=2,
             )
@@ -346,8 +371,9 @@ def make_signal_psd_plotly(results: list[SignalPSDResult]) -> go.Figure:
             groupclick="toggleitem",
         ),
         template="plotly_white",
-        width=1400,
+        width=1500,
         height=500,
+        annotations=[_build_signal_tx_annotation()],
     )
 
     return fig

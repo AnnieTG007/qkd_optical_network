@@ -371,23 +371,14 @@ function syncLegendClicks() {
     var gd = document.querySelector('.plotly-graph-div');
     if (!gd) return;
 
-    function getCurveNumber(node) {
-        if (node._plotlyCurveNumber !== undefined) return node._plotlyCurveNumber;
-        var parent = node.parentElement;
-        while (parent) {
-            if (parent._plotlyCurveNumber !== undefined) return parent._plotlyCurveNumber;
-            parent = parent.parentElement;
-        }
-        return null;
-    }
-
     // 单击图例项：切换该模型的显示/隐藏
+    // 修复：直接用 eventData.curveNumber（Plotly 原生提供），不再依赖 DOM 遍历
     gd.on('plotly_legendclick', function(eventData) {
-        var curveNumber = getCurveNumber(eventData.node);
+        var curveNumber = eventData.curveNumber;
         var fullData = gd._fullData || [];
         var clickedGroup = null;
 
-        if (curveNumber !== null && fullData[curveNumber]) {
+        if (curveNumber !== null && curveNumber !== undefined && fullData[curveNumber]) {
             clickedGroup = fullData[curveNumber].legendgroup;
         }
         if (!clickedGroup) return true;
@@ -412,9 +403,9 @@ function syncLegendClicks() {
 
     // 双击图例项：isolate（隔离）或恢复全部
     gd.on('plotly_legenddoubleclick', function(eventData) {
-        var curveNumber = getCurveNumber(eventData.node);
+        var curveNumber = eventData.curveNumber;
         var fullData = gd._fullData || [];
-        if (!curveNumber || !fullData[curveNumber]) return true;
+        if (curveNumber === null || curveNumber === undefined || !fullData[curveNumber]) return true;
 
         var hasHidden = false;
         for (var h = 0; h < gd.data.length; h++) {
@@ -436,6 +427,36 @@ if (document.readyState === 'loading') {
     syncLegendClicks();
 }
 """
+
+
+def _build_param_annotation() -> list:
+    """构建仿真参数注释文本（用于 Plotly figures 右侧/下侧标注）。"""
+    n_classical = len(CLASSICAL_INDICES)
+    f_classical = [
+        f"  Ch {i}: {(WDM_PARAMS['f_center'] + (i - (WDM_PARAMS['N_ch']-1)/2) * WDM_PARAMS['channel_spacing']) / 1e12:.4f} THz"
+        for i in CLASSICAL_INDICES
+    ]
+    classical_freqs = "\n".join(f_classical)
+    text = (
+        f"Sim Parameters\n"
+        f"  Fiber L = {FIBER_PARAMS['L_km']:.0f} km\n"
+        f"  N_classical = {n_classical}\n"
+        f"  Spacing = {WDM_PARAMS['channel_spacing']/1e9:.0f} GHz\n"
+        f"  P0 = {WDM_PARAMS['P0']*1e3:.0f} mW ({10*np.log10(WDM_PARAMS['P0']*1e3):.1f} dBm)\n"
+        f"{classical_freqs}"
+    )
+    return dict(
+        text=text,
+        align="left",
+        showarrow=False,
+        bordercolor="#cccccc",
+        borderwidth=1,
+        borderpad=6,
+        bgcolor="#f9f9f9",
+        font=dict(size=9, family="Courier New"),
+        xref="paper", yref="paper",
+        x=1.02, y=0.98,
+    )
 
 
 def make_fwm_psd_comparison_figure(results: list[FWMPSDResult]) -> go.Figure:
@@ -464,9 +485,9 @@ def make_fwm_psd_comparison_figure(results: list[FWMPSDResult]) -> go.Figure:
         y_lin = power_bin_W[mask]
         y_dbm = _to_dBm_for_plotly(y_lin)
 
-        # 构建 hovertemplate（使用 Plotly 语法 {x}/{y}，标签通过字符串拼接注入）
-        _ht_W = "f={x:.4f} THz<br>P={y:.3e} W<extra>" + r.label + "</extra>"
-        _ht_dBm = "f={x:.4f} THz<br>P={y:.2f} dBm<extra>" + r.label + "</extra>"
+        # 修复 hover：Plotly hovertemplate 需要 %{x} 和 %{y}（前面有 %）
+        _ht_W = "f=%{x:.4f} THz<br>P=%{y:.3e} W<extra>" + r.label + "</extra>"
+        _ht_dBm = "f=%{x:.4f} THz<br>P=%{y:.2f} dBm<extra>" + r.label + "</extra>"
 
         if r.key == "discrete":
             fig.add_trace(
@@ -548,8 +569,20 @@ def make_fwm_psd_comparison_figure(results: list[FWMPSDResult]) -> go.Figure:
 
     fig.update_xaxes(title_text="Frequency [THz]", range=[f_min, f_max], row=1, col=1)
     fig.update_xaxes(title_text="Frequency [THz]", range=[f_min, f_max], row=1, col=2)
-    fig.update_yaxes(title_text="Power per Bin [W]", range=[y_bot_lin, y_top_lin], row=1, col=1)
-    fig.update_yaxes(title_text="Power per Bin [dBm]", range=[y_bot_dbm, y_top_dbm], row=1, col=2)
+    fig.update_yaxes(
+        title_text="Power per Bin [W]",
+        range=[y_bot_lin, y_top_lin],
+        tickformat="%.0e",
+        exponentformat="none",
+        row=1, col=1,
+    )
+    fig.update_yaxes(
+        title_text="Power per Bin [dBm]",
+        range=[y_bot_dbm, y_top_dbm],
+        tickformat="%.1f",
+        exponentformat="none",
+        row=1, col=2,
+    )
     fig.update_yaxes(type="log", row=1, col=1)
 
     fig.update_layout(
@@ -559,8 +592,9 @@ def make_fwm_psd_comparison_figure(results: list[FWMPSDResult]) -> go.Figure:
         ),
         legend=dict(title=dict(text="Signal Model"), groupclick="toggleitem"),
         template="plotly_white",
-        width=1400,
+        width=1500,
         height=500,
+        annotations=list(fig.layout.annotations) + [_build_param_annotation()],
     )
     return fig
 
@@ -569,29 +603,37 @@ def _make_fwm_length_sweep_subfigure(
     results: list[FWMLengthSweepResult],
     direction: str,  # "forward" or "backward"
 ) -> go.Figure:
-    """生成 FWM 长度扫描子图（前向或后向）。"""
+    """生成 FWM 长度扫描双子图（W 对数 + dBm 线性）。"""
     if not _PLOTLY_AVAILABLE:
         raise ImportError("Plotly is not installed. Run: pip install plotly")
 
     label_map = {"forward": "Forward FWM", "backward": "Backward FWM"}
     noise_attr = "fwd_noise_W" if direction == "forward" else "bwd_noise_W"
-    unit = "W (log scale)" if direction == "forward" else "W (log scale)"
 
-    fig = make_subplots(rows=1, cols=1)
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=(
+            f"{label_map[direction]} Noise Power (W, Log Scale)",
+            f"{label_map[direction]} Noise Power (dBm, Linear Scale)",
+        ),
+        shared_xaxes=False,
+    )
 
     for r in results:
         lengths = r.lengths_km
-        noise_arr = getattr(r, noise_attr)
+        noise_W = getattr(r, noise_attr)
+        noise_dBm = _to_dBm_for_plotly(noise_W)
 
         # 过滤零噪声点
-        mask = noise_arr > 0
+        mask = noise_W > 0
         if not np.any(mask):
             continue
 
+        # W 子图（col=1）：对数坐标
         fig.add_trace(
             go.Scatter(
                 x=lengths[mask],
-                y=noise_arr[mask],
+                y=noise_W[mask],
                 mode="lines+markers",
                 line=dict(color=r.color, width=2.0),
                 marker=dict(size=6, color=r.color),
@@ -607,17 +649,57 @@ def _make_fwm_length_sweep_subfigure(
             row=1, col=1,
         )
 
-    # 动态范围
-    all_noise: list[np.ndarray] = [getattr(r, noise_attr)[getattr(r, noise_attr) > 0] for r in results]
-    all_noise = [x for x in all_noise if x.size > 0]
-    if all_noise:
-        y_bot = min(np.concatenate(all_noise)) / 10.0
-        y_top = max(np.concatenate(all_noise)) * 10.0
-    else:
-        y_bot, y_top = 1e-15, 1e-5
+        # dBm 子图（col=2）：线性坐标
+        fig.add_trace(
+            go.Scatter(
+                x=lengths[mask],
+                y=noise_dBm[mask],
+                mode="lines+markers",
+                line=dict(color=r.color, width=2.0),
+                marker=dict(size=6, color=r.color),
+                name=r.label,
+                legendgroup=r.key,
+                showlegend=False,
+                hovertemplate=(
+                    "L=%{x:.1f} km<br>P=%{y:.2f} dBm<extra>"
+                    + r.label
+                    + "</extra>"
+                ),
+            ),
+            row=1, col=2,
+        )
 
+    # 动态范围
+    all_noise_W: list[np.ndarray] = [getattr(r, noise_attr)[getattr(r, noise_attr) > 0] for r in results]
+    all_noise_W = [x for x in all_noise_W if x.size > 0]
+    if all_noise_W:
+        y_bot_W = min(np.concatenate(all_noise_W)) / 10.0
+        y_top_W = max(np.concatenate(all_noise_W)) * 10.0
+        y_bot_dBm = _to_dBm_for_plotly(y_bot_W)
+        y_top_dBm = _to_dBm_for_plotly(y_top_W)
+    else:
+        y_bot_W, y_top_W = 1e-15, 1e-5
+        y_bot_dBm, y_top_dBm = -150.0, -50.0
+
+    # X 轴：log scale（两列独立）
     fig.update_xaxes(title_text="Fiber Length [km]", type="log", row=1, col=1)
-    fig.update_yaxes(title_text=f"{label_map[direction]} Noise Power [{unit}]", range=[y_bot, y_top], type="log", row=1, col=1)
+    fig.update_xaxes(title_text="Fiber Length [km]", type="log", row=1, col=2)
+    # Y 轴
+    fig.update_yaxes(
+        title_text="Noise Power [W]",
+        range=[y_bot_W, y_top_W],
+        type="log",
+        tickformat="%.0e",
+        exponentformat="none",
+        row=1, col=1,
+    )
+    fig.update_yaxes(
+        title_text="Noise Power [dBm]",
+        range=[y_bot_dBm, y_top_dBm],
+        tickformat="%.1f",
+        exponentformat="none",
+        row=1, col=2,
+    )
 
     fig.update_layout(
         title=dict(
@@ -626,8 +708,9 @@ def _make_fwm_length_sweep_subfigure(
         ),
         legend=dict(title=dict(text="Signal Model"), groupclick="toggleitem"),
         template="plotly_white",
-        width=900,
+        width=1500,
         height=500,
+        annotations=list(fig.layout.annotations) + [_build_param_annotation()],
     )
     return fig
 
