@@ -1,16 +1,15 @@
-"""Dash App 2 — FWM Noise PSD Comparison with Fiber Length Slider.
+"""Dash App 2 - FWM Noise PSD Comparison with Fiber Length Slider.
 
-运行：
+运行:
     python scripts/plot_fwm_noise_dash_l.py
     浏览器打开 http://127.0.0.1:8051
 
-内容：滑条选择光纤长度（1-100 km），双子图显示：
-  - 左：FWM 噪声 PSD（W 对数坐标）
-  - 右：FWM 噪声 PSD（dBm 线性坐标）
+内容: 滑条选择光纤长度, 左右子图同步显示
+  - 左: FWM 噪声功率/频率 bin (W, 对数坐标)
+  - 右: FWM 噪声功率/频率 bin (dBm, 线性坐标)
 
-所有数据在启动时预计算完毕，滑条仅做索引（无延迟）。
-
-依赖：pip install dash plotly numpy pandas
+所有数据在启动时预计算完毕, 滑条仅做索引, 无需重新计算.
+依赖: pip install dash plotly numpy pandas
 """
 
 from __future__ import annotations
@@ -24,19 +23,20 @@ import numpy as np
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _SCRIPT_DIR.parent
 import sys
+
 sys.path.insert(0, str(_PROJECT_ROOT))
 sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 
 import dash
-from dash import Dash, dcc, html, Input, Output
+from dash import Dash, Input, Output, dcc, html
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from qkd_sim.config.plot_config import load_model_specs
 from qkd_sim.config.schema import FiberConfig, WDMConfig
 from qkd_sim.physical.fiber import Fiber
-from qkd_sim.physical.signal import build_wdm_grid
 from qkd_sim.physical.noise import DiscreteFWMSolver
+from qkd_sim.physical.signal import build_wdm_grid
 
 # ============================================================================
 # 参数
@@ -68,10 +68,46 @@ FIBER_PARAMS = dict(
     T_kelvin=300.0,
 )
 
+_LEGEND_SYNC_JS = """
+(function() {
+    function attachLegendSync() {
+        var el = document.querySelector('.js-plotly-plot');
+        if (!el) { setTimeout(attachLegendSync, 500); return; }
+        if (el.dataset.legendSyncAttached === '1') { return; }
+        el.dataset.legendSyncAttached = '1';
+
+        el.on('plotly_legendclick', function(ev) {
+            var cn = ev.curveNumber;
+            var fd = el._fullData || [];
+            var grp = (fd[cn] && fd[cn].legendgroup) ? fd[cn].legendgroup : null;
+            if (!grp) { return true; }
+
+            var on = false;
+            for (var i = 0; i < el.data.length; i++) {
+                if (el.data[i].legendgroup === grp && el.data[i].visible !== 'legendonly') {
+                    on = true; break;
+                }
+            }
+
+            var nv = on ? 'legendonly' : true;
+            for (var j = 0; j < el.data.length; j++) {
+                if (el.data[j].legendgroup === grp) { el.data[j].visible = nv; }
+            }
+            Plotly.redraw(el);
+            return false;
+        });
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', attachLegendSync);
+    } else { attachLegendSync(); }
+})();
+"""
 
 # ============================================================================
 # 辅助函数
 # ============================================================================
+
 
 def _resolve_osa_csv() -> Path:
     csv_files = sorted(OSA_CSV_PATH.glob("*.csv"))
@@ -133,25 +169,64 @@ def _build_model_grid(
 
 
 def _psd_to_json(data: dict) -> dict:
-    """将 ALL_PSD 字典（numpy array → list）序列化为 JSON。"""
-    return {
-        str(Li): {mk: v[mk].tolist() for mk in v.keys()} for Li, v in data.items()
-    }
+    """把 ALL_PSD 字典 (numpy array -> list) 序列化为 JSON."""
+    return {str(Li): {mk: v[mk].tolist() for mk in v.keys()} for Li, v in data.items()}
+
+
+def _nice_log_tickvals(
+    y_bot_log: float, y_top_log: float, n_ticks: int = 9
+) -> tuple[list[float], list[str]]:
+    """Generate clean explicit tick values/text for a log axis.
+
+    tickvals are actual power values in linear space (e.g. 1e-15, 3e-15, 1e-14...).
+    These work correctly with Plotly's type='log' axis.
+    """
+    _ = n_ticks
+    bot = int(np.floor(y_bot_log))
+    top = int(np.ceil(y_top_log))
+    tick_vals: list[float] = []
+    tick_texts: list[str] = []
+
+    for exp in range(bot, top + 1):
+        main_val = float(10.0 ** exp)
+        if main_val > 0:
+            tick_vals.append(main_val)
+            tick_texts.append(f"1e{exp}")
+
+        if exp < top:
+            mid_val = float(3.0 * (10.0 ** exp))
+            mid_log = np.log10(mid_val)
+            if y_bot_log <= mid_log <= y_top_log:
+                tick_vals.append(mid_val)
+                tick_texts.append(f"3e{exp}")
+
+    return tick_vals, tick_texts
+
+
+def _nice_linear_tickvals(
+    y_bot: float, y_top: float, n: int = 7
+) -> tuple[list[float], list[str]]:
+    """Generate explicit evenly spaced tick values/text for a linear axis."""
+    if n <= 1:
+        vals = [float(y_bot)]
+    else:
+        step = (y_top - y_bot) / (n - 1)
+        vals = [float(y_bot + i * step) for i in range(n)]
+    texts = [f"{v:.1f}" for v in vals]
+    return vals, texts
 
 
 # ============================================================================
-# 预计算（启动时一次性完成）
+# 预计算 (启动时一次性完成)
 # ============================================================================
 
 print("=" * 60)
-print("FWM PSD vs Length Dash — 预计算所有光纤长度 × 所有模型 PSD")
+print("FWM PSD vs Length Dash - 预计算所有光纤长度 x 所有模型 PSD")
 print("=" * 60)
 t0 = time.time()
 
 osa_csv_path = _resolve_osa_csv()
-base_quantum_indices = [
-    i for i in range(WDM_PARAMS["N_ch"]) if i not in CLASSICAL_INDICES
-]
+base_quantum_indices = [i for i in range(WDM_PARAMS["N_ch"]) if i not in CLASSICAL_INDICES]
 base_config = _build_wdm_config(base_quantum_indices)
 noise_f_grid = _build_noise_frequency_grid(base_config)
 df = float(np.mean(np.diff(noise_f_grid)))
@@ -164,9 +239,9 @@ N_L = len(LENGTHS_KM)
 N_f = len(noise_f_grid)
 
 print(f"  N_length={N_L}, N_freq={N_f}, N_models={len(model_keys)}")
-print(f"  预计总计算量: {N_L} × {len(model_keys)} = {N_L * len(model_keys)} 次 PSD 求解")
+print(f"  预计算总计算量: {N_L} x {len(model_keys)} = {N_L * len(model_keys)} 次 PSD 求解")
 
-# ALL_PSD[Li][model_key] = np.array(N_f,)  — 第 Li 个长度对应的各模型 PSD
+# ALL_PSD[Li][model_key] = np.array(N_f,) : 第 Li 个长度对应的各模型 PSD
 ALL_PSD: dict[int, dict[str, np.ndarray]] = {}
 for Li in range(N_L):
     ALL_PSD[Li] = {mk: np.zeros(N_f) for mk in model_keys}
@@ -177,9 +252,7 @@ for Li, L_km in enumerate(LENGTHS_KM):
     fiber = Fiber(FiberConfig(**fp))
 
     for model_key, spec in specs.items():
-        grid = _build_model_grid(
-            model_key, spec, base_config, noise_f_grid, osa_csv_path
-        )
+        grid = _build_model_grid(model_key, spec, base_config, noise_f_grid, osa_csv_path)
         psd = fwm_solver.compute_fwm_spectrum_conti(
             fiber, grid, noise_f_grid, direction="forward"
         )
@@ -196,10 +269,9 @@ for Li, L_km in enumerate(LENGTHS_KM):
 ALL_PSD_JSON = _psd_to_json(ALL_PSD)
 
 elapsed_total = time.time() - t0
-print(f"\n预计算完成！总耗时: {elapsed_total:.1f}s")
+print(f"\n预计算完成. 总耗时: {elapsed_total:.1f}s")
 print("启动 Dash 服务...")
 print("=" * 60)
-
 
 # ============================================================================
 # Dash 应用
@@ -207,36 +279,33 @@ print("=" * 60)
 
 app = Dash(__name__)
 
+# 通过 index_string override 注入 legend 单击同步 JS（浏览器原生执行）
+_default_index_string = app.index_string
+app.index_string = _default_index_string.replace(
+    '</body>',
+    '<script>' + _LEGEND_SYNC_JS + '</script></body>'
+)
 
-def _build_param_annotation() -> dict:
+
+def _build_param_text() -> str:
     n_classical = len(CLASSICAL_INDICES)
-    f_classical = [
-        f"  Ch{i}: "
-        f"{(WDM_PARAMS['f_center'] + (i - (WDM_PARAMS['N_ch']-1)/2) * WDM_PARAMS['channel_spacing'])/1e12:.4f} THz"
-        for i in CLASSICAL_INDICES
+    ch_lines = []
+    for i in CLASSICAL_INDICES:
+        f_hz = (
+            WDM_PARAMS["f_center"]
+            + (i - (WDM_PARAMS["N_ch"] - 1) / 2) * WDM_PARAMS["channel_spacing"]
+        )
+        ch_lines.append(f"Ch{i}: {f_hz / 1e12:.4f} THz")
+    lines = [
+        (
+            f"Sim Parameters  |  L = controlled by slider  |  "
+            f"N_classical = {n_classical}  |  "
+            f"Spacing = {WDM_PARAMS['channel_spacing'] / 1e9:.0f} GHz  |  "
+            f"P0 = {WDM_PARAMS['P0'] * 1e3:.0f} mW"
+        ),
+        "  |  ".join(ch_lines),
     ]
-    text = (
-        f"Sim Parameters\n"
-        f"  (可变) L = 由滑条控制\n"
-        f"  N_classical = {n_classical}\n"
-        f"  Spacing = {WDM_PARAMS['channel_spacing']/1e9:.0f} GHz\n"
-        f"  P0 = {WDM_PARAMS['P0']*1e3:.0f} mW\n"
-        + "\n".join(f_classical)
-    )
-    return dict(
-        text=text,
-        align="left",
-        showarrow=False,
-        bordercolor="#cccccc",
-        borderwidth=1,
-        borderpad=6,
-        bgcolor="#f9f9f9",
-        font=dict(size=9, family="Courier New"),
-        xref="paper",
-        yref="paper",
-        x=1.02,
-        y=0.98,
-    )
+    return "\n".join(lines)
 
 
 def _to_dBm(v: np.ndarray | float) -> np.ndarray | float:
@@ -244,23 +313,22 @@ def _to_dBm(v: np.ndarray | float) -> np.ndarray | float:
     return 10.0 * np.log10(np.maximum(v_arr, 1e-30)) + 30.0
 
 
-# Slider 刻度（每 N_L//5 取一个）
+# Slider 刻度
 _n_marks = max(1, N_L // 5)
 slider_marks = {
     i: {"label": f"{LENGTHS_KM[i]:.0f} km", "style": {"font-size": "10px"}}
     for i in range(0, N_L, _n_marks)
 }
 if (N_L - 1) not in slider_marks:
-    slider_marks[N_L - 1] = {"label": f"{LENGTHS_KM[N_L-1]:.0f} km"}
+    slider_marks[N_L - 1] = {"label": f"{LENGTHS_KM[N_L - 1]:.0f} km"}
 
 app.layout = html.Div(
     [
-        html.H2("FWM Noise PSD — Fiber Length Slider (Pre-computed)"),
+        html.H2("FWM Noise PSD - Fiber Length Slider (Pre-computed)"),
         html.P(
-            "滑条选择光纤长度，噪声 PSD 曲线同步更新（启动时预计算完毕，无重新计算）",
+            "滑条选择光纤长度, 噪声 PSD 曲线同步更新（启动时预计算完毕, 无重新计算）",
             style=dict(color="gray"),
         ),
-        # ---- 滑条 ----
         html.Div(
             [
                 html.Label("光纤长度 [km] (Fiber Length [km])"),
@@ -269,21 +337,32 @@ app.layout = html.Div(
                     min=0,
                     max=N_L - 1,
                     step=1,
-                    value=list(LENGTHS_KM).index(50.0),  # 默认 L=50 km
+                    value=list(LENGTHS_KM).index(50.0),
                     marks=slider_marks,
                 ),
             ],
             style=dict(width="90%", padding="10px"),
         ),
-        # 当前长度信息
         html.Div(
             id="l-display",
             style=dict(padding="5px 10px", fontFamily="Courier New", fontSize="13px"),
         ),
-        # 预计算数据
         dcc.Store(id="psd-store", data=ALL_PSD_JSON),
-        # 图
         dcc.Graph(id="psd-graph"),
+        html.Div(
+            id="param-display",
+            style=dict(
+                padding="10px",
+                marginTop="8px",
+                backgroundColor="#f9f9f9",
+                border="1px solid #cccccc",
+                fontFamily="Courier New",
+                fontSize="12px",
+                whiteSpace="pre-wrap",
+                maxWidth="1500px",
+                overflowX="auto",
+            ),
+        ),
     ],
     style=dict(fontFamily="Arial", padding="20px"),
 )
@@ -295,8 +374,18 @@ app.layout = html.Div(
     Input("psd-store", "data"),
 )
 def update_display(Li: int, store_data: dict) -> str:
+    _ = store_data
     L_km = float(LENGTHS_KM[Li])
     return f"Selected Fiber Length: L = {L_km:.0f} km"
+
+
+@app.callback(
+    Output("param-display", "children"),
+    Input("l-slider", "value"),
+)
+def update_param_display(Li: int) -> str:
+    _ = Li
+    return _build_param_text()
 
 
 @app.callback(
@@ -305,7 +394,7 @@ def update_display(Li: int, store_data: dict) -> str:
     Input("psd-store", "data"),
 )
 def update_graph(Li: int, store_data: dict) -> go.Figure:
-    psd_dict = store_data[str(Li)]  # {model_key: [...]} — PSD array per model
+    psd_dict = store_data.get(str(Li), {})
 
     fig = make_subplots(
         rows=1,
@@ -317,8 +406,18 @@ def update_graph(Li: int, store_data: dict) -> go.Figure:
     )
 
     for model_key, spec in specs.items():
-        psd = np.array(psd_dict[model_key], dtype=np.float64)
-        power_bin_W = psd * df  # bin 功率 [W]
+        raw = psd_dict.get(model_key)
+        if raw is None:
+            continue
+
+        psd = np.array(raw, dtype=np.float64)
+        if psd.size == 0:
+            continue
+
+        power_bin_W = psd * df
+        if not np.any(power_bin_W > 0):
+            continue
+
         power_bin_dBm = _to_dBm(power_bin_W)
 
         mask = power_bin_W > 0
@@ -326,22 +425,16 @@ def update_graph(Li: int, store_data: dict) -> go.Figure:
         y_W = power_bin_W[mask]
         y_dBm = power_bin_dBm[mask]
 
-        _ht_W = (
-            f"f=%{{x:.4f}} THz<br>P=%{{y:.3e}} W<extra>"
-            + spec["label"]
-            + "</extra>"
-        )
-        _ht_dBm = (
-            f"f=%{{x:.4f}} THz<br>P=%{{y:.2f}} dBm<extra>"
-            + spec["label"]
-            + "</extra>"
-        )
+        if f_THz.size == 0 or y_W.size == 0:
+            continue
+
+        _ht_W = f"f=%{{x:.4f}} THz<br>P=%{{y:.3e}} W<extra>{spec['label']}</extra>"
+        _ht_dBm = f"f=%{{x:.4f}} THz<br>P=%{{y:.2f}} dBm<extra>{spec['label']}</extra>"
 
         mode = "markers" if not spec["continuous"] else "lines"
         line_dict = dict(color=spec["color"], width=2.0) if spec["continuous"] else None
         marker_dict = dict(size=6, color=spec["color"], symbol="circle")
 
-        # W 子图
         fig.add_trace(
             go.Scatter(
                 x=f_THz,
@@ -357,7 +450,6 @@ def update_graph(Li: int, store_data: dict) -> go.Figure:
             row=1,
             col=1,
         )
-        # dBm 子图
         fig.add_trace(
             go.Scatter(
                 x=f_THz,
@@ -374,55 +466,75 @@ def update_graph(Li: int, store_data: dict) -> go.Figure:
             col=2,
         )
 
-    # ---- 动态坐标轴范围（基于 ALL 长度数据）----
-    all_pmax: list[float] = []
+    all_positive: list[float] = []
     for Li_str in store_data.keys():
-        for mk in store_data[Li_str].keys():
-            arr = np.array(store_data[Li_str][mk], dtype=np.float64)
-            nonzero = arr[arr > 0]
-            if nonzero.size > 0:
-                all_pmax.append(float(nonzero.max()))
-    if all_pmax:
-        y_bot_lin = min(all_pmax) / 1e6
-        y_top_lin = max(all_pmax) * 10.0
-        y_bot_dBm = _to_dBm(y_bot_lin)
-        y_top_dBm = _to_dBm(y_top_lin)
+        psd_at_length = store_data.get(Li_str, {})
+        for mk in model_keys:
+            raw = psd_at_length.get(mk)
+            if raw is None:
+                continue
+            arr = np.array(raw, dtype=np.float64)
+            if arr.size == 0:
+                continue
+            power_arr = arr * df
+            positive = power_arr[power_arr > 0]
+            if positive.size > 0:
+                all_positive.extend(positive.tolist())
+
+    if all_positive:
+        y_bot_log = round(np.log10(min(all_positive)) - 0.3, 1)
+        y_top_log = round(np.log10(max(all_positive)) + 0.3, 1)
+        y_bot_dBm = float(_to_dBm(min(all_positive))) - 5.0
+        y_top_dBm = float(_to_dBm(max(all_positive))) + 5.0
     else:
-        y_bot_lin, y_top_lin = 1e-15, 1e-8
+        y_bot_log, y_top_log = -15.5, -7.5
         y_bot_dBm, y_top_dBm = -120.0, -60.0
+
+    log_tick_vals, log_tick_texts = _nice_log_tickvals(y_bot_log, y_top_log)
+    lin_tick_vals, lin_tick_texts = _nice_linear_tickvals(y_bot_dBm, y_top_dBm)
 
     f_min, f_max = float(freq_THz.min()), float(freq_THz.max())
 
     for col in [1, 2]:
         fig.update_xaxes(
-            title_text="Frequency [THz]", range=[f_min, f_max], row=1, col=col
+            title_text="Frequency [THz]",
+            range=[f_min, f_max],
+            row=1,
+            col=col,
         )
 
     fig.update_yaxes(
         title_text="Power per Bin [W]",
-        range=[y_bot_lin, y_top_lin],
-        tickformat="%.0e",
+        type="log",
+        range=[y_bot_log, y_top_log],
+        tickmode="array",
+        tickvals=log_tick_vals,
+        ticktext=log_tick_texts,
+        tickformat=None,
         exponentformat="none",
+        showgrid=True,
         row=1,
         col=1,
     )
     fig.update_yaxes(
         title_text="Power per Bin [dBm]",
         range=[y_bot_dBm, y_top_dBm],
-        tickformat="%.1f",
+        tickmode="array",
+        tickvals=lin_tick_vals,
+        ticktext=lin_tick_texts,
+        tickformat=None,
         exponentformat="none",
         row=1,
         col=2,
     )
-    fig.update_yaxes(type="log", row=1, col=1)
 
     fig.update_layout(
-        title="FWM Noise PSD — W (left) / dBm (right)",
+        title="FWM Noise PSD - W (left) / dBm (right)",
         template="plotly_white",
         width=1500,
         height=500,
         legend=dict(groupclick="toggleitem"),
-        annotations=[_build_param_annotation()],
+        uirevision="fixed",
     )
     return fig
 
