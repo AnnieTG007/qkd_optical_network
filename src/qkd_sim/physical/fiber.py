@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 from scipy.constants import c as c_light
 
@@ -16,8 +18,14 @@ class Fiber:
     """光纤参数容器，支持频率相关的物理参数查询。
 
     当前实现：C波段常数参数 + 色散斜率修正。
-    C+L 扩展预留：get_loss_at_freq / get_dispersion_at_freq 接口
-    支持未来替换为查表或拟合模型。
+
+    C+L 波段扩展路线
+    ----------------
+    - get_loss_at_freq: 替换为多项式拟合或插值表（参考 ITU-T G.652 衰减曲线）
+    - get_dispersion_at_freq: 已支持斜率修正，C+L 可切换为 Sellmeier 方程
+    - 新增 get_gamma_at_freq: γ = 2πn₂/(λ·A_eff(λ))，A_eff 波长依赖
+    - get_effective_length: 使用频率相关 α
+    - f_ref (当前硬编码 193.5 THz): 提取为 FiberConfig 字段
 
     Parameters
     ----------
@@ -108,7 +116,7 @@ class Fiber:
             色散系数 [s/m²]
         """
         # 参考波长: C波段中心 193.5 THz
-        f_ref = 193.5e12
+        f_ref = 193.5e12  # C波段中心，C+L扩展时应提取为FiberConfig字段
         lambda_ref = c_light / f_ref
         wavelength = c_light / np.asarray(freq)
         return self._D_c + self._D_slope * (wavelength - lambda_ref)
@@ -119,7 +127,13 @@ class Fiber:
         f3: float | np.ndarray,
         f4: float | np.ndarray,
     ) -> float | np.ndarray:
-        """计算 FWM 相位失配 Δβ。
+        """计算 FWM 相位失配 Δβ（二阶 Taylor 展开近似）。
+
+        .. note:: 近似说明
+           采用色散系数 β(ω) 在 f₂ 对应波长处的二阶 Taylor 展开，
+           仅保留 D_c 和 dD_c/dλ 两项。当信道间距远小于载波频率时
+           （典型 WDM 场景，Δf/f < 1%）精度良好。精确计算需要
+           β(ω) 的完整色散关系（如 Sellmeier 方程）。
 
         公式 2.2.3 (formulas_fwm.md):
         Δβ = (2π λ² / c) × |f₃ - f₂| × |f₄ - f₂|
@@ -167,15 +181,22 @@ class Fiber:
         Parameters
         ----------
         freq : float or ndarray or None
-            频率 [Hz]，用于获取频率相关的衰减。None 使用默认 alpha。
+            频率 [Hz]，用于获取频率相关的衰减。None 使用默认常数
+            alpha，此时会发出警告。
 
         Returns
         -------
         float
-            有效长度 [m]
+            有效长度 [m]。当前实现中即使 freq 为 ndarray，由于 C 波段
+            衰减为常数，返回值仍为标量 float。
         """
         if freq is not None:
             alpha = np.asarray(self.get_loss_at_freq(freq))
         else:
+            warnings.warn(
+                "get_effective_length: freq=None, 使用常数 alpha。"
+                " 传入 freq 以启用频率相关衰减。",
+                stacklevel=2,
+            )
             alpha = self._alpha
         return (1.0 - np.exp(-alpha * self._L)) / alpha

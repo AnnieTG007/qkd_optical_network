@@ -113,27 +113,6 @@ def _resolve_frequency_grid(
     return np.asarray(wdm_grid.f_grid, dtype=np.float64)
 
 
-def _map_channel_noise_to_psd(
-    wdm_grid: WDMGrid,
-    f_grid: np.ndarray,
-    channel_noise: np.ndarray,
-) -> np.ndarray:
-    """将信道积分噪声（标量 per channel）映射到 f_grid 最近格点的 PSD。
-
-    用于离散模型的噪声 PSD 谱：将信道中心频率处的积分噪声 per B_s
-    转换为等效 PSD 放在最近格点。
-    """
-    df = validate_uniform_frequency_grid(f_grid)
-    q_freqs = np.array(
-        [ch.f_center for ch in wdm_grid.get_quantum_channels()], dtype=np.float64
-    )
-    out = np.zeros_like(f_grid, dtype=np.float64)
-    for fq, pq in zip(q_freqs, channel_noise):
-        idx = int(np.argmin(np.abs(f_grid - fq)))
-        out[idx] += float(pq) / df
-    return out
-
-
 def compute_noise_spectrum(
     noise_type: NoiseType,
     fiber: Fiber,
@@ -141,7 +120,6 @@ def compute_noise_spectrum(
     f_grid: np.ndarray | None = None,
     sprs_solver: DiscreteSPRSSolver | None = None,
     fwm_solver: DiscreteFWMSolver | None = None,
-    continuous: bool = True,
 ) -> dict[str, np.ndarray]:
     """计算噪声功率谱密度 G_noise(f) [W/Hz]，在 f_grid 每个频率点评估。
 
@@ -149,7 +127,7 @@ def compute_noise_spectrum(
     - compute_noise()：返回每个量子信道中心频率处的积分噪声功率 [W]（标量 per channel）
     - compute_noise_spectrum()：返回 f_grid 上每个频率点的噪声 PSD [W/Hz]（连续曲线）
 
-    用于绘制噪声功率谱（连续曲线），而非 BER/SNR 计算。
+    仅用于连续模型（绘制噪声功率谱曲线）。
 
     Parameters
     ----------
@@ -163,9 +141,6 @@ def compute_noise_spectrum(
         输出频率网格 [Hz]。None 时使用 wdm_grid.f_grid。
     sprs_solver : DiscreteSPRSSolver or None
     fwm_solver : DiscreteFWMSolver or None
-    continuous : bool
-        True（默认）：使用连续模型；
-        False：使用离散模型（信道积分噪声映射到 f_grid 的 PSD）
 
     Returns
     -------
@@ -188,44 +163,22 @@ def compute_noise_spectrum(
 
     if noise_type in ("sprs", "all"):
         solver = sprs_solver if sprs_solver is not None else DiscreteSPRSSolver()
-        if continuous:
-            result["sprs_fwd"] = solver.compute_sprs_spectrum_conti(
-                fiber, wdm_grid, f_eval, direction="forward"
-            )
-            result["sprs_bwd"] = solver.compute_sprs_spectrum_conti(
-                fiber, wdm_grid, f_eval, direction="backward"
-            )
-        else:
-            ch_noise = compute_noise(
-                "sprs", fiber, wdm_grid, sprs_solver=solver, continuous=False
-            )
-            result["sprs_fwd"] = _map_channel_noise_to_psd(
-                wdm_grid, f_eval, ch_noise["sprs_fwd"]
-            )
-            result["sprs_bwd"] = _map_channel_noise_to_psd(
-                wdm_grid, f_eval, ch_noise["sprs_bwd"]
-            )
+        result["sprs_fwd"] = solver.compute_sprs_spectrum_conti(
+            fiber, wdm_grid, f_eval, direction="forward"
+        )
+        result["sprs_bwd"] = solver.compute_sprs_spectrum_conti(
+            fiber, wdm_grid, f_eval, direction="backward"
+        )
         result["sprs"] = result["sprs_fwd"] + result["sprs_bwd"]
 
     if noise_type in ("fwm", "all"):
         solver_fwm = fwm_solver if fwm_solver is not None else DiscreteFWMSolver()
-        if continuous:
-            result["fwm_fwd"] = solver_fwm.compute_fwm_spectrum_conti(
-                fiber, wdm_grid, f_eval, direction="forward"
-            )
-            result["fwm_bwd"] = solver_fwm.compute_fwm_spectrum_conti(
-                fiber, wdm_grid, f_eval, direction="backward"
-            )
-        else:
-            ch_noise = compute_noise(
-                "fwm", fiber, wdm_grid, fwm_solver=solver_fwm, continuous=False
-            )
-            result["fwm_fwd"] = _map_channel_noise_to_psd(
-                wdm_grid, f_eval, ch_noise["fwm_fwd"]
-            )
-            result["fwm_bwd"] = _map_channel_noise_to_psd(
-                wdm_grid, f_eval, ch_noise["fwm_bwd"]
-            )
+        result["fwm_fwd"] = solver_fwm.compute_fwm_spectrum_conti(
+            fiber, wdm_grid, f_eval, direction="forward"
+        )
+        result["fwm_bwd"] = solver_fwm.compute_fwm_spectrum_conti(
+            fiber, wdm_grid, f_eval, direction="backward"
+        )
         result["fwm"] = result["fwm_fwd"] + result["fwm_bwd"]
 
     if noise_type == "sprs":

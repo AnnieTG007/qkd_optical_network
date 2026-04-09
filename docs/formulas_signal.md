@@ -15,12 +15,19 @@
 
 假定信道全部功率集中于中心频率 f_n：
 
-```
-P(f) = P_0,   当 f = f_n
-P(f) = 0,     当 f ≠ f_n
-```
+$$
+P(f) = P_0, \quad \text{当}\ f = f_n
+$$
+
+$$
+P(f) = 0, \quad \text{当}\ f \neq f_n
+$$
 
 实现说明：信号用长度为 N_ch 的功率数组表示，每个元素对应一个信道。
+
+**绘图说明（2026-04 修正）**：离散信道没有 PSD 概念，只有信道功率 P。
+绘图时，在 f_n 处画高度为 P_ch 的竖线（stem），不乘以 1/Δf。
+连续模型的绘图值为 PSD × Δf [W]（bin 功率），与离散信道的功率 [W] 量纲统一，可以直观比较。
 
 ---
 
@@ -28,9 +35,9 @@ P(f) = 0,     当 f ≠ f_n
 
 基于GN-Model，假设信号为复周期高斯白噪声过程，有平均PSD：
 
-```
-G_GN(f) = G_TX(f) × f_0 × Σ δ(f - i×f_0)
-```
+$$
+G_{\text{GN}}(f) = G_{\text{TX}}(f) \times f_0 \times \sum_i \delta(f - i \times f_0)
+$$
 
 当周期 T_0 → ∞（即 f_0 → 0）时，离散谱线趋近于连续谱。
 
@@ -38,41 +45,49 @@ G_GN(f) = G_TX(f) × f_0 × Σ δ(f - i×f_0)
 
 ---
 
-## 3. G_TX(f) 的三种建模方式
+## 3. G_TX(f) 的两种建模方式
 
-### 3.1 矩形信号谱
-
-G_TX(f) 在信道带宽 B_s 内均匀分布：
-
-```
-对于第n个信道，中心频率 f_n，带宽 B_s：
-G_TX(f) = P_ch / B_s,   当 |f - f_n| ≤ B_s/2
-G_TX(f) = 0,             当 |f - f_n| > B_s/2
-```
-
-其中 P_ch 是该信道的总发射功率 [W]。
-
-### 3.2 升余弦滚降谱
+### 3.1 升余弦滚降谱（矩形谱为 β=0 的特例）
 
 G_TX(f) 按升余弦滚降分布，滚降因子为 β_rolloff（0 ≤ β_rolloff ≤ 1）：
 
-```
-对于第n个信道，中心频率 f_n，符号速率 R_s = B_s：
-Δf = |f - f_n|
+$$
+\text{对于第n个信道，中心频率}\ f_n,\ \text{符号速率}\ R_s = B_s：
+$$
 
-当 Δf ≤ (1-β_rolloff)×R_s/2：
-    G_TX(f) = P_ch / R_s
+$$
+\Delta f = |f - f_n|
+$$
 
-当 (1-β_rolloff)×R_s/2 < Δf ≤ (1+β_rolloff)×R_s/2：
-    G_TX(f) = (P_ch / R_s) × 0.5 × (1 + cos(π/(β_rolloff×R_s) × (Δf - (1-β_rolloff)×R_s/2)))
+**当** $\Delta f \leq (1-\beta_{\text{rolloff}}) \times R_s / 2$：
 
-当 Δf > (1+β_rolloff)×R_s/2：
-    G_TX(f) = 0
-```
+$$
+G_{\text{TX}}(f) = \frac{P_{\text{ch}}}{R_s}
+$$
 
-注意：功率归一化条件 ∫G_TX(f)df = P_ch 需要验证。
+**当** $(1-\beta_{\text{rolloff}}) \times R_s / 2 < \Delta f \leq (1+\beta_{\text{rolloff}}) \times R_s / 2$：
 
-### 3.3 OSA真实采样
+$$
+G_{\text{TX}}(f) = \frac{P_{\text{ch}}}{R_s} \times 0.5 \times \left[1 + \cos\left(\frac{\pi}{\beta_{\text{rolloff}} \times R_s} \times \left(\Delta f - \frac{(1-\beta_{\text{rolloff}}) \times R_s}{2}\right)\right)\right]
+$$
+
+**当** $\Delta f > (1+\beta_{\text{rolloff}}) \times R_s / 2$：
+
+$$
+G_{\text{TX}}(f) = 0
+$$
+
+**矩形谱**：当 β_rolloff = 0 时，上式退化为矩形谱，即 $G_{\text{TX}}(f) = P_{\text{ch}} / B_s$（$|f-f_n| \leq B_s/2$）。
+
+**峰值高度**：
+  - 升余弦谱的峰值 PSD = P_ch / B_s（与滚降系数 β 无关）
+  - 不同 β 值的差异体现在频谱形状：平坦区宽度由 $(1-\beta) \times B_s/2$ 变为（β=0 时完整 B_s），
+    滚降区宽度由 0 变为 $\beta \times B_s/2$（总占用带宽 $(1+\beta) \times B_s/2$）
+  - 矩形谱（β=0）和升余弦谱（β>0）在中心频率处具有相同的峰值 P_ch/B_s
+
+注意：功率归一化条件 $\int G_{\text{TX}}(f) df = P_{\text{ch}}$ 需要验证。
+
+### 3.2 OSA真实采样
 
 直接读取OSA（光谱分析仪）返回的频谱采样数据作为 G_TX(f)。
 
@@ -81,16 +96,10 @@ G_TX(f) 按升余弦滚降分布，滚降因子为 β_rolloff（0 ≤ β_rolloff
 
 **加载流程：**
 1. 读取CSV，提取 `frequency_THz` 和 `power_dBm` 列
-2. 频率单位转换：f [Hz] = frequency_THz × 1e12
-3. 功率单位转换：P_linear [W] = 10^(power_dBm / 10) × 1e-3
-4. 计算PSD：G_osa [W/Hz] = P_linear / RBW（RBW为OSA分辨率带宽，需从仪器设置获取）
+2. 频率单位转换：$f\ [\text{Hz}] = \text{frequency\_THz} \times 10^{12}$
+3. 功率单位转换：$P_{\text{linear}}\ [\text{W}] = 10^{\text{power\_dBm} / 10} \times 10^{-3}$
+4. 计算PSD：$G_{\text{osa}}\ [\text{W/Hz}] = P_{\text{linear}} / \text{RBW}$（RBW为OSA分辨率带宽，需从仪器设置获取）
 5. 使用 scipy.interpolate.interp1d 插值到计算频率网格
-
-```
-输入：CSV文件路径，RBW [Hz]（OSA分辨率带宽）
-中间：f_osa [Hz]，G_osa [W/Hz]
-输出：插值到计算频率网格上的 G_TX(f) [W/Hz]
-```
 
 ---
 
@@ -106,6 +115,6 @@ G_TX(f) 按升余弦滚降分布，滚降因子为 β_rolloff（0 ≤ β_rolloff
 
 等间隔DWDM系统，N_ch 个信道，中心频率 f_center，间隔 g：
 
-```python
-f_channels = f_center + np.arange(-(N_ch-1)/2, (N_ch+1)/2) * g
-```
+$$
+f_{\text{channels}} = f_{\text{center}} + \text{np.arange}\left(-\frac{N_{\text{ch}}-1}{2}, \frac{N_{\text{ch}}+1}{2}\right) \times g
+$$

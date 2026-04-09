@@ -68,9 +68,20 @@
 
 ## 物理常数
 
-```python
-import scipy.constants as const
-h_planck = const.h        # 6.62607015e-34 J·s
-k_boltzmann = const.k     # 1.380649e-23 J/K
-c_light = const.c         # 299792458 m/s
-```
+$$
+h_{\text{planck}} = 6.62607015 \times 10^{-34} \quad \text{J·s}
+$$
+
+$$
+k_{\text{boltzmann}} = 1.380649 \times 10^{-23} \quad \text{J/K}
+$$
+
+$$
+c_{\text{light}} = 299792458 \quad \text{m/s}
+$$
+
+代码引用方式：
+
+$$
+\text{from scipy.constants import h, k, c}
+$$

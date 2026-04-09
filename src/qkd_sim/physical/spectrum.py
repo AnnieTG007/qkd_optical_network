@@ -430,14 +430,20 @@ from typing import Sequence
 
 _MODEL_COLORS = {
     "discrete": "#202020",
-    "rectangular": "#1f77b4",
-    "raised_cosine": "#d95f02",
+    "rc_beta0": "#1f77b4",
+    "rc_beta001": "#aec7e8",
+    "rc_beta01": "#d95f02",
+    "rc_beta05": "#ff7f0e",
     "osa": "#2ca02c",
 }
 
 
 def _ylabel_psd(unit: str) -> str:
     return "Launch PSD [W/Hz]" if unit == "W" else "Launch PSD [dBm/Hz]"
+
+
+def _ylabel_power_bin(unit: str) -> str:
+    return "Power per Bin [W]" if unit == "W" else "Power per Bin [dBm]"
 
 
 @dataclass
@@ -475,6 +481,136 @@ class ModelLengthSweepResult:
     @property
     def total_W(self) -> np.ndarray:
         return self.fwm_W + self.sprs_W
+
+
+@dataclass
+class SignalPSDResult:
+    """单信号模型的发射功率谱结果（用于信号 PSD 对比图）。
+
+    纵轴语义（修正 2026-04）：
+      - Discrete: psd_W_per_Hz = 信道功率 P [W]（stem 高度 = P）
+      - 连续模型: psd_W_per_Hz = PSD [W/Hz]；绘图时乘 df 得 bin 功率 [W]
+    """
+    key: str
+    label: str
+    color: str
+    f_hz: np.ndarray          # 频率网格 [Hz]
+    psd_W_per_Hz: np.ndarray  # PSD [W/Hz]（离散模型存 P [W]）
+    integrated_power_W: float  # 积分功率（验证 = P0）
+
+
+def make_signal_psd_comparison_figure(
+    results: Sequence[SignalPSDResult],
+    unit: str = "W",
+) -> Figure:
+    """绘制多信号模型的发射 PSD 对比图（1×2 布局：线性 + 对数）。
+
+    对比的模型：
+      - Discrete: delta 近似（stem 竖线）
+      - Raised Cosine β=0 (≡矩形)
+      - Raised Cosine β=0.01
+      - Raised Cosine β=0.1
+      - Raised Cosine β=0.5
+      - OSA
+
+    **物理说明（修正 2026-04）**：
+      - 离散模型 stem：高度 = 信道功率 P [W]（不是 P/df）
+      - 连续模型曲线：高度 = PSD × Δf [W]（每个采样点的 bin 功率）
+      - 两者纵轴量纲统一为 [W]，可直观比较；积分均为 P0 ✓
+
+    Parameters
+    ----------
+    results : Sequence[SignalPSDResult]
+        各信号模型的 PSD 结果
+    unit : str
+        "W" 或 "dBm"
+
+    Returns
+    -------
+    Figure
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    for ax in axes:
+        for result in results:
+            f_THz = result.f_hz / 1e12
+            if result.key == "discrete":
+                # 离散模型：psd_W_per_Hz 存的是信道功率 P [W]
+                y = _to_display(result.psd_W_per_Hz, unit)
+                mask = result.psd_W_per_Hz > 0.0
+                markerline, stemlines, _ = ax.stem(
+                    f_THz[mask], y[mask],
+                    linefmt=result.color, markerfmt=" ", basefmt=" ",
+                    label=result.label,
+                )
+                stemlines.set_linewidth(1.5)
+                markerline.set_visible(False)
+            else:
+                # 连续模型：PSD [W/Hz] × df [Hz] = bin 功率 [W]
+                df = float(np.mean(np.diff(result.f_hz)))
+                power_per_bin = result.psd_W_per_Hz * df
+                y = _to_display(power_per_bin, unit)
+                ax.plot(
+                    f_THz, y,
+                    color=result.color, linewidth=2.0, label=result.label,
+                )
+        ax.set_xlabel("Frequency [THz]")
+        ax.set_ylabel(_ylabel_power_bin(unit))
+        ax.grid(True, alpha=0.3, which="both")
+
+    axes[0].set_title("Signal Launch Power per Bin (Linear Scale)")
+    axes[0].set_ylim(bottom=0.0)
+
+    axes[1].set_title("Signal Launch Power per Bin (Log Scale)")
+
+    # ---- xlim: 显示全 C 波段（80 信道），以便看到 RC/OS rolloff 形状差异 ----
+    # x 轴范围从网格最小频率到最大频率
+    f_plot_min = min(r.f_hz.min() for r in results)
+    f_plot_max = max(r.f_hz.max() for r in results)
+    for ax in axes:
+        ax.set_xlim(f_plot_min / 1e12, f_plot_max / 1e12)
+
+    # ---- log 图 ylim：从全部数据的动态范围计算 ----
+    # 收集所有连续模型在全部频率网格上的功率值
+    all_power_W = []
+    for result in results:
+        if result.key == "discrete":
+            continue
+        df = float(np.mean(np.diff(result.f_hz)))
+        power_per_bin = result.psd_W_per_Hz * df  # [W]
+        all_power_W.append(power_per_bin[power_per_bin > 0])
+
+    if all_power_W:
+        all_W = np.concatenate(all_power_W)
+        p_min = float(all_W.min())
+        p_max = float(all_W.max())
+        # headroom: -30 dB below min, +10 dB above max
+        y_bot_W = p_min / 1000   # -30 dB
+        y_top_W = p_max * 10     # +10 dB
+        axes[1].set_ylim(y_bot_W, y_top_W)
+        axes[1].set_yscale("log")
+        axes[1].axhline(y=y_bot_W, color="#cccccc", linewidth=0.5, linestyle="--", alpha=0.5)
+
+    fig.legend(
+        handles=[], loc="upper center", ncol=len(results), frameon=False,
+        bbox_to_anchor=(0.5, 1.02),
+    )
+    handles, labels = axes[0].get_legend_handles_labels()
+    non_empty = [h for h, l in zip(handles, labels) if l]
+    fig.legend(non_empty, [l for l in labels if l],
+               loc="upper center", ncol=len(results), frameon=False,
+               bbox_to_anchor=(0.5, 1.02))
+
+    fig.text(
+        0.5, -0.04,
+        "Note: Discrete stems show channel power P [W]. "
+        "Continuous curves show PSD × Δf [W] (power per bin). "
+        "Both share the same unit [W] — integrals equal total channel power P0.",
+        ha="center", fontsize=8, style="italic", color="#555555",
+    )
+
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.93))
+    return fig
 
 
 def _noise_bin_power(psd: np.ndarray, df: float, unit: str) -> np.ndarray:

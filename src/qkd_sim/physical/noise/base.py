@@ -26,6 +26,14 @@ class NoiseSolver(ABC):
     - 输出：shape (N_q,) 的 ndarray，单位 W
     - N_q 为 wdm_grid 中量子信道数量
     - z=L（光纤长度）为默认评估位置；子类可根据需要扩展其他位置
+
+    Notes
+    -----
+    ABC 是 `collections.abc`（Abstract Base Class）的别名，是 Python 标准库的
+    抽象基类机制：
+      - 用 ``@abstractmethod`` 装饰的方法子类必须实现，否则实例化时报 TypeError
+      - 抽象基类本身不能直接实例化
+      - 类似于 Java 的 interface 或 C++ 的纯虚基类
     """
 
     @abstractmethod

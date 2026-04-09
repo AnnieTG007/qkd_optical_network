@@ -32,14 +32,14 @@ def _fwm_efficiency(
 ) -> np.ndarray:
     """FWM 效率因子 η。
 
-    公式 2.2.2 (formulas_fwm.md):
+    公式 2.1.1 (formulas_fwm.md):
         η = [exp(-Δα·L) - 2·exp(-Δα·L/2)·cos(Δβ·L) + 1]
             / [(Δα)²/4 + (Δβ)²]
 
     Parameters
     ----------
     delta_alpha : ndarray
-        衰减失配 Δα = α₃+α₄+α₂-α₁ [1/m]
+        衰减差值 Δα = α₃+α₄+α₂-α₁ [1/m]
     delta_beta : ndarray
         相位失配 Δβ [rad/m]
     L : float
@@ -70,11 +70,14 @@ def _F_antiderivative(
     """后向 FWM 积分原函数 F(l)。
 
     公式 2.2.6 (formulas_fwm.md):
-        F(l) = exp(α₁·z_obs) / denom × [-exp(-A·l)/A - exp(-B·l)/B² - exp(-C·l)/C]
+        F(l) = exp(α₁·z_obs) / denom
+               × [ -exp(-A·l)/A
+                   - exp(-B·l)/(B²+Δβ²)·(-B·cos(Δβ·l)+Δβ·sin(Δβ·l))
+                   - exp(-C·l)/C ]
 
     辅助变量（函数内部计算）：
         A = Δα + 2·α₁
-        B = Δα/2 + 2·α₁   （注：分母中为 B²，源自二次项积分，见公式推导）
+        B = Δα/2 + 2·α₁
         C = 2·α₁
         denom = (Δα)²/4 + (Δβ)²
 
@@ -89,7 +92,7 @@ def _F_antiderivative(
     alpha1 : float
         量子信道衰减 α₁ [1/m]
     delta_alpha : ndarray
-        衰减失配 Δα = α_k + α_i + α_j - α₁ [1/m]
+        衰减差值 Δα = α_k + α_i + α_j - α₁ [1/m]
     delta_beta : ndarray
         相位失配 Δβ [rad/m]
     L : float
@@ -108,7 +111,12 @@ def _F_antiderivative(
 
     exp_z = np.exp(alpha1 * z_obs)
     term_A = -np.exp(-A * l) / A
-    term_B = -np.exp(-B * l) / (B ** 2)  # 注：B² 来自二次项的部分分数展开
+    # B 项：分母 B²+Δβ²，乘以三角修正因子 (-B·cos+Δβ·sin)
+    term_B = (
+        -np.exp(-B * l)
+        / (B ** 2 + delta_beta ** 2)
+        * (-B * np.cos(delta_beta * l) + delta_beta * np.sin(delta_beta * l))
+    )
     term_C = -np.exp(-C * l) / C
     return exp_z / denom * (term_A + term_B + term_C)
 
@@ -219,11 +227,14 @@ class DiscreteFWMSolver(NoiseSolver):
         # 简并因子 D（公式 2.2.1）
         D = np.where(n3_arr == n4_arr, 3.0, 6.0)
 
-        # 衰减失配 Δα = α₃+α₄+α₂-α₁（C波段近似：各信道 α 相同，Δα = 2α）
-        alpha = fiber.alpha
-        delta_alpha = 2.0 * alpha * np.ones(f2.shape)  # Δα ≈ 2α
+        # 衰减差值 Δα = α(f₃)+α(f₄)+α(f₂)-α(f₁)（精确公式）
+        alpha1 = fiber.get_loss_at_freq(f1)  # 标量
+        alpha2 = fiber.get_loss_at_freq(f2)  # shape (N_valid,)
+        alpha3 = fiber.get_loss_at_freq(f3)  # shape (N_valid,)
+        alpha4 = fiber.get_loss_at_freq(f4)  # shape (N_valid,)
+        delta_alpha = alpha4 + alpha3 + alpha2 - alpha1
 
-        # 相位失配 Δβ（调用 Fiber 接口，公式 2.2.3）
+        # 相位失配 Δβ（调用 Fiber 接口，见 docs/formulas_fwm.md 效率因子节）
         delta_beta = fiber.get_phase_mismatch(f2=f2, f3=f3, f4=f4)
 
         L = fiber.L
@@ -233,7 +244,7 @@ class DiscreteFWMSolver(NoiseSolver):
             # 公式 2.2.1
             eta = _fwm_efficiency(delta_alpha, delta_beta, L)
             contributions = (
-                np.exp(-alpha * L) * (gamma ** 2 / 9.0)
+                np.exp(-alpha1 * L) * (gamma ** 2 / 9.0)
                 * D ** 2 * eta * P2 * P3 * P4
             )
             return float(contributions.sum())
@@ -244,11 +255,11 @@ class DiscreteFWMSolver(NoiseSolver):
             # 辅助变量 A、B、C、denom 由 _F_antiderivative 内部计算
             F_L = _F_antiderivative(
                 l=np.full_like(delta_alpha, L), z_obs=0.0,
-                alpha1=alpha, delta_alpha=delta_alpha, delta_beta=delta_beta, L=L,
+                alpha1=alpha1, delta_alpha=delta_alpha, delta_beta=delta_beta, L=L,
             )
             F_0 = _F_antiderivative(
                 l=np.zeros_like(delta_alpha), z_obs=0.0,
-                alpha1=alpha, delta_alpha=delta_alpha, delta_beta=delta_beta, L=L,
+                alpha1=alpha1, delta_alpha=delta_alpha, delta_beta=delta_beta, L=L,
             )
 
             contributions = (

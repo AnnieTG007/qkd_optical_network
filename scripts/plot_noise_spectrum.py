@@ -87,13 +87,8 @@ MODEL_SPECS = {
         "spectrum_type": SpectrumType.SINGLE_FREQ,
         "continuous": False,
     },
-    "rectangular": {
-        "label": "Rectangular",
-        "spectrum_type": SpectrumType.RECTANGULAR,
-        "continuous": True,
-    },
     "raised_cosine": {
-        "label": "Raised Cosine",
+        "label": "Raised Cosine (β=0 ≡ Rectangular)",
         "spectrum_type": SpectrumType.RAISED_COSINE,
         "continuous": True,
     },
@@ -101,6 +96,46 @@ MODEL_SPECS = {
         "label": "OSA",
         "spectrum_type": SpectrumType.OSA_SAMPLED,
         "continuous": True,
+    },
+}
+
+# 信号发射 PSD 对比专用模型列表（支持多种 RC 滚降系数）
+SIGNAL_TX_SPECS = {
+    "discrete": {
+        "label": "Discrete",
+        "spectrum_type": SpectrumType.SINGLE_FREQ,
+        "continuous": False,
+        "beta_rolloff": None,
+    },
+    "rc_beta0": {
+        "label": "RC (β=0, ≡Rect)",
+        "spectrum_type": SpectrumType.RAISED_COSINE,
+        "continuous": True,
+        "beta_rolloff": 0.0,
+    },
+    "rc_beta001": {
+        "label": "RC (β=0.01)",
+        "spectrum_type": SpectrumType.RAISED_COSINE,
+        "continuous": True,
+        "beta_rolloff": 0.01,
+    },
+    "rc_beta01": {
+        "label": "RC (β=0.1)",
+        "spectrum_type": SpectrumType.RAISED_COSINE,
+        "continuous": True,
+        "beta_rolloff": 0.1,
+    },
+    "rc_beta05": {
+        "label": "RC (β=0.5)",
+        "spectrum_type": SpectrumType.RAISED_COSINE,
+        "continuous": True,
+        "beta_rolloff": 0.5,
+    },
+    "osa": {
+        "label": "OSA",
+        "spectrum_type": SpectrumType.OSA_SAMPLED,
+        "continuous": True,
+        "beta_rolloff": None,
     },
 }
 
@@ -148,6 +183,63 @@ def _build_model_grid(
         )
     return build_wdm_grid(
         config=config,
+        spectrum_type=spec["spectrum_type"],
+        f_grid=f_grid,
+        classical_channel_indices=CLASSICAL_INDICES,
+    )
+
+
+def _build_signal_tx_grid(
+    model_key: str,
+    base_config: WDMConfig,
+    f_grid: np.ndarray,
+    osa_csv_path: Path,
+) -> WDMGrid:
+    """为信号发射 PSD 对比构建 WDMGrid（支持 per-model beta_rolloff）。
+
+    Parameters
+    ----------
+    model_key : str
+        SIGNAL_TX_SPECS 中的键名
+    base_config : WDMConfig
+        基础配置（会被 beta_rolloff 覆盖）
+    f_grid : ndarray
+        频率网格
+    osa_csv_path : Path
+        OSA CSV 文件路径
+
+    Returns
+    -------
+    WDMGrid
+    """
+    spec = SIGNAL_TX_SPECS[model_key]
+
+    # 使用 per-model beta_rolloff 构建独立 config
+    if spec["beta_rolloff"] is not None:
+        from qkd_sim.config.schema import WDMConfig as WC
+        model_config = WC(
+            f_center=base_config.f_center,
+            N_ch=base_config.N_ch,
+            channel_spacing=base_config.channel_spacing,
+            B_s=base_config.B_s,
+            P0=base_config.P0,
+            beta_rolloff=spec["beta_rolloff"],
+            quantum_channel_indices=base_config.quantum_channel_indices,
+        )
+    else:
+        model_config = base_config
+
+    if spec["spectrum_type"] == SpectrumType.OSA_SAMPLED:
+        return build_wdm_grid(
+            config=model_config,
+            spectrum_type=spec["spectrum_type"],
+            f_grid=f_grid,
+            osa_csv_path=osa_csv_path,
+            osa_rbw=OSA_RBW_HZ,
+            classical_channel_indices=CLASSICAL_INDICES,
+        )
+    return build_wdm_grid(
+        config=model_config,
         spectrum_type=spec["spectrum_type"],
         f_grid=f_grid,
         classical_channel_indices=CLASSICAL_INDICES,

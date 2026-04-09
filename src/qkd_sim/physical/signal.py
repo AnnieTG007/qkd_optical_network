@@ -1,15 +1,15 @@
 """WDM 信号建模：频谱类型、信道、网格与 G_TX 构建。
 
 公式来源: docs/formulas_signal.md
-支持四种频谱类型:
+支持三种频谱类型:
   - SINGLE_FREQ: 离散单频（功率集中于中心频率）
-  - RECTANGULAR: 连续矩形谱（公式 3.1）
-  - RAISED_COSINE: 连续升余弦滚降谱（公式 3.2）
-  - OSA_SAMPLED: OSA 实测谱（公式 3.3）
+  - RAISED_COSINE: 连续升余弦滚降谱（公式 3.1），矩形谱为 beta=0 的特例
+  - OSA_SAMPLED: OSA 实测谱（公式 3.2）
 """
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -22,10 +22,12 @@ from qkd_sim.utils.units import power_dBm_to_W
 
 
 class SpectrumType(Enum):
-    """信号频谱类型枚举。"""
+    """信号频谱类型枚举。
+
+    注意：矩形谱不再作为独立类型，RAISED_COSINE (beta=0) 即为矩形谱。
+    """
 
     SINGLE_FREQ = "single_freq"
-    RECTANGULAR = "rectangular"
     RAISED_COSINE = "raised_cosine"
     OSA_SAMPLED = "osa_sampled"
 
@@ -79,7 +81,7 @@ def integrate_psd(f_grid: np.ndarray, psd: np.ndarray) -> float:
     if psd.size == 0:
         return 0.0
     df = validate_uniform_frequency_grid(f_grid)
-    return float(np.sum(psd) * df)
+    return float(np.sum(psd * df))
 
 
 def normalize_psd_to_power(
@@ -168,15 +170,23 @@ class WDMChannel:
         if f_grid.ndim != 1:
             raise ValueError(f"f_grid must be 1D, got shape {f_grid.shape}")
 
-        # 非活跃信道无 PSD
-        if self.channel_type != "classical" or self.power <= 0.0:
+        # classical 信道但 power <= 0：警告后降级为 inactive
+        if self.channel_type == "classical" and self.power <= 0.0:
+            warnings.warn(
+                f"Channel at {self.f_center:.3e} Hz is 'classical' but power={self.power:.2e} W ≤ 0. "
+                "Treating as 'inactive'. Set channel_type='inactive' explicitly to silence this warning.",
+                UserWarning,
+                stacklevel=2,
+            )
+            self.channel_type = "inactive"
+            return np.zeros_like(f_grid)
+
+        # 非 classical 信道无 PSD
+        if self.channel_type != "classical":
             return np.zeros_like(f_grid)
 
         if self.spectrum_type == SpectrumType.SINGLE_FREQ:
             return np.zeros_like(f_grid)
-
-        if self.spectrum_type == SpectrumType.RECTANGULAR:
-            raw = self._psd_rectangular(f_grid)
         elif self.spectrum_type == SpectrumType.RAISED_COSINE:
             raw = self._psd_raised_cosine(f_grid)
         elif self.spectrum_type == SpectrumType.OSA_SAMPLED:
@@ -185,15 +195,6 @@ class WDMChannel:
             raise ValueError(f"Unknown spectrum type: {self.spectrum_type}")
 
         return normalize_psd_to_power(f_grid, raw, self.power)
-
-    def _psd_rectangular(self, f_grid: np.ndarray) -> np.ndarray:
-        """矩形谱 G_TX(f)。公式 3.1 (formulas_signal.md)。
-
-        G_TX(f) = P_ch / B_s,  当 |f - f_n| ≤ B_s/2
-        G_TX(f) = 0,            当 |f - f_n| > B_s/2
-        """
-        delta_f = np.abs(f_grid - self.f_center)
-        return np.where(delta_f <= self.B_s / 2.0, self.power / self.B_s, 0.0)
 
     def _psd_raised_cosine(self, f_grid: np.ndarray) -> np.ndarray:
         """升余弦滚降谱 G_TX(f)。公式 3.2 (formulas_signal.md)。
@@ -207,7 +208,9 @@ class WDMChannel:
         beta = self.beta_rolloff
 
         if beta < 1e-12:
-            return self._psd_rectangular(f_grid)
+            # beta=0 时退化为矩形谱
+            delta_f = np.abs(f_grid - self.f_center)
+            return np.where(delta_f <= R_s / 2.0, self.power / R_s, 0.0)
 
         delta_f = np.abs(f_grid - self.f_center)
         psd = np.zeros_like(f_grid)
