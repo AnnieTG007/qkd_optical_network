@@ -217,26 +217,24 @@ def _display_channel_label(channel_index: int) -> str:
     return f"C{channel_index + WDM_PARAMS['start_channel']}"
 
 
-def _nice_log_tickvals(
-    y_bot_log: float, y_top_log: float, n_ticks: int = 9
-) -> tuple[list[float], list[str]]:
-    _ = n_ticks
-    bot = int(np.floor(y_bot_log))
-    top = int(np.ceil(y_top_log))
-    tick_vals: list[float] = []
-    tick_texts: list[str] = []
+def adaptive_log_ticks(
+    y_bot_log: float, y_top_log: float, max_ticks: int = 8
+) -> dict:
+    """自适应对数轴刻度: Plotly 自动管理密度, tickformat 保证干净标签."""
+    return dict(
+        tickmode="auto",
+        nticks=max_ticks,
+        tickformat="1e",
+        exponentformat="power",
+    )
 
-    for exp in range(bot, top + 1):
-        main_val = float(10.0 ** exp)
-        if main_val > 0:
-            tick_vals.append(main_val)
-            tick_texts.append(f"1e{exp}")
 
-        if exp < top:
-            mid_val = float(3.0 * (10.0 ** exp))
-            mid_log = np.log10(mid_val)
-            if y_bot_log <= mid_log <= y_top_log:
-                tick_vals.append(mid_val)
-                tick_texts.append(f"3e{exp}")
-
-    return tick_vals, tick_texts
+def adaptive_linear_ticks(
+    y_bot: float, y_top: float, max_ticks: int = 8
+) -> dict:
+    """自适应线性轴刻度: Plotly 自动管理密度, 保留两位小数."""
+    return dict(
+        tickmode="auto",
+        nticks=max_ticks,
+        tickformat=".2f",
+    )

@@ -46,7 +46,8 @@ from scripts.dash_utils import (
     _build_noise_frequency_grid,
     _build_wdm_config,
     _display_channel_label,
-    _nice_log_tickvals,
+    adaptive_log_ticks,
+    adaptive_linear_ticks,
     _resolve_osa_csv,
 )
 
@@ -71,17 +72,7 @@ def _build_discrete_fwm_psd(
     return fwm_psd
 
 
-def _nice_linear_tickvals(
-    y_bot: float, y_top: float, n: int = 7
-) -> tuple[list[float], list[str]]:
-    """Generate explicit evenly spaced tick values/text for a linear axis."""
-    if n <= 1:
-        vals = [float(y_bot)]
-    else:
-        step = (y_top - y_bot) / (n - 1)
-        vals = [float(y_bot + i * step) for i in range(n)]
-    texts = [f"{v:.1f}" for v in vals]
-    return vals, texts
+# _nice_linear_tickvals 已迁移到 dash_utils.adaptive_linear_ticks
 
 
 print("=" * 60)
@@ -355,9 +346,6 @@ def update_graph(Li: int, store_data: dict) -> go.Figure:
         y_bot_log, y_top_log = -15.5, -7.5
         y_bot_dBm, y_top_dBm = -120.0, -60.0
 
-    log_tick_vals, log_tick_texts = _nice_log_tickvals(y_bot_log, y_top_log)
-    lin_tick_vals, lin_tick_texts = _nice_linear_tickvals(y_bot_dBm, y_top_dBm)
-
     f_min, f_max = float(freq_THz.min()), float(freq_THz.max())
 
     for col in [1, 2]:
@@ -372,11 +360,7 @@ def update_graph(Li: int, store_data: dict) -> go.Figure:
         title_text="Power per Bin [W]",
         type="log",
         range=[y_bot_log, y_top_log],
-        tickmode="array",
-        tickvals=log_tick_vals,
-        ticktext=log_tick_texts,
-        tickformat=None,
-        exponentformat="none",
+        **adaptive_log_ticks(y_bot_log, y_top_log),
         showgrid=True,
         row=1,
         col=1,
@@ -384,11 +368,7 @@ def update_graph(Li: int, store_data: dict) -> go.Figure:
     fig.update_yaxes(
         title_text="Power per Bin [dBm]",
         range=[y_bot_dBm, y_top_dBm],
-        tickmode="array",
-        tickvals=lin_tick_vals,
-        ticktext=lin_tick_texts,
-        tickformat=None,
-        exponentformat="none",
+        **adaptive_linear_ticks(y_bot_dBm, y_top_dBm),
         row=1,
         col=2,
     )

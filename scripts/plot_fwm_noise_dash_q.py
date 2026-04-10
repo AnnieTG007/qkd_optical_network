@@ -46,7 +46,7 @@ from scripts.dash_utils import (
     _build_noise_frequency_grid,
     _build_wdm_config,
     _display_channel_label,
-    _nice_log_tickvals,
+    adaptive_log_ticks,
     _resolve_osa_csv,
 )
 
@@ -325,8 +325,6 @@ def update_graph(q_idx: int, store_data: dict) -> go.Figure:
     else:
         y_bot_log, y_top_log = -15.5, -4.5
 
-    tick_vals, tick_texts = _nice_log_tickvals(y_bot_log, y_top_log)
-
     for col in [1, 2]:
         fig.update_xaxes(
             title_text="Fiber Length [km]",
@@ -338,11 +336,7 @@ def update_graph(q_idx: int, store_data: dict) -> go.Figure:
             title_text="Noise Power [W]",
             type="log",
             range=[y_bot_log, y_top_log],
-            tickmode="array",
-            tickvals=tick_vals,
-            ticktext=tick_texts,
-            tickformat=None,
-            exponentformat="none",
+            **adaptive_log_ticks(y_bot_log, y_top_log),
             showgrid=True,
             row=1,
             col=col,
