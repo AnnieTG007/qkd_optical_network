@@ -38,27 +38,19 @@ from qkd_sim.config.schema import WDMConfig
 from qkd_sim.config.plot_config import get_color, load_model_specs
 from qkd_sim.physical.spectrum import SignalPSDResult
 
-# ============================================================================
-# 配置参数（与 plot_noise_spectrum.py 保持一致）
-# ============================================================================
-
-WDM_PARAMS = dict(
-    start_freq=190.1e12,
-    start_channel=1,
-    end_channel=61,
-    channel_spacing=100e9,
-    B_s=32e9,
-    P0=1e-3,
-    beta_rolloff=0.2,
+# ---- 共享常量和辅助函数（从 dash_utils 导入）----
+from scripts.dash_utils import (
+    WDM_PARAMS,          # ITU-T G.694.1 C-band: 190.1-196.1 THz, 100 GHz spacing
+    CLASSICAL_INDICES,   # zero-based classical channel indices
+    OSA_CSV_PATH,
+    _resolve_osa_csv,
+    _LEGEND_SYNC_JS,
+    FREQ_GRID_PADDING_FACTOR,
 )
 
-CLASSICAL_INDICES = [39, 40, 41]
-
-FREQ_GRID_RESOLUTION_HZ = 0.1e9
-FREQ_GRID_PADDING_FACTOR = 1.5
-
+# 仅 signal_tx 脚本使用的参数（不同分辨率）
+FREQ_GRID_RESOLUTION_HZ = 0.1e9   # 信号 PSD 网格: 0.1 GHz（细网格）
 OSA_RBW_HZ = 1.0e9
-OSA_CSV_PATH = _PROJECT_ROOT / "data" / "osa"
 
 
 def _build_signal_tx_annotation() -> dict:
@@ -88,11 +80,7 @@ def _build_signal_tx_annotation() -> dict:
 
 
 
-def _resolve_osa_csv() -> Path:
-    csv_files = sorted(OSA_CSV_PATH.glob("*.csv"))
-    if not csv_files:
-        raise FileNotFoundError(f"No OSA CSV files found in {OSA_CSV_PATH}")
-    return csv_files[0]
+# _resolve_osa_csv 已从 dash_utils 导入
 
 
 def _build_frequency_grid(config: WDMConfig) -> np.ndarray:
@@ -382,84 +370,7 @@ def make_signal_psd_plotly(results: list[SignalPSDResult]) -> go.Figure:
     return fig
 
 
-_LEGEND_SYNC_JS = """
-function syncLegendClicks() {
-    var gd = document.querySelector('.plotly-graph-div');
-    if (!gd) return;
-
-    // 从 legend item DOM 节点找到对应的 curveNumber
-    function getCurveNumber(node) {
-        if (node._plotlyCurveNumber !== undefined) return node._plotlyCurveNumber;
-        var parent = node.parentElement;
-        while (parent) {
-            if (parent._plotlyCurveNumber !== undefined) return parent._plotlyCurveNumber;
-            parent = parent.parentElement;
-        }
-        return null;
-    }
-
-    // 单击图例项：切换该模型的显示/隐藏
-    gd.on('plotly_legendclick', function(eventData) {
-        var curveNumber = getCurveNumber(eventData.node);
-        var fullData = gd._fullData || [];
-        var clickedGroup = null;
-
-        if (curveNumber !== null && fullData[curveNumber]) {
-            clickedGroup = fullData[curveNumber].legendgroup;
-        }
-        if (!clickedGroup) return true;
-
-        var groupOn = false;
-        for (var k = 0; k < gd.data.length; k++) {
-            if (gd.data[k].legendgroup === clickedGroup && gd.data[k].visible === true) {
-                groupOn = true;
-                break;
-            }
-        }
-
-        var newVal = groupOn ? 'legendonly' : true;
-        for (var m = 0; m < gd.data.length; m++) {
-            if (gd.data[m].legendgroup === clickedGroup) {
-                gd.data[m].visible = newVal;
-            }
-        }
-        Plotly.redraw(gd);
-        return false;
-    });
-
-    // 双击图例项：利用 Plotly 内置隔离行为（默认在 handler 之前执行），
-    // 在 handler 内检测是否有隐藏项：
-    //   - 有隐藏项（Plotly 刚做完隔离）→ 恢复全部
-    //   - 无隐藏项（当前全部可见）→ 无操作（Plotly 已完成隔离，保持）
-    // 效果：单击图例切换显示/隐藏；双击图例隔离单个模型，再次双击任意图例恢复全部
-    gd.on('plotly_legenddoubleclick', function(eventData) {
-        var curveNumber = getCurveNumber(eventData.node);
-        var fullData = gd._fullData || [];
-        if (!curveNumber || !fullData[curveNumber]) return true;
-
-        // Plotly 默认隔离行为已经执行，检查是否有 legendonly 项
-        var hasHidden = false;
-        for (var h = 0; h < gd.data.length; h++) {
-            if (gd.data[h].visible === 'legendonly') { hasHidden = true; break; }
-        }
-
-        if (hasHidden) {
-            // Plotly 刚隔离了某个模型，恢复全部显示
-            for (var ri = 0; ri < gd.data.length; ri++) {
-                gd.data[ri].visible = true;
-            }
-            Plotly.redraw(gd);
-        }
-        // 如果无隐藏项（当前全部可见），Plotly 的隔离已生效，无需额外操作
-        return false;
-    });
-}
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', syncLegendClicks);
-} else {
-    syncLegendClicks();
-}
-"""
+# _LEGEND_SYNC_JS 已从 dash_utils 导入
 
 
 # ============================================================================
