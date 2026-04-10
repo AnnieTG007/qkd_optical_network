@@ -10,7 +10,7 @@
   2. 前向 FWM 噪声 vs 光纤长度
   3. 后向 FWM 噪声 vs 光纤长度
 
-输出到: outputs/phase4_N80_C3/FWM_Noise/
+输出到: outputs/phase4_N61_C3/FWM_Noise/
 
 纵轴量纲（与 signal_tx 保持一致）：
   - 离散模型 stem 高度 = 该量子信道的积分 FWM 噪声功率 [W]
@@ -50,16 +50,17 @@ from qkd_sim.physical.noise import DiscreteFWMSolver
 # ============================================================================
 
 WDM_PARAMS = dict(
-    f_center=193.4e12,
-    N_ch=80,
-    channel_spacing=50e9,
+    start_freq=190.1e12,
+    start_channel=1,
+    end_channel=61,
+    channel_spacing=100e9,
     B_s=32e9,
     P0=1e-3,
     beta_rolloff=0.2,
 )
 
 # 泵浦（经典信道）indices：39, 40, 41（居中）
-CLASSICAL_INDICES = [39, 40, 41]
+CLASSICAL_INDICES = [38, 39, 40]
 
 # 频率网格分辨率
 FREQ_GRID_RESOLUTION_HZ = 0.1e9      # 信号 grid（连续模型 PSD）
@@ -98,22 +99,28 @@ def _resolve_osa_csv() -> Path:
     return csv_files[0]
 
 
+def _n_channels_from_params() -> int:
+    return int(WDM_PARAMS["end_channel"] - WDM_PARAMS["start_channel"] + 1)
+
+
 def _build_noise_frequency_grid(config: WDMConfig) -> np.ndarray:
     """构建噪声 PSD 绘图的频率网格（粗分辨率）。"""
-    half_span = (config.N_ch - 1) / 2 * config.channel_spacing
+    half_span = (config.end_channel - config.start_channel) / 2.0 * config.channel_spacing
+    center_freq = config.start_freq + half_span
     padding = FREQ_GRID_PADDING_FACTOR * config.channel_spacing
-    f_min = config.f_center - half_span - padding
-    f_max = config.f_center + half_span + padding
+    f_min = center_freq - half_span - padding
+    f_max = center_freq + half_span + padding
     n_points = int(np.ceil((f_max - f_min) / NOISE_GRID_RESOLUTION_HZ)) + 1
     return np.linspace(f_min, f_max, n_points)
 
 
 def _build_signal_frequency_grid(config: WDMConfig) -> np.ndarray:
     """构建信号 PSD 的精细频率网格（连续模型积分需要）。"""
-    half_span = (config.N_ch - 1) / 2 * config.channel_spacing
+    half_span = (config.end_channel - config.start_channel) / 2.0 * config.channel_spacing
+    center_freq = config.start_freq + half_span
     padding = FREQ_GRID_PADDING_FACTOR * config.channel_spacing
-    f_min = config.f_center - half_span - padding
-    f_max = config.f_center + half_span + padding
+    f_min = center_freq - half_span - padding
+    f_max = center_freq + half_span + padding
     n_points = int(np.ceil((f_max - f_min) / FREQ_GRID_RESOLUTION_HZ)) + 1
     return np.linspace(f_min, f_max, n_points)
 
@@ -142,8 +149,9 @@ def _build_model_wdm_grid(
     """
     if spec["beta_rolloff"] is not None:
         model_config = WDMConfig(
-            f_center=base_config.f_center,
-            N_ch=base_config.N_ch,
+            start_freq=base_config.start_freq,
+            start_channel=base_config.start_channel,
+            end_channel=base_config.end_channel,
             channel_spacing=base_config.channel_spacing,
             B_s=base_config.B_s,
             P0=base_config.P0,
@@ -174,6 +182,25 @@ def _to_dBm_for_plotly(v: np.ndarray | float) -> np.ndarray | float:
     """将功率 [W] 转换为 dBm（向量化，支持数组输入）。"""
     v_arr = np.asarray(v, dtype=np.float64)
     return 10.0 * np.log10(np.maximum(v_arr, 1e-30)) + 30.0
+
+
+def _display_channel_label(channel_index: int) -> str:
+    return f"C{channel_index + WDM_PARAMS['start_channel']}"
+
+
+def _build_discrete_fwm_psd(
+    f_grid: np.ndarray,
+    quantum_freqs_hz: np.ndarray,
+    channel_power_w: np.ndarray,
+) -> np.ndarray:
+    fwm_psd = np.zeros_like(f_grid, dtype=np.float64)
+    df = float(np.mean(np.diff(f_grid)))
+    for power_w, f_q_hz in zip(channel_power_w, quantum_freqs_hz):
+        if power_w <= 0.0:
+            continue
+        idx = int(np.argmin(np.abs(f_grid - f_q_hz)))
+        fwm_psd[idx] += power_w / df
+    return fwm_psd
 
 
 # ============================================================================
@@ -207,16 +234,13 @@ def compute_fwm_psd_results(
     base_config: WDMConfig,
     osa_csv_path: Path,
 ) -> list[FWMPSDResult]:
-    """计算所有模型的 FWM 噪声 PSD。
-
-    离散模型：使用 compute_fwm_spectrum_conti，但在量子信道位置画竖线
-    连续模型：compute_fwm_spectrum_conti 返回全频段 PSD [W/Hz]
+    """??????????? FWM ??? PSD??
+    ?????????????????????????????????
+    ????????ompute_fwm_spectrum_conti ????????PSD [W/Hz]
     """
     fwm_solver = DiscreteFWMSolver()
     f_grid = _build_noise_frequency_grid(base_config)
-    df = float(np.mean(np.diff(f_grid)))
 
-    # 创建默认长度的 Fiber（用于 PSD 计算）
     fp = dict(FIBER_PARAMS)
     fiber = Fiber(FiberConfig(**fp))
 
@@ -225,30 +249,17 @@ def compute_fwm_psd_results(
 
     for model_key, spec in specs.items():
         grid = _build_model_wdm_grid(model_key, spec, base_config, f_grid, osa_csv_path)
-
-        # 量子信道频率（用于离散模型竖线定位）
         q_chs = grid.get_quantum_channels()
-        f_q_hz = np.array([ch.f_center for ch in q_chs])
+        f_q_hz = np.array([ch.f_center for ch in q_chs], dtype=np.float64)
 
         if spec["continuous"]:
-            # 连续模型：compute_fwm_spectrum_conti 返回 G_fwm(f) [W/Hz]
             fwm_psd = fwm_solver.compute_fwm_spectrum_conti(
                 fiber, grid, f_grid, direction="forward"
             )
             fwm_channel_power = None
         else:
-            # 离散模型：用 compute_forward 获取每量子信道的积分噪声
-            # compute_fwm_spectrum_conti with SINGLE_FREQ → 等效积分结果
-            # 为绘图一致性：在量子信道频率处返回该信道积分噪声，其余为零
-            fwm_psd = fwm_solver.compute_fwm_spectrum_conti(
-                fiber, grid, f_grid, direction="forward"
-            )
-            # 用离散积分结果替代（在 f_grid 的量子信道位置注入积分值）
             fwm_channel_power = fwm_solver.compute_forward(fiber, grid)
-            # 将积分值放到最近邻格点
-            for i, f_ch in enumerate(f_q_hz):
-                idx = int(np.argmin(np.abs(f_grid - f_ch)))
-                fwm_psd[idx] = fwm_channel_power[i] / df  # 转回 PSD 用于绘图
+            fwm_psd = _build_discrete_fwm_psd(f_grid, f_q_hz, fwm_channel_power)
 
         results.append(FWMPSDResult(
             key=model_key,
@@ -433,7 +444,7 @@ def _build_param_annotation() -> list:
     """构建仿真参数注释文本（用于 Plotly figures 右侧/下侧标注）。"""
     n_classical = len(CLASSICAL_INDICES)
     f_classical = [
-        f"  Ch {i}: {(WDM_PARAMS['f_center'] + (i - (WDM_PARAMS['N_ch']-1)/2) * WDM_PARAMS['channel_spacing']) / 1e12:.4f} THz"
+        f"  {_display_channel_label(i)}: {(WDM_PARAMS['start_freq'] + i * WDM_PARAMS['channel_spacing']) / 1e12:.4f} THz"
         for i in CLASSICAL_INDICES
     ]
     classical_freqs = "\n".join(f_classical)
@@ -720,12 +731,15 @@ def _make_fwm_length_sweep_subfigure(
 # ============================================================================
 
 def main() -> None:
-    output_dir = _PROJECT_ROOT / "outputs" / "phase4_N80_C3" / "FWM_Noise"
+    n_classical = len(CLASSICAL_INDICES)
+    n_ch = _n_channels_from_params()
+    run_tag = f"phase4_N{n_ch}_C{n_classical}"
+    output_dir = _PROJECT_ROOT / "outputs" / run_tag / "FWM_Noise"
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output: {output_dir}")
 
     # 量子信道 = 所有非 CLASSICAL_INDICES 的信道（避免与经典信道重叠）
-    quantum_channel_indices = [i for i in range(WDM_PARAMS["N_ch"]) if i not in CLASSICAL_INDICES]
+    quantum_channel_indices = [i for i in range(int(WDM_PARAMS["end_channel"] - WDM_PARAMS["start_channel"] + 1)) if i not in CLASSICAL_INDICES]
     wdm_config = WDMConfig(**WDM_PARAMS, quantum_channel_indices=quantum_channel_indices)
     osa_csv_path = _resolve_osa_csv()
 

@@ -76,23 +76,23 @@ colors:
 # =============================================================================
 model_groups:
 
-  # Signal TX 对比：6 个模型
+  # Signal TX 对比
   signal_tx:
     - discrete
-    - rc_beta0
     - rc_beta001
     - rc_beta05
-    - rc_beta1
     - osa
 
-  # FWM Noise PSD 对比：3 个模型
+  # FWM Noise PSD 对比
   fwm_noise:
     - discrete
-    - rc_beta02
+    - rc_beta001
+    - rc_beta05
     - osa
 
-  # Phase 4 噪声谱综合对比（离散 / RC(β=0) / OSA）
+  # Phase 4 噪声谱综合对比
   noise_spectrum:
     - discrete
-    - raised_cosine
+    - rc_beta001
+    - rc_beta05
     - osa

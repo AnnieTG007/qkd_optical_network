@@ -111,10 +111,31 @@ $$
 
 ---
 
-## 5. WDM频率网格生成
+## 5. WDM频率网格生成（ITU-T G.694.1）
 
-等间隔DWDM系统，N_ch 个信道，中心频率 f_center，间隔 g：
+等间隔DWDM系统，ITU-T G.694.1 频段定义：
 
 $$
-f_{\text{channels}} = f_{\text{center}} + \text{np.arange}\left(-\frac{N_{\text{ch}}-1}{2}, \frac{N_{\text{ch}}+1}{2}\right) \times g
+f(n) = f_{\text{start}} + (n - n_{\text{start}}) \times g
 $$
+
+其中：
+- $f_{\text{start}}$：波段起始频率（如 C01 = 190.1 THz）
+- $n_{\text{start}}$：起始信道号（如 1 = C01）
+- $g$：信道间隔（100 GHz）
+- $n$：信道号（如 31 = C31 = 193.1 THz）
+
+标准 C-band（C01~C61）：
+$$
+f_{\text{start}} = 190.1 \text{ THz}, \quad n_{\text{start}} = 1, \quad g = 100 \text{ GHz}
+$$
+
+$$
+\text{C01} = 190.1 \text{ THz}, \quad \text{C31} = 193.1 \text{ THz}, \quad \text{C61} = 196.1 \text{ THz}
+$$
+
+代码实现：
+```python
+indices = np.arange(start_channel, end_channel + 1, dtype=float)
+f_channels = start_freq + (indices - start_channel) * channel_spacing
+```

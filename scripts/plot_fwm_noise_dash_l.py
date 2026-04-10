@@ -43,14 +43,15 @@ from qkd_sim.physical.signal import build_wdm_grid
 # ============================================================================
 
 WDM_PARAMS = dict(
-    f_center=193.4e12,
-    N_ch=80,
-    channel_spacing=50e9,
+    start_freq=190.1e12,
+    start_channel=1,
+    end_channel=61,
+    channel_spacing=100e9,
     B_s=32e9,
     P0=1e-3,
     beta_rolloff=0.2,
 )
-CLASSICAL_INDICES = [39, 40, 41]
+CLASSICAL_INDICES = [38, 39, 40]
 NOISE_GRID_RESOLUTION_HZ = 5e9
 FREQ_GRID_PADDING_FACTOR = 1.5
 LENGTHS_KM = np.array([1, 2, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100])
@@ -117,10 +118,11 @@ def _resolve_osa_csv() -> Path:
 
 
 def _build_noise_frequency_grid(config: WDMConfig) -> np.ndarray:
-    half_span = (config.N_ch - 1) / 2 * config.channel_spacing
+    half_span = (config.end_channel - config.start_channel) / 2.0 * config.channel_spacing
+    center_freq = config.start_freq + half_span
     padding = FREQ_GRID_PADDING_FACTOR * config.channel_spacing
-    f_min = config.f_center - half_span - padding
-    f_max = config.f_center + half_span + padding
+    f_min = center_freq - half_span - padding
+    f_max = center_freq + half_span + padding
     n_points = int(np.ceil((f_max - f_min) / NOISE_GRID_RESOLUTION_HZ)) + 1
     return np.linspace(f_min, f_max, n_points)
 
@@ -140,8 +142,9 @@ def _build_model_grid(
 
     if spec["beta_rolloff"] is not None:
         model_config = WDMConfig(
-            f_center=base_config.f_center,
-            N_ch=base_config.N_ch,
+            start_freq=base_config.start_freq,
+            start_channel=base_config.start_channel,
+            end_channel=base_config.end_channel,
             channel_spacing=base_config.channel_spacing,
             B_s=base_config.B_s,
             P0=base_config.P0,
@@ -171,6 +174,25 @@ def _build_model_grid(
 def _psd_to_json(data: dict) -> dict:
     """把 ALL_PSD 字典 (numpy array -> list) 序列化为 JSON."""
     return {str(Li): {mk: v[mk].tolist() for mk in v.keys()} for Li, v in data.items()}
+
+
+def _display_channel_label(channel_index: int) -> str:
+    return f"C{channel_index + WDM_PARAMS['start_channel']}"
+
+
+def _build_discrete_fwm_psd(
+    f_grid: np.ndarray,
+    quantum_freqs_hz: np.ndarray,
+    channel_power_w: np.ndarray,
+) -> np.ndarray:
+    fwm_psd = np.zeros_like(f_grid, dtype=np.float64)
+    df = float(np.mean(np.diff(f_grid)))
+    for power_w, f_q_hz in zip(channel_power_w, quantum_freqs_hz):
+        if power_w <= 0.0:
+            continue
+        idx = int(np.argmin(np.abs(f_grid - f_q_hz)))
+        fwm_psd[idx] += power_w / df
+    return fwm_psd
 
 
 def _nice_log_tickvals(
@@ -226,7 +248,7 @@ print("=" * 60)
 t0 = time.time()
 
 osa_csv_path = _resolve_osa_csv()
-base_quantum_indices = [i for i in range(WDM_PARAMS["N_ch"]) if i not in CLASSICAL_INDICES]
+base_quantum_indices = [i for i in range(int(WDM_PARAMS["end_channel"] - WDM_PARAMS["start_channel"] + 1)) if i not in CLASSICAL_INDICES]
 base_config = _build_wdm_config(base_quantum_indices)
 noise_f_grid = _build_noise_frequency_grid(base_config)
 df = float(np.mean(np.diff(noise_f_grid)))
@@ -253,9 +275,15 @@ for Li, L_km in enumerate(LENGTHS_KM):
 
     for model_key, spec in specs.items():
         grid = _build_model_grid(model_key, spec, base_config, noise_f_grid, osa_csv_path)
-        psd = fwm_solver.compute_fwm_spectrum_conti(
-            fiber, grid, noise_f_grid, direction="forward"
-        )
+        if spec["continuous"]:
+            psd = fwm_solver.compute_fwm_spectrum_conti(
+                fiber, grid, noise_f_grid, direction="forward"
+            )
+        else:
+            q_chs = grid.get_quantum_channels()
+            f_q_hz = np.array([ch.f_center for ch in q_chs], dtype=np.float64)
+            fwm_channel_power = fwm_solver.compute_forward(fiber, grid)
+            psd = _build_discrete_fwm_psd(noise_f_grid, f_q_hz, fwm_channel_power)
         ALL_PSD[Li][model_key] = psd.astype(np.float64)
 
     elapsed = time.time() - t0
@@ -292,10 +320,10 @@ def _build_param_text() -> str:
     ch_lines = []
     for i in CLASSICAL_INDICES:
         f_hz = (
-            WDM_PARAMS["f_center"]
-            + (i - (WDM_PARAMS["N_ch"] - 1) / 2) * WDM_PARAMS["channel_spacing"]
+            WDM_PARAMS["start_freq"]
+            + i * WDM_PARAMS["channel_spacing"]
         )
-        ch_lines.append(f"Ch{i}: {f_hz / 1e12:.4f} THz")
+        ch_lines.append(f"{_display_channel_label(i)}: {f_hz / 1e12:.4f} THz")
     lines = [
         (
             f"Sim Parameters  |  L = controlled by slider  |  "

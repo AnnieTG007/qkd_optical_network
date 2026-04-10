@@ -43,9 +43,10 @@ from qkd_sim.physical.spectrum import SignalPSDResult
 # ============================================================================
 
 WDM_PARAMS = dict(
-    f_center=193.4e12,
-    N_ch=80,
-    channel_spacing=50e9,
+    start_freq=190.1e12,
+    start_channel=1,
+    end_channel=61,
+    channel_spacing=100e9,
     B_s=32e9,
     P0=1e-3,
     beta_rolloff=0.2,
@@ -63,9 +64,10 @@ OSA_CSV_PATH = _PROJECT_ROOT / "data" / "osa"
 def _build_signal_tx_annotation() -> dict:
     """构建信号 TX 仿真参数注释。"""
     n_classical = len(CLASSICAL_INDICES)
+    n_ch = int(WDM_PARAMS["end_channel"] - WDM_PARAMS["start_channel"] + 1)
     text = (
         f"Sim Parameters\n"
-        f"  N_ch = {WDM_PARAMS['N_ch']}\n"
+        f"  N_ch = {n_ch}\n"
         f"  N_classical = {n_classical}\n"
         f"  Spacing = {WDM_PARAMS['channel_spacing']/1e9:.0f} GHz\n"
         f"  B_s = {WDM_PARAMS['B_s']/1e9:.0f} GHz\n"
@@ -94,10 +96,11 @@ def _resolve_osa_csv() -> Path:
 
 
 def _build_frequency_grid(config: WDMConfig) -> np.ndarray:
-    half_span = (config.N_ch - 1) / 2 * config.channel_spacing
+    half_span = (config.end_channel - config.start_channel) / 2.0 * config.channel_spacing
+    center_freq = config.start_freq + half_span
     padding = FREQ_GRID_PADDING_FACTOR * config.channel_spacing
-    f_min = config.f_center - half_span - padding
-    f_max = config.f_center + half_span + padding
+    f_min = center_freq - half_span - padding
+    f_max = center_freq + half_span + padding
     n_points = int(np.ceil((f_max - f_min) / FREQ_GRID_RESOLUTION_HZ)) + 1
     return np.linspace(f_min, f_max, n_points)
 

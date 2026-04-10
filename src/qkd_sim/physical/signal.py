@@ -330,7 +330,7 @@ def build_wdm_grid(
       - 其余信道为 inactive（无功率，不参与噪声计算）
 
     频率网格公式 (formulas_signal.md 第5节):
-        f_channels = f_center + np.arange(-(N_ch-1)/2, (N_ch+1)/2) * g
+        f_channels = start_freq + (channel_number - start_channel) * spacing
 
     OSA_SAMPLED 谱型：
       - 从 osa_csv_path 加载模板后，将峰值平移对齐到每个经典信道的 f_center
@@ -355,7 +355,7 @@ def build_wdm_grid(
     -------
     WDMGrid
     """
-    all_indices_set = set(range(config.N_ch))
+    all_indices_set = set(range(int(config.end_channel - config.start_channel + 1)))
     quantum_set = set(config.quantum_channel_indices)
 
     if not quantum_set.issubset(all_indices_set):
@@ -373,8 +373,8 @@ def build_wdm_grid(
                 f"Classical and quantum channel sets overlap: {sorted(overlap)}"
             )
 
-    indices = np.arange(-(config.N_ch - 1) / 2, (config.N_ch + 1) / 2)
-    f_channels = config.f_center + indices * config.channel_spacing
+    indices = np.arange(config.start_channel, config.end_channel + 1, dtype=float)
+    f_channels = config.start_freq + (indices - config.start_channel) * config.channel_spacing
 
     # OSA 模板预处理（峰值对齐至各信道 f_center）
     osa_offsets = None
@@ -450,10 +450,11 @@ def build_frequency_grid(
     ndarray
         均匀频率网格 [Hz]
     """
-    half_span = (config.N_ch - 1) / 2 * config.channel_spacing
+    half_span = (config.end_channel - config.start_channel) / 2.0 * config.channel_spacing
+    center_freq = config.start_freq + half_span
     padding = padding_factor * config.channel_spacing
-    f_min = config.f_center - half_span - padding
-    f_max = config.f_center + half_span + padding
+    f_min = center_freq - half_span - padding
+    f_max = center_freq + half_span + padding
     n_points = int(np.ceil((f_max - f_min) / resolution)) + 1
     return np.linspace(f_min, f_max, n_points)
 

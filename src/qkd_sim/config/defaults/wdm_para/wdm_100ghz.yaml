@@ -1,0 +1,17 @@
+# WDM 100GHz 间隔系统默认参数（ITU-T G.694.1 C-band）
+# 频率公式: f(n) = start_freq + (n - start_channel) * channel_spacing
+#
+# ITU-T G.694.1 标准 C-band:
+#   C01 = 190.1 THz, C31 = 193.1 THz, C61 = 196.1 THz
+#
+# 扩展 C-band: 改 end_channel: 71（C71 = 197.1 THz）
+# 半信道: 改 start_channel: 1.5（C01.5 = 190.15 THz）
+
+start_freq: 1.901e+14          # 波段起始频率 [Hz]（190.1 THz = C01）
+start_channel: 1               # 起始信道号（C01）
+end_channel: 61                # 终止信道号（C61 = 196.1 THz）
+channel_spacing: 1.0e+11       # 信道间隔 [Hz]（100 GHz）
+B_s: 3.2e+10                  # 信号带宽/符号速率 [Hz]（32 GBaud）
+P0: 1.0e-3                    # 单信道发射功率 [W]（0 dBm）
+beta_rolloff: 0.0             # 升余弦滚降因子（0=矩形谱）
+quantum_channel_indices: []     # 量子信道索引（空=全部为经典）

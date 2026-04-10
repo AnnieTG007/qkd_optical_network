@@ -432,7 +432,7 @@ _MODEL_COLORS = {
     "discrete": "#202020",
     "rc_beta0": "#1f77b4",
     "rc_beta001": "#aec7e8",
-    "rc_beta01": "#d95f02",
+    "rc_beta1": "#d95f02",
     "rc_beta05": "#ff7f0e",
     "osa": "#2ca02c",
 }
@@ -550,8 +550,10 @@ def make_signal_psd_comparison_figure(
                 df = float(np.mean(np.diff(result.f_hz)))
                 power_per_bin = result.psd_W_per_Hz * df
                 y = _to_display(power_per_bin, unit)
+                # 只绘制非零功率点（过滤频率两端的零功率尾巴）
+                mask = power_per_bin > 0
                 ax.plot(
-                    f_THz, y,
+                    f_THz[mask], y[mask],
                     color=result.color, linewidth=2.0, label=result.label,
                 )
         ax.set_xlabel("Frequency [THz]")
@@ -563,30 +565,45 @@ def make_signal_psd_comparison_figure(
 
     axes[1].set_title("Signal Launch Power per Bin (Log Scale)")
 
-    # ---- xlim: 显示全 C 波段（80 信道），以便看到 RC/OS rolloff 形状差异 ----
-    # x 轴范围从网格最小频率到最大频率
-    f_plot_min = min(r.f_hz.min() for r in results)
-    f_plot_max = max(r.f_hz.max() for r in results)
-    for ax in axes:
-        ax.set_xlim(f_plot_min / 1e12, f_plot_max / 1e12)
+    # ---- xlim: 动态范围 = 有功率的频率区间（两侧加 0.5 THz padding）----
+    all_f_THz_nonzero: list[np.ndarray] = []
+    for result in results:
+        f_THz = result.f_hz / 1e12
+        if result.key == "discrete":
+            mask = result.psd_W_per_Hz > 0
+        else:
+            df = float(np.mean(np.diff(result.f_hz)))
+            power_per_bin = result.psd_W_per_Hz * df
+            mask = power_per_bin > 0
+        all_f_THz_nonzero.append(f_THz[mask])
 
-    # ---- log 图 ylim：从全部数据的动态范围计算 ----
-    # 收集所有连续模型在全部频率网格上的功率值
-    all_power_W = []
+    if all_f_THz_nonzero:
+        all_f = np.concatenate(all_f_THz_nonzero)
+        f_plot_min = float(all_f.min())
+        f_plot_max = float(all_f.max())
+        pad = 0.1  # THz
+        for ax in axes:
+            ax.set_xlim(f_plot_min - pad, f_plot_max + pad)
+
+    # ---- log 图 ylim：用各模型主瓣峰值建立合理动态范围 ----
+    # y_bot = min(p_max across all models) —— 用各模型主瓣峰值中最小者作下界，
+    #     避免被 OSA 超低 sidelobe（~1e-12 W）拉至 1e-14 W，
+    #     导致 RC 主瓣（~3e-6 W）在 11 个量级 y 轴上被压缩为几条像素
+    # y_top = max(p_max across all models) × 10 —— 上界统一放宽 10 倍
+    model_pmax: list[float] = []
     for result in results:
         if result.key == "discrete":
-            continue
-        df = float(np.mean(np.diff(result.f_hz)))
-        power_per_bin = result.psd_W_per_Hz * df  # [W]
-        all_power_W.append(power_per_bin[power_per_bin > 0])
+            power_per_bin = result.psd_W_per_Hz
+        else:
+            df = float(np.mean(np.diff(result.f_hz)))
+            power_per_bin = result.psd_W_per_Hz * df
+        nonzero = power_per_bin[power_per_bin > 0]
+        if nonzero.size > 0:
+            model_pmax.append(float(nonzero.max()))
 
-    if all_power_W:
-        all_W = np.concatenate(all_power_W)
-        p_min = float(all_W.min())
-        p_max = float(all_W.max())
-        # headroom: -30 dB below min, +10 dB above max
-        y_bot_W = p_min / 1000   # -30 dB
-        y_top_W = p_max * 10     # +10 dB
+    if model_pmax:
+        y_bot_W = min(model_pmax) / 10    # min(p_max) / 10
+        y_top_W = max(model_pmax) * 10   # max(p_max) × 10
         axes[1].set_ylim(y_bot_W, y_top_W)
         axes[1].set_yscale("log")
         axes[1].axhline(y=y_bot_W, color="#cccccc", linewidth=0.5, linestyle="--", alpha=0.5)
@@ -675,9 +692,9 @@ def make_model_comparison_figure(
         )
 
     for ax, title in [
-        (ax_fwm, "FWM Noise PSD Spectrum"),
-        (ax_sprs, "SpRS Noise PSD Spectrum"),
-        (ax_total, "Total Noise PSD Spectrum"),
+        (ax_fwm, "FWM FWM_Noise PSD Spectrum"),
+        (ax_sprs, "SpRS FWM_Noise PSD Spectrum"),
+        (ax_total, "Total FWM_Noise PSD Spectrum"),
     ]:
         ax.set_title(title)
         ax.set_xlabel("Frequency [THz]")
@@ -743,9 +760,9 @@ def make_noise_vs_length_figure(
     """
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), sharex=True)
     panels = [
-        ("FWM Noise", "fwm_W"),
-        ("SpRS Noise", "sprs_W"),
-        ("Total Noise", "total_W"),
+        ("FWM FWM_Noise", "fwm_W"),
+        ("SpRS FWM_Noise", "sprs_W"),
+        ("Total FWM_Noise", "total_W"),
     ]
 
     floor = np.finfo(np.float64).tiny
@@ -760,7 +777,7 @@ def make_noise_vs_length_figure(
             )
         ax.set_title(title)
         ax.set_xlabel("Fiber Length [km]")
-        ax.set_ylabel("Noise Power [W]")
+        ax.set_ylabel("FWM_Noise Power [W]")
         ax.set_yscale("log")
         ax.grid(True, alpha=0.3, which="both")
 

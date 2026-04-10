@@ -76,14 +76,19 @@ class FiberConfig:
 class WDMConfig:
     """WDM 系统参数配置。所有字段直接使用 SI 单位。
 
+    频率公式: f(n) = start_freq + (n - start_channel) * channel_spacing
+    ITU-T G.694.1 标准 C-band: start_freq=190.1e12, start_channel=1, end_channel=61
+
     Attributes
     ----------
-    f_center : float
-        WDM 网格中心频率 [Hz]，如 193.5e12 (C波段)
-    N_ch : int
-        信道总数
+    start_freq : float
+        波段起始频率 [Hz]，如 190.1e12 (C01 = 190.1 THz)
     channel_spacing : float
-        信道间隔 [Hz]，如 50e9
+        信道间隔 [Hz]，如 100e9
+    start_channel : float
+        起始信道号（支持半信道，如 1.5）
+    end_channel : float
+        终止信道号
     B_s : float
         信号带宽 / 符号速率 [Hz]
     P0 : float
@@ -94,9 +99,10 @@ class WDMConfig:
         量子信道在信道数组中的索引列表（0-based）
     """
 
-    f_center: float
-    N_ch: int
+    start_freq: float
     channel_spacing: float
+    start_channel: float
+    end_channel: float
     B_s: float
     P0: float
     beta_rolloff: float = 0.0
