@@ -328,7 +328,7 @@ def update_graph(q_idx: int, store_data: dict) -> go.Figure:
     for col in [1, 2]:
         fig.update_xaxes(
             title_text="Fiber Length [km]",
-            type="log",
+            type="linear",
             row=1,
             col=col,
         )
