@@ -220,7 +220,6 @@ def _display_channel_label(channel_index: int) -> str:
 def adaptive_log_ticks(
     y_bot_log: float, y_top_log: float, max_ticks: int = 8
 ) -> dict:
-    """自适应对数轴刻度: Plotly 自动管理密度, tickformat 保证干净标签."""
     return dict(
         tickmode="auto",
         nticks=max_ticks,
@@ -232,9 +231,355 @@ def adaptive_log_ticks(
 def adaptive_linear_ticks(
     y_bot: float, y_top: float, max_ticks: int = 8
 ) -> dict:
-    """自适应线性轴刻度: Plotly 自动管理密度, 保留两位小数."""
     return dict(
         tickmode="auto",
         nticks=max_ticks,
         tickformat=".2f",
     )
+
+
+def _build_all_classical_grid(
+    spec: dict,
+    base_config: WDMConfig,
+    f_grid: np.ndarray,
+    osa_csv_path: Path,
+):
+    from qkd_sim.physical.signal import SpectrumType
+
+    model_config = WDMConfig(
+        start_freq=base_config.start_freq,
+        start_channel=base_config.start_channel,
+        end_channel=base_config.end_channel,
+        channel_spacing=base_config.channel_spacing,
+        B_s=base_config.B_s,
+        P0=base_config.P0,
+        beta_rolloff=base_config.beta_rolloff if spec["beta_rolloff"] is None else spec["beta_rolloff"],
+        quantum_channel_indices=[],
+    )
+    all_indices = list(range(int(base_config.end_channel - base_config.start_channel + 1)))
+    if spec["spectrum_type"] == SpectrumType.OSA_SAMPLED:
+        return build_wdm_grid(
+            config=model_config,
+            spectrum_type=spec["spectrum_type"],
+            f_grid=f_grid,
+            osa_csv_path=osa_csv_path,
+            osa_rbw=OSA_RBW_HZ,
+            classical_channel_indices=all_indices,
+        )
+    return build_wdm_grid(
+        config=model_config,
+        spectrum_type=spec["spectrum_type"],
+        f_grid=f_grid,
+        classical_channel_indices=all_indices,
+    )
+
+
+def _make_fiber(fiber_params: dict, length_km: float):
+    from qkd_sim.config.schema import FiberConfig
+    from qkd_sim.physical.fiber import Fiber
+
+    params = dict(fiber_params)
+    params["L_km"] = float(length_km)
+    return Fiber(FiberConfig(**params))
+
+
+def _integrate_signal_per_channel(grid, f_grid: np.ndarray | None) -> np.ndarray:
+    powers = np.zeros(len(grid.channels), dtype=np.float64)
+    if f_grid is None or len(f_grid) < 2:
+        for idx, ch in enumerate(grid.channels):
+            if ch.channel_type == "classical":
+                powers[idx] = float(ch.power)
+        return powers
+
+    df = float(np.mean(np.diff(f_grid)))
+    for idx, ch in enumerate(grid.channels):
+        if ch.channel_type == "classical":
+            powers[idx] = float(np.sum(ch.get_psd(f_grid)) * df)
+    return powers
+
+
+def _compute_noise_pair(
+    noise_type: str,
+    fiber,
+    grid,
+    continuous: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    from qkd_sim.physical.noise import DiscreteFWMSolver, DiscreteSPRSSolver
+
+    fwd = np.zeros(len(grid.get_quantum_channels()), dtype=np.float64)
+    bwd = np.zeros(len(grid.get_quantum_channels()), dtype=np.float64)
+
+    if noise_type in ("fwm", "both"):
+        solver = DiscreteFWMSolver()
+        if continuous:
+            fwd += np.asarray(solver.compute_forward_conti(fiber, grid, grid.f_grid), dtype=np.float64)
+            bwd += np.asarray(solver.compute_backward_conti(fiber, grid, grid.f_grid), dtype=np.float64)
+        else:
+            fwd += np.asarray(solver.compute_forward(fiber, grid), dtype=np.float64)
+            bwd += np.asarray(solver.compute_backward(fiber, grid), dtype=np.float64)
+
+    if noise_type in ("sprs", "both"):
+        solver = DiscreteSPRSSolver()
+        if continuous:
+            fwd += np.asarray(solver.compute_forward_conti(fiber, grid, grid.f_grid), dtype=np.float64)
+            bwd += np.asarray(solver.compute_backward_conti(fiber, grid, grid.f_grid), dtype=np.float64)
+        else:
+            fwd += np.asarray(solver.compute_forward(fiber, grid), dtype=np.float64)
+            bwd += np.asarray(solver.compute_backward(fiber, grid), dtype=np.float64)
+
+    return fwd, bwd
+
+
+def _compute_nli_pair(fiber, grid) -> tuple[np.ndarray, np.ndarray]:
+    try:
+        from qkd_sim.physical.noise import GNModelSolver
+        gn_solver = GNModelSolver()
+    except ImportError:
+        n_ch = len(grid.channels)
+        return np.zeros(n_ch, dtype=np.float64), np.zeros(n_ch, dtype=np.float64)
+
+    result = gn_solver.compute_nli_per_channel(fiber, grid, grid.f_grid)
+    return (
+        np.asarray(result["nli_fwd"], dtype=np.float64),
+        np.asarray(result["nli_bwd"], dtype=np.float64),
+    )
+
+
+def precompute_by_length(
+    noise_type: str,
+    specs: dict,
+    LENGTHS_KM: np.ndarray,
+    base_config: WDMConfig,
+    noise_f_grid: np.ndarray,
+    osa_csv_path: Path,
+    fiber_params: dict,
+) -> tuple[dict, list]:
+    """Precompute noise vs fiber length for all quantum channels.
+
+    Returns (ALL_BY_LEN, VALID_Q_INDICES)
+    ALL_BY_LEN[q_idx][model_key] = {"fwd": np.array(N_L), "bwd": np.array(N_L)}
+    VALID_Q_INDICES: list of q_idx that have non-zero noise for at least one model
+    """
+    model_keys = get_noise_model_keys(noise_type)
+    quantum_indices = list(base_config.quantum_channel_indices)
+    n_q = len(quantum_indices)
+    n_l = len(LENGTHS_KM)
+    n_ch = int(base_config.end_channel - base_config.start_channel + 1)
+
+    if noise_type in ("only_signal", "with_signal"):
+        all_by_len = {
+            ch_idx: {mk: {"fwd": np.zeros(n_l), "bwd": np.zeros(n_l)} for mk in model_keys}
+            for ch_idx in range(n_ch)
+        }
+        for model_key in model_keys:
+            spec = specs[model_key]
+            grid_all = _build_all_classical_grid(spec, base_config, noise_f_grid, osa_csv_path)
+            signal = _integrate_signal_per_channel(grid_all, grid_all.f_grid)
+            classical_mask = np.array([ch.channel_type == "classical" for ch in grid_all.channels], dtype=bool)
+
+            per_q_grids = {}
+            if noise_type == "with_signal":
+                for q_idx in quantum_indices:
+                    per_q_grids[q_idx] = _build_model_grid(
+                        model_key,
+                        spec,
+                        _build_wdm_config([q_idx]),
+                        noise_f_grid,
+                        osa_csv_path,
+                    )
+
+            for li, length_km in enumerate(LENGTHS_KM):
+                fiber = _make_fiber(fiber_params, length_km)
+                fwd = np.zeros(n_ch, dtype=np.float64)
+                bwd = np.zeros(n_ch, dtype=np.float64)
+
+                nli_fwd, nli_bwd = _compute_nli_pair(fiber, grid_all)
+                fwd[classical_mask] = nli_fwd + signal[classical_mask]
+                bwd[classical_mask] = nli_bwd + signal[classical_mask]
+
+                if noise_type == "with_signal":
+                    for q_idx in quantum_indices:
+                        q_fwd, q_bwd = _compute_noise_pair(
+                            "both",
+                            fiber,
+                            per_q_grids[q_idx],
+                            continuous=bool(spec["continuous"]),
+                        )
+                        if len(q_fwd) > 0:
+                            fwd[q_idx] = float(q_fwd[0])
+                            bwd[q_idx] = float(q_bwd[0])
+
+                for ch_idx in range(n_ch):
+                    all_by_len[ch_idx][model_key]["fwd"][li] = float(fwd[ch_idx])
+                    all_by_len[ch_idx][model_key]["bwd"][li] = float(bwd[ch_idx])
+
+        valid_indices = [
+            ch_idx
+            for ch_idx in range(n_ch)
+            if any(
+                np.any(all_by_len[ch_idx][mk]["fwd"] > 0)
+                or np.any(all_by_len[ch_idx][mk]["bwd"] > 0)
+                for mk in model_keys
+            )
+        ]
+        return all_by_len, valid_indices
+
+    all_by_len = {
+        q_local_idx: {mk: {"fwd": np.zeros(n_l), "bwd": np.zeros(n_l)} for mk in model_keys}
+        for q_local_idx in range(n_q)
+    }
+    for q_local_idx, q_idx in enumerate(quantum_indices):
+        single_q_config = _build_wdm_config([q_idx])
+        for model_key in model_keys:
+            spec = specs[model_key]
+            grid = _build_model_grid(
+                model_key,
+                spec,
+                single_q_config,
+                noise_f_grid,
+                osa_csv_path,
+            )
+            for li, length_km in enumerate(LENGTHS_KM):
+                fiber = _make_fiber(fiber_params, length_km)
+                fwd, bwd = _compute_noise_pair(
+                    noise_type,
+                    fiber,
+                    grid,
+                    continuous=bool(spec["continuous"]),
+                )
+                if len(fwd) > 0:
+                    all_by_len[q_local_idx][model_key]["fwd"][li] = float(fwd[0])
+                    all_by_len[q_local_idx][model_key]["bwd"][li] = float(bwd[0])
+
+    valid_q_indices = [
+        q_local_idx
+        for q_local_idx in range(n_q)
+        if any(
+            np.any(all_by_len[q_local_idx][mk]["fwd"] > 0)
+            or np.any(all_by_len[q_local_idx][mk]["bwd"] > 0)
+            for mk in model_keys
+        )
+    ]
+    return all_by_len, valid_q_indices
+
+
+def precompute_by_channel(
+    noise_type: str,
+    specs: dict,
+    LENGTHS_KM: np.ndarray,
+    base_config: WDMConfig,
+    noise_f_grid: np.ndarray,
+    osa_csv_path: Path,
+    fiber_params: dict,
+) -> tuple[dict, list]:
+    """Precompute noise vs quantum channel frequency for all lengths.
+
+    Returns (ALL_BY_CH, VALID_L_INDICES)
+    ALL_BY_CH[L_idx][model_key] = {"fwd": np.array(N_q), "bwd": np.array(N_q)}
+    VALID_L_INDICES: list of L indices with non-zero noise
+    """
+    model_keys = get_noise_model_keys(noise_type)
+    quantum_indices = list(base_config.quantum_channel_indices)
+    n_q = len(quantum_indices)
+    n_l = len(LENGTHS_KM)
+    n_ch = int(base_config.end_channel - base_config.start_channel + 1)
+
+    if noise_type in ("only_signal", "with_signal"):
+        all_by_ch = {
+            li: {mk: {"fwd": np.zeros(n_ch), "bwd": np.zeros(n_ch)} for mk in model_keys}
+            for li in range(n_l)
+        }
+        for li, length_km in enumerate(LENGTHS_KM):
+            fiber = _make_fiber(fiber_params, length_km)
+            for model_key in model_keys:
+                spec = specs[model_key]
+                grid_all = _build_all_classical_grid(spec, base_config, noise_f_grid, osa_csv_path)
+                signal = _integrate_signal_per_channel(grid_all, grid_all.f_grid)
+                classical_mask = np.array([ch.channel_type == "classical" for ch in grid_all.channels], dtype=bool)
+
+                fwd = np.zeros(n_ch, dtype=np.float64)
+                bwd = np.zeros(n_ch, dtype=np.float64)
+                nli_fwd, nli_bwd = _compute_nli_pair(fiber, grid_all)
+                fwd[classical_mask] = nli_fwd + signal[classical_mask]
+                bwd[classical_mask] = nli_bwd + signal[classical_mask]
+
+                if noise_type == "with_signal":
+                    for q_idx in quantum_indices:
+                        grid = _build_model_grid(
+                            model_key,
+                            spec,
+                            _build_wdm_config([q_idx]),
+                            noise_f_grid,
+                            osa_csv_path,
+                        )
+                        q_fwd, q_bwd = _compute_noise_pair(
+                            "both",
+                            fiber,
+                            grid,
+                            continuous=bool(spec["continuous"]),
+                        )
+                        if len(q_fwd) > 0:
+                            fwd[q_idx] = float(q_fwd[0])
+                            bwd[q_idx] = float(q_bwd[0])
+
+                all_by_ch[li][model_key]["fwd"] = np.asarray(fwd, dtype=np.float64)
+                all_by_ch[li][model_key]["bwd"] = np.asarray(bwd, dtype=np.float64)
+
+        valid_l_indices = [
+            li
+            for li in range(n_l)
+            if any(
+                np.any(all_by_ch[li][mk]["fwd"] > 0)
+                or np.any(all_by_ch[li][mk]["bwd"] > 0)
+                for mk in model_keys
+            )
+        ]
+        return all_by_ch, valid_l_indices
+
+    all_by_ch = {
+        li: {mk: {"fwd": np.zeros(n_q), "bwd": np.zeros(n_q)} for mk in model_keys}
+        for li in range(n_l)
+    }
+    for li, length_km in enumerate(LENGTHS_KM):
+        fiber = _make_fiber(fiber_params, length_km)
+        for model_key in model_keys:
+            spec = specs[model_key]
+            for q_local_idx, q_idx in enumerate(quantum_indices):
+                grid = _build_model_grid(
+                    model_key,
+                    spec,
+                    _build_wdm_config([q_idx]),
+                    noise_f_grid,
+                    osa_csv_path,
+                )
+                fwd, bwd = _compute_noise_pair(
+                    noise_type,
+                    fiber,
+                    grid,
+                    continuous=bool(spec["continuous"]),
+                )
+                if len(fwd) > 0:
+                    all_by_ch[li][model_key]["fwd"][q_local_idx] = float(fwd[0])
+                    all_by_ch[li][model_key]["bwd"][q_local_idx] = float(bwd[0])
+
+    valid_l_indices = [
+        li
+        for li in range(n_l)
+        if any(
+            np.any(all_by_ch[li][mk]["fwd"] > 0)
+            or np.any(all_by_ch[li][mk]["bwd"] > 0)
+            for mk in model_keys
+        )
+    ]
+    return all_by_ch, valid_l_indices
+
+
+def get_noise_model_keys(noise_type: str) -> list[str]:
+    """Return model keys for the given noise_type."""
+    _ = noise_type
+    try:
+        from qkd_sim.config.plot_config import load_model_specs
+
+        return list(load_model_specs("fwm_noise").keys())
+    except Exception:
+        return ["discrete", "osa"]
