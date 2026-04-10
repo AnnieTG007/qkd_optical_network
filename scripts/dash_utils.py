@@ -75,6 +75,28 @@ _LEGEND_SYNC_JS = """
         }
     }
 
+    function isGroupIsolated(el, targetGroup) {
+        var groups = getLegendGroups(el);
+        if (groups.length <= 1) { return false; }
+
+        var visibleGroups = {};
+        var data = el.data || [];
+        for (var i = 0; i < data.length; i++) {
+            var grp = data[i].legendgroup;
+            if (!grp || data[i].visible === 'legendonly') { continue; }
+            visibleGroups[grp] = true;
+        }
+
+        var visibleCount = 0;
+        for (var j = 0; j < groups.length; j++) {
+            if (visibleGroups[groups[j]]) {
+                visibleCount += 1;
+            }
+        }
+
+        return visibleCount === 1 && !!visibleGroups[targetGroup];
+    }
+
     function attachLegendSync() {
         var el = document.querySelector('.js-plotly-plot');
         if (!el) { setTimeout(attachLegendSync, 500); return; }
@@ -100,7 +122,6 @@ _LEGEND_SYNC_JS = """
                     data[j].visible = nv;
                 }
             }
-            delete el.dataset.isolatedLegendGroup;
             Plotly.redraw(el);
             return false;
         });
@@ -112,12 +133,10 @@ _LEGEND_SYNC_JS = """
             var groups = getLegendGroups(el);
             if (groups.length <= 1) { return false; }
 
-            if (el.dataset.isolatedLegendGroup === grp) {
+            if (isGroupIsolated(el, grp)) {
                 setAllGroupsVisible(el);
-                delete el.dataset.isolatedLegendGroup;
             } else {
                 isolateGroup(el, grp);
-                el.dataset.isolatedLegendGroup = grp;
             }
 
             Plotly.redraw(el);
