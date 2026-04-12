@@ -298,34 +298,94 @@ def _integrate_signal_per_channel(grid, f_grid: np.ndarray | None) -> np.ndarray
     return powers
 
 
+def _integrate_noise_psd_per_channel(
+    psd_fwd: np.ndarray,
+    psd_bwd: np.ndarray,
+    grid,
+    f_grid: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """积分连续 PSD 到各量子信道带宽。
+
+    compute_forward_conti 返回完整 PSD (N_f,)，需积分到每个量子信道带宽
+    得到各量子信道的积分噪声功率 (N_q,)。
+
+    Parameters
+    ----------
+    psd_fwd, psd_bwd : ndarray (N_f,)
+        前向/后向噪声 PSD
+    grid : WDMGrid
+    f_grid : ndarray (N_f,)
+
+    Returns
+    -------
+    (N_q,) 前向/后向积分噪声功率
+    """
+    quantum_chs = grid.get_quantum_channels()
+    n_q = len(quantum_chs)
+    df = float(np.mean(np.diff(f_grid)))
+    fwd_integrated = np.zeros(n_q, dtype=np.float64)
+    bwd_integrated = np.zeros(n_q, dtype=np.float64)
+
+    for i, ch in enumerate(quantum_chs):
+        f_lo = ch.f_center - ch.B_s / 2.0
+        f_hi = ch.f_center + ch.B_s / 2.0
+        mask = (f_grid >= f_lo) & (f_grid < f_hi)
+        fwd_integrated[i] = float(np.sum(psd_fwd[mask]) * df)
+        bwd_integrated[i] = float(np.sum(psd_bwd[mask]) * df)
+
+    return fwd_integrated, bwd_integrated
+
+
 def _compute_noise_pair(
     noise_type: str,
     fiber,
     grid,
     continuous: bool,
+    integrate: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """计算 FWM/SpRS 噪声。
+
+    Args:
+        noise_type: "fwm" | "sprs" | "both"
+        fiber: Fiber instance
+        grid: WDMGrid
+        continuous: 是否为连续模型
+        integrate: 若为 True，对连续 PSD 积分到各量子信道（用于信道扫描，
+                  x 轴为信道频率）；若为 False，返回完整 PSD 数组（用于长度扫描，
+                  x 轴为光纤长度）
+    """
     from qkd_sim.physical.noise import DiscreteFWMSolver, DiscreteSPRSSolver
 
-    fwd = np.zeros(len(grid.get_quantum_channels()), dtype=np.float64)
-    bwd = np.zeros(len(grid.get_quantum_channels()), dtype=np.float64)
+    n_q = len(grid.get_quantum_channels())
+    fwd = np.zeros(n_q, dtype=np.float64)
+    bwd = np.zeros(n_q, dtype=np.float64)
+    _f_grid = grid.f_grid
+
+    def _call_solver(solver):
+        if continuous:
+            psd_f = np.asarray(solver.compute_forward_conti(fiber, grid, _f_grid), dtype=np.float64)
+            psd_b = np.asarray(solver.compute_backward_conti(fiber, grid, _f_grid), dtype=np.float64)
+            if integrate:
+                return _integrate_noise_psd_per_channel(psd_f, psd_b, grid, _f_grid)
+            # 长度扫描：返回 (N_f,) PSD 数组，调用方取 fwd[0]
+            return psd_f, psd_b
+        # 离散模型：返回 (N_q,) 积分功率
+        return (
+            np.asarray(solver.compute_forward(fiber, grid), dtype=np.float64),
+            np.asarray(solver.compute_backward(fiber, grid), dtype=np.float64),
+        )
 
     if noise_type in ("fwm", "both"):
         solver = DiscreteFWMSolver()
-        if continuous:
-            fwd += np.asarray(solver.compute_forward_conti(fiber, grid, grid.f_grid), dtype=np.float64)
-            bwd += np.asarray(solver.compute_backward_conti(fiber, grid, grid.f_grid), dtype=np.float64)
-        else:
-            fwd += np.asarray(solver.compute_forward(fiber, grid), dtype=np.float64)
-            bwd += np.asarray(solver.compute_backward(fiber, grid), dtype=np.float64)
+        f_i, b_i = _call_solver(solver)
+        fwd += f_i
+        bwd += b_i
 
     if noise_type in ("sprs", "both"):
         solver = DiscreteSPRSSolver()
-        if continuous:
-            fwd += np.asarray(solver.compute_forward_conti(fiber, grid, grid.f_grid), dtype=np.float64)
-            bwd += np.asarray(solver.compute_backward_conti(fiber, grid, grid.f_grid), dtype=np.float64)
-        else:
-            fwd += np.asarray(solver.compute_forward(fiber, grid), dtype=np.float64)
-            bwd += np.asarray(solver.compute_backward(fiber, grid), dtype=np.float64)
+        f_i, b_i = _call_solver(solver)
+        fwd += f_i
+        bwd += b_i
 
     return fwd, bwd
 
@@ -557,10 +617,11 @@ def precompute_by_channel(
                     fiber,
                     grid,
                     continuous=bool(spec["continuous"]),
+                    integrate=True,  # 连续模型：积分 PSD 到各量子信道带宽
                 )
                 if len(fwd) > 0:
-                    all_by_ch[li][model_key]["fwd"][q_local_idx] = float(fwd[0])
-                    all_by_ch[li][model_key]["bwd"][q_local_idx] = float(bwd[0])
+                    all_by_ch[li][model_key]["fwd"][q_local_idx] = float(fwd[q_local_idx])
+                    all_by_ch[li][model_key]["bwd"][q_local_idx] = float(bwd[q_local_idx])
 
     valid_l_indices = [
         li
