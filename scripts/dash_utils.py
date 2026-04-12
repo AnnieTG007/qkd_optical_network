@@ -617,11 +617,10 @@ def precompute_by_channel(
                     fiber,
                     grid,
                     continuous=bool(spec["continuous"]),
-                    integrate=True,  # 连续模型：积分 PSD 到各量子信道带宽
                 )
                 if len(fwd) > 0:
-                    all_by_ch[li][model_key]["fwd"][q_local_idx] = float(fwd[q_local_idx])
-                    all_by_ch[li][model_key]["bwd"][q_local_idx] = float(bwd[q_local_idx])
+                    all_by_ch[li][model_key]["fwd"][q_local_idx] = float(fwd[0])
+                    all_by_ch[li][model_key]["bwd"][q_local_idx] = float(bwd[0])
 
     valid_l_indices = [
         li
