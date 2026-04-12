@@ -36,6 +36,7 @@ from scripts.dash_utils import (
     adaptive_log_ticks,
     get_noise_model_keys,
     precompute_by_length,
+    base_quantum_indices,  # 全局量子信道索引映射
 )
 
 
@@ -103,12 +104,12 @@ app.index_string = app.index_string.replace("</body>", "<script>" + _LEGEND_SYNC
 
 step = max(1, len(VALID_INDICES) // 10)
 slider_marks = {
-    i: {"label": _display_channel_label(VALID_INDICES[i]), "style": {"font-size": "9px"}}
+    i: {"label": _display_channel_label(base_quantum_indices[VALID_INDICES[i]]), "style": {"font-size": "9px"}}
     for i in range(0, len(VALID_INDICES), step)
 }
 if (len(VALID_INDICES) - 1) not in slider_marks:
     last = len(VALID_INDICES) - 1
-    slider_marks[last] = {"label": _display_channel_label(VALID_INDICES[last]), "style": {"font-size": "9px"}}
+    slider_marks[last] = {"label": _display_channel_label(base_quantum_indices[VALID_INDICES[last]]), "style": {"font-size": "9px"}}
 
 app.layout = html.Div(
     [
@@ -139,7 +140,8 @@ app.layout = html.Div(
     Input("channel-slider", "value"),
 )
 def update_display(selection_idx: int) -> str:
-    ch_idx = VALID_INDICES[selection_idx]
+    q_local = VALID_INDICES[selection_idx]
+    ch_idx = base_quantum_indices[q_local]  # 全局信道索引用于显示
     freq_hz = WDM_PARAMS["start_freq"] + ch_idx * WDM_PARAMS["channel_spacing"]
     wl_nm = 299792458.0 / freq_hz * 1e9
     return f"Selected: {_display_channel_label(ch_idx)} | f = {freq_hz / 1e12:.4f} THz | lambda ~ {wl_nm:.2f} nm"
