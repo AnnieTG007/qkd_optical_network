@@ -37,6 +37,7 @@ class FiberConfig:
         A_eff           : float  有效模场面积 [m²]
         rayleigh_coeff  : float  瑞利散射系数 S·α_R [1/m³]
         T_kelvin        : float  温度 [K]
+        length_km_samples : list[float] | None  可选：Dash app 长度采样点
 
     SI 输出字段 (由 __post_init__ 计算):
         alpha    : float  衰减 [1/m]
@@ -55,6 +56,7 @@ class FiberConfig:
     A_eff: float              # m² (直接 SI)
     rayleigh_coeff: float     # 1/m³ (直接 SI)
     T_kelvin: float = 300.0   # K
+    length_km_samples: list[float] | None = None  # 可选：Dash app 长度采样点
 
     # --- SI 输出字段 (由 __post_init__ 计算) ---
     alpha: float = field(init=False, repr=False)
@@ -70,6 +72,12 @@ class FiberConfig:
         self.D_c = D_ps_nm_km_to_s_m2(self.D_ps_nm_km)
         self.D_slope = D_slope_ps_nm2_km_to_s_m3(self.D_slope_ps_nm2_km)
         self.L = L_km_to_m(self.L_km)
+        if self.length_km_samples is None:
+            object.__setattr__(
+                self,
+                'length_km_samples',
+                [1, 2, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 120, 140, 160, 180, 200],
+            )
 
 
 @dataclass
@@ -78,6 +86,10 @@ class WDMConfig:
 
     频率公式: f(n) = start_freq + (n - start_channel) * channel_spacing
     ITU-T G.694.1 标准 C-band: start_freq=190.1e12, start_channel=1, end_channel=61
+
+    支持灵活信道间隔：在 YAML 中指定 num_channels，start_freq 和 end_freq 保持不变。
+    示例: start_freq=190.1e12, channel_spacing=200e9, num_channels=31
+          → 信道: C01(190.1), C02(190.3), ..., C31(196.1) THz
 
     Attributes
     ----------
@@ -88,7 +100,10 @@ class WDMConfig:
     start_channel : float
         起始信道号（支持半信道，如 1.5）
     end_channel : float
-        终止信道号
+        终止信道号（当 num_channels 指定时自动计算）
+    num_channels : int | None
+        信道总数。指定时 end_channel 由 start_channel + num_channels - 1 计算，
+        使得修改 channel_spacing 时可以保持 start_freq 和 end_freq 不变。
     B_s : float
         信号带宽 / 符号速率 [Hz]
     P0 : float
@@ -107,6 +122,13 @@ class WDMConfig:
     P0: float
     beta_rolloff: float = 0.0
     quantum_channel_indices: list[int] = field(default_factory=list)
+    num_channels: int | None = None  # 可选：信道总数
+
+    def __post_init__(self) -> None:
+        if self.num_channels is not None:
+            object.__setattr__(
+                self, 'end_channel', self.start_channel + self.num_channels - 1
+            )
 
 
 @dataclass

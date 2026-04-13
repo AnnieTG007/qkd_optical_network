@@ -355,7 +355,7 @@ def build_wdm_grid(
     -------
     WDMGrid
     """
-    all_indices_set = set(range(int(config.end_channel - config.start_channel + 1)))
+    all_indices_set = set(range(int(config.num_channels)))
     quantum_set = set(config.quantum_channel_indices)
 
     if not quantum_set.issubset(all_indices_set):
@@ -373,7 +373,7 @@ def build_wdm_grid(
                 f"Classical and quantum channel sets overlap: {sorted(overlap)}"
             )
 
-    indices = np.arange(config.start_channel, config.end_channel + 1, dtype=float)
+    indices = np.arange(config.start_channel, config.start_channel + config.num_channels, dtype=float)
     f_channels = config.start_freq + (indices - config.start_channel) * config.channel_spacing
 
     # OSA 模板预处理（峰值对齐至各信道 f_center）
@@ -450,7 +450,7 @@ def build_frequency_grid(
     ndarray
         均匀频率网格 [Hz]
     """
-    half_span = (config.end_channel - config.start_channel) / 2.0 * config.channel_spacing
+    half_span = (config.num_channels - 1) / 2.0 * config.channel_spacing
     center_freq = config.start_freq + half_span
     padding = padding_factor * config.channel_spacing
     f_min = center_freq - half_span - padding

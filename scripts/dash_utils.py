@@ -14,11 +14,15 @@ _PROJECT_ROOT = _SCRIPT_DIR.parent
 # WDM 参数从 YAML 加载，保持唯一真值
 _CONFIG_DIR = _PROJECT_ROOT / "src" / "qkd_sim" / "config"
 _YAML_WDM_PATH = _CONFIG_DIR / "defaults" / "wdm_para" / "wdm_100ghz.yaml"
+_YAML_FIBER_PATH = _CONFIG_DIR / "defaults" / "fiber_para" / "fiber_smf.yaml"
 
 
 def _load_wdm_params() -> dict:
     from qkd_sim.config.schema import load_wdm_config
     cfg = load_wdm_config(_YAML_WDM_PATH)
+    num_ch = cfg.num_channels
+    if num_ch is None:
+        num_ch = int(cfg.end_channel - cfg.start_channel + 1)
     return dict(
         start_freq=cfg.start_freq,
         start_channel=cfg.start_channel,
@@ -27,6 +31,7 @@ def _load_wdm_params() -> dict:
         B_s=cfg.B_s,
         P0=cfg.P0,
         beta_rolloff=cfg.beta_rolloff,
+        num_channels=num_ch,
         # quantum_channel_indices 由 _build_wdm_config 单独传入，不加入此 dict
     )
 
@@ -36,7 +41,24 @@ CLASSICAL_INDICES = [38, 39, 40]
 NOISE_GRID_RESOLUTION_HZ = 5e9
 NOISE_FLOOR_W = 1e-23
 FREQ_GRID_PADDING_FACTOR = 1.5
-LENGTHS_KM = np.array([1, 2, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 120, 140, 160, 180, 200])
+def _load_fiber_params() -> dict:
+    from qkd_sim.config.schema import load_fiber_config
+    cfg = load_fiber_config(_YAML_FIBER_PATH)
+    return dict(
+        alpha_dB_per_km=cfg.alpha_dB_per_km,
+        gamma_per_W_km=cfg.gamma_per_W_km,
+        D_ps_nm_km=cfg.D_ps_nm_km,
+        D_slope_ps_nm2_km=cfg.D_slope_ps_nm2_km,
+        L_km=cfg.L_km,
+        A_eff=cfg.A_eff,
+        rayleigh_coeff=cfg.rayleigh_coeff,
+        T_kelvin=cfg.T_kelvin,
+        length_km_samples=cfg.length_km_samples,
+    )
+
+_FIBER_CFG = _load_fiber_params()
+FIBER_PARAMS = {k: v for k, v in _FIBER_CFG.items() if k != 'length_km_samples'}
+LENGTHS_KM = np.array(_FIBER_CFG['length_km_samples'])
 OSA_RBW_HZ = 1.0e9
 OSA_CSV_PATH = _PROJECT_ROOT / "data" / "osa"
 
@@ -193,7 +215,7 @@ def _resolve_osa_csv() -> Path:
 
 
 def _build_noise_frequency_grid(config: WDMConfig) -> np.ndarray:
-    half_span = (config.end_channel - config.start_channel) / 2.0 * config.channel_spacing
+    half_span = (config.num_channels - 1) / 2.0 * config.channel_spacing
     center_freq = config.start_freq + half_span
     padding = FREQ_GRID_PADDING_FACTOR * config.channel_spacing
     f_min = center_freq - half_span - padding
@@ -227,6 +249,7 @@ def _build_model_grid(
             P0=_get_P0(),
             beta_rolloff=spec["beta_rolloff"],
             quantum_channel_indices=base_config.quantum_channel_indices,
+            num_channels=int(base_config.num_channels),
         )
     else:
         model_config = base_config
@@ -290,8 +313,9 @@ def _build_all_classical_grid(
         P0=_get_P0(),
         beta_rolloff=base_config.beta_rolloff if spec["beta_rolloff"] is None else spec["beta_rolloff"],
         quantum_channel_indices=[],
+        num_channels=int(base_config.num_channels),
     )
-    all_indices = list(range(int(base_config.end_channel - base_config.start_channel + 1)))
+    all_indices = list(range(int(base_config.num_channels)))
     if spec["spectrum_type"] == SpectrumType.OSA_SAMPLED:
         return build_wdm_grid(
             config=model_config,
@@ -501,7 +525,7 @@ def precompute_by_length(
     quantum_indices = list(base_config.quantum_channel_indices)
     n_q = len(quantum_indices)
     n_l = len(LENGTHS_KM)
-    n_ch = int(base_config.end_channel - base_config.start_channel + 1)
+    n_ch = int(base_config.num_channels)
 
     if noise_type == "with_signal":
         # Continuous PSD: noise (FWM+SpRS) + signal, integrate to power per length
@@ -656,7 +680,7 @@ def precompute_by_channel(
     quantum_indices = list(base_config.quantum_channel_indices)
     n_q = len(quantum_indices)
     n_l = len(LENGTHS_KM)
-    n_ch = int(base_config.end_channel - base_config.start_channel + 1)
+    n_ch = int(base_config.num_channels)
 
     if noise_type == "with_signal":
         # Continuous PSD: noise (FWM+SpRS) + signal, output (N_f,) per length
