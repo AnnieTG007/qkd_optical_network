@@ -29,6 +29,7 @@ from scripts.dash_utils import (
     NOISE_FLOOR_W,
     WDM_PARAMS,
     _LEGEND_SYNC_JS,
+    _build_caption,
     _build_noise_frequency_grid,
     _build_wdm_config,
     _display_channel_label,
@@ -286,9 +287,23 @@ def _make_figure(sweep: dict, ch_idx: int) -> go.Figure:
     fig.update_layout(
         template="plotly_white",
         width=1500,
-        height=520,
+        height=560,
         legend=dict(groupclick="toggleitem"),
         title=f"Noise vs Fiber Length [{NOISE_TYPE}]",
+        annotations=[
+            dict(
+                x=0.5,
+                y=-0.12,
+                xref="paper",
+                yref="paper",
+                text=_build_caption(),
+                showarrow=False,
+                font=dict(size=10, color="gray"),
+                align="center",
+                xanchor="center",
+                yanchor="top",
+            )
+        ],
     )
     return fig
 
