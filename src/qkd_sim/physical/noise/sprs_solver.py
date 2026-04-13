@@ -54,6 +54,7 @@ def _raman_cross_section(
     g_R: np.ndarray,
     n_th: np.ndarray,
     delta_f: np.ndarray,
+    bandwidth: float,
 ) -> np.ndarray:
     """拉曼横截面积 σ_{1,2}，区分 Stokes / anti-Stokes。
 
@@ -64,7 +65,8 @@ def _raman_cross_section(
         anti-Stokes (f_c < f_q，泵浦频率低于量子信道，散射光为高频):
             σ = 2·h·f_q · g_R(f_q, f_c) · n_th · (f_q/f_c) · Δf
 
-    注意：σ 中的 Δf 是频率差绝对值，不是积分微元。
+    这里的 Δf 是信道采样带宽（channel.spacing），而非 |f_q - f_c|。
+    delta_f 参数仅用于插值 g_R 和计算声子占据因子 n_th。
 
     Parameters
     ----------
@@ -77,7 +79,9 @@ def _raman_cross_section(
     n_th : ndarray, shape (N_q, N_c)
         声子占据因子
     delta_f : ndarray, shape (N_q, N_c)
-        频移绝对值 |f_q - f_c| [Hz]
+        频移绝对值 |f_q - f_c| [Hz]（用于插值和 n_th）
+    bandwidth : float
+        信道采样带宽 [Hz]，即信道间隔（离散模型）或频率网格步长（连续模型）
 
     Returns
     -------
@@ -93,12 +97,12 @@ def _raman_cross_section(
     f_q_bc = np.broadcast_to(f_q, g_R.shape)
     f_c_bc = np.broadcast_to(f_c, g_R.shape)
 
-    # Stokes 分量
+    # Stokes 分量：Δf = bandwidth（采样带宽，不是实际频移）
     sigma[stokes_mask] = (
         2.0 * h * f_q_bc[stokes_mask]
         * g_R[stokes_mask]
         * (1.0 + n_th[stokes_mask])
-        * delta_f[stokes_mask]
+        * bandwidth
     )
 
     # anti-Stokes 分量
@@ -108,7 +112,7 @@ def _raman_cross_section(
         * g_R[anti_mask]
         * n_th[anti_mask]
         * (f_q_bc[anti_mask] / f_c_bc[anti_mask])
-        * delta_f[anti_mask]
+        * bandwidth
     )
 
     return sigma
@@ -255,6 +259,7 @@ class DiscreteSPRSSolver(NoiseSolver):
         f_q: np.ndarray,
         f_c: np.ndarray,
         fiber: Fiber,
+        wdm_grid: WDMGrid,
     ) -> np.ndarray:
         """计算拉曼横截面积矩阵 σ_{1,2}，shape (N_q, N_c)。"""
         delta_f = np.abs(f_q - f_c)  # shape (N_q, N_c)
@@ -270,7 +275,11 @@ class DiscreteSPRSSolver(NoiseSolver):
 
         n_th = _phonon_occupation(delta_f, fiber.T_kelvin)  # shape (N_q, N_c)
 
-        sigma = _raman_cross_section(f_q, f_c, g_R, n_th, delta_f)
+        # 采样带宽：离散模型取经典信道带宽 B_s（等于 channel.spacing）
+        c_chs = wdm_grid.get_classical_channels()
+        bandwidth = c_chs[0].B_s  # 所有经典信道 B_s 相同
+
+        sigma = _raman_cross_section(f_q, f_c, g_R, n_th, delta_f, bandwidth)
         return sigma
 
     def compute_forward(self, fiber: Fiber, wdm_grid: WDMGrid) -> np.ndarray:
@@ -289,7 +298,7 @@ class DiscreteSPRSSolver(NoiseSolver):
             前向 SpRS 噪声功率 [W]
         """
         f_q, f_c, P_pump, alpha1, alpha2 = self._prepare(fiber, wdm_grid)
-        sigma = self._compute_sigma(f_q, f_c, fiber)
+        sigma = self._compute_sigma(f_q, f_c, fiber, wdm_grid)
 
         # shape (N_q, N_c)
         P_fwd_matrix = _forward_propagation(sigma, P_pump, alpha1, alpha2, fiber.L)
@@ -315,7 +324,7 @@ class DiscreteSPRSSolver(NoiseSolver):
             后向 SpRS 噪声功率 [W]
         """
         f_q, f_c, P_pump, alpha1, alpha2 = self._prepare(fiber, wdm_grid)
-        sigma = self._compute_sigma(f_q, f_c, fiber)
+        sigma = self._compute_sigma(f_q, f_c, fiber, wdm_grid)
 
         # shape (N_q, N_c)
         P_bwd_matrix = _backward_propagation(sigma, P_pump, alpha1, alpha2, fiber.L)
@@ -402,7 +411,7 @@ class DiscreteSPRSSolver(NoiseSolver):
         g_R = get_raman_gain(delta_f=delta_f, f_pump=f_2, A_eff=fiber.A_eff)
         n_th = _phonon_occupation(delta_f, fiber.T_kelvin)
         sigma = _raman_cross_section(
-            f_q=f_q, f_c=f_2, g_R=g_R, n_th=n_th, delta_f=delta_f
+            f_q=f_q, f_c=f_2, g_R=g_R, n_th=n_th, delta_f=delta_f, bandwidth=df
         )
 
         G_fwd = _forward_propagation(
@@ -451,7 +460,7 @@ class DiscreteSPRSSolver(NoiseSolver):
         g_R = get_raman_gain(delta_f=delta_f, f_pump=f_2, A_eff=fiber.A_eff)
         n_th = _phonon_occupation(delta_f, fiber.T_kelvin)
         sigma = _raman_cross_section(
-            f_q=f_q, f_c=f_2, g_R=g_R, n_th=n_th, delta_f=delta_f
+            f_q=f_q, f_c=f_2, g_R=g_R, n_th=n_th, delta_f=delta_f, bandwidth=df
         )
 
         G_bwd = _backward_propagation(
@@ -476,6 +485,7 @@ class DiscreteSPRSSolver(NoiseSolver):
         alpha2: np.ndarray,
         f1: float,
         direction: str,
+        df: float,
     ) -> float:
         """在单个输出频率 f1 处计算 SpRS 噪声 PSD G_sprs(f1) [W/Hz]。
 
@@ -493,7 +503,7 @@ class DiscreteSPRSSolver(NoiseSolver):
         g_R = get_raman_gain(delta_f=delta_f, f_pump=f_grid_arr, A_eff=fiber.A_eff)
         n_th = _phonon_occupation(delta_f, fiber.T_kelvin)
         sigma = _raman_cross_section(
-            f_q=f1_arr, f_c=f_grid_arr, g_R=g_R, n_th=n_th, delta_f=delta_f
+            f_q=f1_arr, f_c=f_grid_arr, g_R=g_R, n_th=n_th, delta_f=delta_f, bandwidth=df
         )
 
         if direction == "forward":
@@ -509,7 +519,6 @@ class DiscreteSPRSSolver(NoiseSolver):
         else:
             raise ValueError(f"Unsupported direction: {direction}")
 
-        df = float(np.mean(np.diff(f_grid)))
         return float(np.sum(integrand) * df)
 
     def compute_sprs_spectrum_conti(
@@ -553,5 +562,6 @@ class DiscreteSPRSSolver(NoiseSolver):
                 fiber=fiber, f_grid=f_grid,
                 G_pump=G_pump, alpha2=alpha2,
                 f1=float(f1), direction=direction,
+                df=df,
             )
         return out

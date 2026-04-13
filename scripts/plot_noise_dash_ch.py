@@ -25,6 +25,7 @@ from scripts.dash_utils import (
     CLASSICAL_INDICES,
     FIBER_PARAMS,
     LENGTHS_KM,
+    NOISE_FLOOR_W,
     WDM_PARAMS,
     _LEGEND_SYNC_JS,
     _build_noise_frequency_grid,
@@ -45,47 +46,28 @@ def _to_dbm(values_w: np.ndarray) -> np.ndarray:
     return out
 
 
-def _to_dbm_per_hz(values_w_hz: np.ndarray) -> np.ndarray:
-    """Convert PSD [W/Hz] to dBm/Hz."""
-    out = np.full_like(values_w_hz, np.nan, dtype=np.float64)
-    mask = values_w_hz > 0
-    out[mask] = 10.0 * np.log10(values_w_hz[mask] / 1e-3)
-    return out
-
-
-def _global_ranges(all_data: dict, model_keys: list[str]) -> tuple[tuple[float, float], tuple[float, float], bool]:
+def _global_ranges(all_data: dict, model_keys: list[str]) -> tuple[tuple[float, float], tuple[float, float]]:
     """Compute y-axis ranges for the plot.
 
-    Returns (y_log, y_dbm, is_psd) where is_psd indicates if we're plotting PSD vs channel power.
-    For PSD (W/Hz), dBm conversion uses 10*log10 instead of dBm formula.
+    Returns (y_log, y_dbm). All data is now in [W] (power per bin or channel power).
     """
     positives: list[float] = []
-    y_kind_set = set()
     for curve_data in all_data.values():
         for model_key in model_keys:
             entry = curve_data.get(model_key, {})
-            y_kind = entry.get("y_kind", "channel_power")
-            y_kind_set.add(y_kind)
             fwd = np.asarray(entry.get("fwd", []), dtype=np.float64)
             bwd = np.asarray(entry.get("bwd", []), dtype=np.float64)
-            positives.extend(fwd[fwd > 0].tolist())
-            positives.extend(bwd[bwd > 0].tolist())
+            positives.extend(fwd[fwd >= NOISE_FLOOR_W].tolist())
+            positives.extend(bwd[bwd >= NOISE_FLOOR_W].tolist())
     if not positives:
-        return (-18.0, -3.0), (-150.0, -30.0), False
+        return (-18.0, -3.0), (-150.0, -30.0)
 
     positives_arr = np.asarray(positives, dtype=np.float64)
     y_log = (float(np.log10(positives_arr.min()) - 0.3), float(np.log10(positives_arr.max()) + 0.3))
+    dbm = _to_dbm(positives_arr)
+    y_lin = (float(np.nanmin(dbm) - 3.0), float(np.nanmax(dbm) + 3.0))
 
-    is_psd = "psd" in y_kind_set
-    if is_psd:
-        # For PSD [W/Hz], convert to dBm/Hz: 10*log10(W/Hz) -> dBm/Hz
-        dbm_vals = _to_dbm_per_hz(positives_arr)
-        y_lin = (float(np.nanmin(dbm_vals) - 3.0), float(np.nanmax(dbm_vals) + 3.0))
-    else:
-        dbm = _to_dbm(positives_arr)
-        y_lin = (float(np.nanmin(dbm) - 3.0), float(np.nanmax(dbm) + 3.0))
-
-    return y_log, y_lin, is_psd
+    return y_log, y_lin
 
 
 parser = argparse.ArgumentParser()
@@ -120,7 +102,7 @@ ALL_BY_CH, VALID_L_INDICES = precompute_by_channel(
 if not VALID_L_INDICES:
     raise RuntimeError(f"No valid lengths found for noise type {NOISE_TYPE!r}")
 
-Y_LOG_RANGE, Y_DBM_RANGE, IS_PSD = _global_ranges(ALL_BY_CH, model_keys)
+Y_LOG_RANGE, Y_DBM_RANGE = _global_ranges(ALL_BY_CH, model_keys)
 elapsed = time.time() - t0
 print(f"Precompute done in {elapsed:.1f}s. Valid selections: {len(VALID_L_INDICES)}")
 
@@ -188,33 +170,18 @@ def update_graph(selection_idx: int) -> go.Figure:
     l_idx = VALID_L_INDICES[selection_idx]
     sweep = ALL_BY_CH[l_idx]
 
-    # Determine subplot titles and y-axis based on data kinds present
-    y_kinds_present = set()
-    for model_key in model_keys:
-        entry = sweep.get(model_key, {})
-        if entry:
-            y_kinds_present.add(entry.get("y_kind", "channel_power"))
-
-    is_psd_plot = "psd" in y_kinds_present
-    subplot_titles = (
-        ("Noise PSD [W/Hz]", "Noise PSD [dBm/Hz]") if is_psd_plot
-        else ("Noise Power [W]", "Noise Power [dBm]")
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=("Noise Power [W]", "Noise Power [dBm]"),
     )
 
-    fig = make_subplots(rows=1, cols=2, subplot_titles=subplot_titles)
-
-    x_kind: str = "channel_center"  # default, updated inside loop if entries exist
     for model_key in model_keys:
         spec = specs[model_key]
         entry = sweep.get(model_key, {})
         if not entry or entry.get("fwd") is None or len(entry.get("fwd", [])) == 0:
             continue
 
-        y_kind = entry.get("y_kind", "channel_power")
-        x_kind = entry.get("x_kind", "channel_center")
         x_data = np.asarray(entry.get("x", []), dtype=np.float64)
-
-        # Convert x to THz for display
         x_thz = x_data / 1e12
 
         for direction, dash_style in (("fwd", "solid"), ("bwd", "dot")):
@@ -223,24 +190,19 @@ def update_graph(selection_idx: int) -> go.Figure:
             name = f"{spec['label']} ({direction})"
             legendgroup = f"{model_key}-{direction}"
 
-            # Style based on y_kind
-            if y_kind == "psd":
-                # Continuous PSD: plot ALL frequency points.
-                # Zero-noise points are floored to 1e-20 so the line is continuous
-                # across the full band on a log y-axis (zeros would become -inf).
+            if spec["continuous"] or NOISE_TYPE == "with_signal":
+                # Continuous model or with_signal: lines on full f_grid, hide values below the noise floor
                 mode = "lines"
                 line_cfg = dict(color=spec["color"], width=2.0, dash=dash_style)
                 marker_cfg = None
                 x_plot = x_thz
-                y_plot = np.where(arr_w > 0, arr_w, 1e-20)
-                y_db = _to_dbm_per_hz(np.where(arr_w > 0, arr_w, 1e-20))
-                hover_w = "f=%{x:.4f} THz<br>PSD=%{y:.3e} W/Hz<extra>" + name + "</extra>"
-                hover_db = "f=%{x:.4f} THz<br>PSD=%{y:.2f} dBm/Hz<extra>" + name + "</extra>"
+                y_plot = np.where(arr_w >= NOISE_FLOOR_W, arr_w, np.nan)
+                y_db = _to_dbm(y_plot)
+                hover_w = "f=%{x:.4f} THz<br>P=%{y:.3e} W<extra>" + name + "</extra>"
+                hover_db = "f=%{x:.4f} THz<br>P=%{y:.2f} dBm<extra>" + name + "</extra>"
             else:
-                # Discrete channel power: markers only, no connecting lines.
-                # connectgaps=False ensures no line is drawn between sparse
-                # non-adjacent channel-center points.
-                mask = arr_w > 0
+                # Discrete model: markers only at channel centers, no connecting lines
+                mask = arr_w >= NOISE_FLOOR_W
                 if not np.any(mask):
                     continue
                 mode = "markers"
@@ -286,17 +248,11 @@ def update_graph(selection_idx: int) -> go.Figure:
                 col=2,
             )
 
-    # X-axis label (depends on x_kind)
-    xaxis_title = "Frequency [THz]" if x_kind == "frequency_grid" else "Channel Frequency [THz]"
-
-    fig.update_xaxes(title_text=xaxis_title, row=1, col=1)
-    fig.update_xaxes(title_text=xaxis_title, row=1, col=2)
-
-    y_left_title = "PSD [W/Hz]" if is_psd_plot else "Power [W]"
-    y_right_title = "PSD [dBm/Hz]" if is_psd_plot else "Power [dBm]"
+    fig.update_xaxes(title_text="Frequency [THz]", row=1, col=1)
+    fig.update_xaxes(title_text="Frequency [THz]", row=1, col=2)
 
     fig.update_yaxes(
-        title_text=y_left_title,
+        title_text="Power [W]",
         type="log",
         range=list(Y_LOG_RANGE),
         showgrid=True,
@@ -305,7 +261,7 @@ def update_graph(selection_idx: int) -> go.Figure:
         **adaptive_log_ticks(*Y_LOG_RANGE),
     )
     fig.update_yaxes(
-        title_text=y_right_title,
+        title_text="Power [dBm]",
         type="linear",
         range=list(Y_DBM_RANGE),
         showgrid=True,

@@ -26,6 +26,7 @@ from scripts.dash_utils import (
     CLASSICAL_INDICES,
     FIBER_PARAMS,
     LENGTHS_KM,
+    NOISE_FLOOR_W,
     WDM_PARAMS,
     _LEGEND_SYNC_JS,
     _build_noise_frequency_grid,
@@ -51,8 +52,8 @@ def _global_ranges(all_data: dict, model_keys: list[str]) -> tuple[tuple[float, 
     positives: list[float] = []
     for curve_data in all_data.values():
         for model_key in model_keys:
-            positives.extend(curve_data[model_key]["fwd"][curve_data[model_key]["fwd"] > 0].tolist())
-            positives.extend(curve_data[model_key]["bwd"][curve_data[model_key]["bwd"] > 0].tolist())
+            positives.extend(curve_data[model_key]["fwd"][curve_data[model_key]["fwd"] >= NOISE_FLOOR_W].tolist())
+            positives.extend(curve_data[model_key]["bwd"][curve_data[model_key]["bwd"] >= NOISE_FLOOR_W].tolist())
     if not positives:
         return (-18.0, -3.0), (-150.0, -30.0)
 
@@ -164,7 +165,7 @@ def update_graph(selection_idx: int) -> go.Figure:
         spec = specs[model_key]
         for direction, dash_style in (("fwd", "solid"), ("bwd", "dot")):
             arr_w = np.asarray(sweep[model_key][direction], dtype=np.float64)
-            mask = arr_w > 0
+            mask = arr_w >= NOISE_FLOOR_W
             if not np.any(mask):
                 continue
 

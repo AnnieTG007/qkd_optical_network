@@ -10,17 +10,30 @@ from qkd_sim.physical.signal import build_wdm_grid
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _SCRIPT_DIR.parent
 
-WDM_PARAMS = dict(
-    start_freq=190.1e12,
-    start_channel=1,
-    end_channel=61,
-    channel_spacing=100e9,
-    B_s=32e9,
-    P0=1e-3,
-    beta_rolloff=0.2,
-)
+# WDM 参数从 YAML 加载，保持唯一真值
+_CONFIG_DIR = _PROJECT_ROOT / "src" / "qkd_sim" / "config"
+_YAML_WDM_PATH = _CONFIG_DIR / "defaults" / "wdm_para" / "wdm_100ghz.yaml"
+
+
+def _load_wdm_params() -> dict:
+    from qkd_sim.config.schema import load_wdm_config
+    cfg = load_wdm_config(_YAML_WDM_PATH)
+    return dict(
+        start_freq=cfg.start_freq,
+        start_channel=cfg.start_channel,
+        end_channel=cfg.end_channel,
+        channel_spacing=cfg.channel_spacing,
+        B_s=cfg.B_s,
+        P0=cfg.P0,
+        beta_rolloff=cfg.beta_rolloff,
+        # quantum_channel_indices 由 _build_wdm_config 单独传入，不加入此 dict
+    )
+
+
+WDM_PARAMS = _load_wdm_params()
 CLASSICAL_INDICES = [38, 39, 40]
 NOISE_GRID_RESOLUTION_HZ = 5e9
+NOISE_FLOOR_W = 1e-23
 FREQ_GRID_PADDING_FACTOR = 1.5
 LENGTHS_KM = np.array([1, 2, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 120, 140, 160, 180, 200])
 OSA_RBW_HZ = 1.0e9
@@ -292,9 +305,14 @@ def _integrate_signal_per_channel(grid, f_grid: np.ndarray | None) -> np.ndarray
         return powers
 
     df = float(np.mean(np.diff(f_grid)))
+    from qkd_sim.physical.signal import SpectrumType
     for idx, ch in enumerate(grid.channels):
         if ch.channel_type == "classical":
-            powers[idx] = float(np.sum(ch.get_psd(f_grid)) * df)
+            if ch.spectrum_type == SpectrumType.SINGLE_FREQ:
+                # Delta approximation: sum(G*df) = P at nearest bin → G = P/df
+                powers[idx] = float(ch.power)
+            else:
+                powers[idx] = float(np.sum(ch.get_psd(f_grid)) * df)
     return powers
 
 
@@ -420,8 +438,9 @@ def _compute_noise_spectrum_pair(
 
     if noise_type in ("sprs", "both"):
         solver = DiscreteSPRSSolver()
-        fwd += solver.compute_sprs_spectrum_conti(fiber, grid, f_grid, direction="forward")
-        bwd += solver.compute_sprs_spectrum_conti(fiber, grid, f_grid, direction="backward")
+        df_grid = float(np.mean(np.diff(f_grid)))
+        fwd += solver.compute_sprs_spectrum_conti(fiber, grid, f_grid, direction="forward") / df_grid
+        bwd += solver.compute_sprs_spectrum_conti(fiber, grid, f_grid, direction="backward") / df_grid
 
     return np.asarray(fwd, dtype=np.float64), np.asarray(bwd, dtype=np.float64)
 
@@ -462,7 +481,55 @@ def precompute_by_length(
     n_l = len(LENGTHS_KM)
     n_ch = int(base_config.end_channel - base_config.start_channel + 1)
 
-    if noise_type in ("only_signal", "with_signal"):
+    if noise_type == "with_signal":
+        # Continuous PSD: noise (FWM+SpRS) + signal, integrate to power per length
+        df = float(np.mean(np.diff(noise_f_grid)))
+        all_by_len = {
+            ch_idx: {mk: {"fwd": np.zeros(n_l), "bwd": np.zeros(n_l)} for mk in model_keys}
+            for ch_idx in range(n_ch)
+        }
+        for model_key in model_keys:
+            spec = specs[model_key]
+            # Full grid with all classical channels (raised-cosine spectrum)
+            grid_all = _build_all_classical_grid(
+                dict(spec, beta_rolloff=WDM_PARAMS["beta_rolloff"]),
+                base_config,
+                noise_f_grid,
+                osa_csv_path,
+            )
+            # Precompute signal PSD on the full frequency grid (sum of all classical channels)
+            signal_psd = np.zeros_like(noise_f_grid, dtype=np.float64)
+            for ch in grid_all.channels:
+                if ch.channel_type == "classical":
+                    signal_psd += ch.get_psd(noise_f_grid)
+
+            for li, length_km in enumerate(LENGTHS_KM):
+                fiber = _make_fiber(fiber_params, length_km)
+                # Noise PSD: FWM + SpRS on the full grid
+                noise_fwd_psd, noise_bwd_psd = _compute_noise_spectrum_pair(
+                    "both", fiber, grid_all, noise_f_grid
+                )
+                total_psd_fwd = noise_fwd_psd + signal_psd
+                total_psd_bwd = noise_bwd_psd + signal_psd
+                # Integrate over full grid to get total power [W]
+                total_fwd_power = float(np.sum(total_psd_fwd) * df)
+                total_bwd_power = float(np.sum(total_psd_bwd) * df)
+                for ch_idx in range(n_ch):
+                    all_by_len[ch_idx][model_key]["fwd"][li] = total_fwd_power
+                    all_by_len[ch_idx][model_key]["bwd"][li] = total_bwd_power
+
+        valid_indices = [
+            ch_idx
+            for ch_idx in range(n_ch)
+            if any(
+                np.any(all_by_len[ch_idx][mk]["fwd"] > 0)
+                or np.any(all_by_len[ch_idx][mk]["bwd"] > 0)
+                for mk in model_keys
+            )
+        ]
+        return all_by_len, valid_indices
+
+    if noise_type == "only_signal":
         all_by_len = {
             ch_idx: {mk: {"fwd": np.zeros(n_l), "bwd": np.zeros(n_l)} for mk in model_keys}
             for ch_idx in range(n_ch)
@@ -473,37 +540,13 @@ def precompute_by_length(
             signal = _integrate_signal_per_channel(grid_all, grid_all.f_grid)
             classical_mask = np.array([ch.channel_type == "classical" for ch in grid_all.channels], dtype=bool)
 
-            per_q_grids = {}
-            if noise_type == "with_signal":
-                for q_idx in quantum_indices:
-                    per_q_grids[q_idx] = _build_model_grid(
-                        model_key,
-                        spec,
-                        _build_wdm_config([q_idx]),
-                        noise_f_grid,
-                        osa_csv_path,
-                    )
-
             for li, length_km in enumerate(LENGTHS_KM):
                 fiber = _make_fiber(fiber_params, length_km)
+                nli_fwd, nli_bwd = _compute_nli_pair(fiber, grid_all)
                 fwd = np.zeros(n_ch, dtype=np.float64)
                 bwd = np.zeros(n_ch, dtype=np.float64)
-
-                nli_fwd, nli_bwd = _compute_nli_pair(fiber, grid_all)
                 fwd[classical_mask] = nli_fwd + signal[classical_mask]
                 bwd[classical_mask] = nli_bwd + signal[classical_mask]
-
-                if noise_type == "with_signal":
-                    for q_idx in quantum_indices:
-                        q_fwd, q_bwd = _compute_noise_power_pair(
-                            "both",
-                            fiber,
-                            per_q_grids[q_idx],
-                            continuous=bool(spec["continuous"]),
-                        )
-                        if len(q_fwd) > 0:
-                            fwd[q_idx] = float(q_fwd[0])
-                            bwd[q_idx] = float(q_bwd[0])
 
                 for ch_idx in range(n_ch):
                     all_by_len[ch_idx][model_key]["fwd"][li] = float(fwd[ch_idx])
@@ -587,7 +630,56 @@ def precompute_by_channel(
     n_l = len(LENGTHS_KM)
     n_ch = int(base_config.end_channel - base_config.start_channel + 1)
 
-    if noise_type in ("only_signal", "with_signal"):
+    if noise_type == "with_signal":
+        # Continuous PSD: noise (FWM+SpRS) + signal, output (N_f,) per length
+        df = float(np.mean(np.diff(noise_f_grid)))
+        all_by_ch = {
+            li: {mk: {
+                "fwd": np.zeros(len(noise_f_grid)),
+                "bwd": np.zeros(len(noise_f_grid)),
+                "x": np.asarray(noise_f_grid, dtype=np.float64),
+                "x_kind": "frequency_grid",
+                "y_kind": "power_per_bin",
+            } for mk in model_keys}
+            for li in range(n_l)
+        }
+        for li, length_km in enumerate(LENGTHS_KM):
+            fiber = _make_fiber(fiber_params, length_km)
+            for model_key in model_keys:
+                spec = specs[model_key]
+                # Full grid with all classical channels (raised-cosine spectrum)
+                grid_all = _build_all_classical_grid(
+                    dict(spec, beta_rolloff=WDM_PARAMS["beta_rolloff"]),
+                    base_config,
+                    noise_f_grid,
+                    osa_csv_path,
+                )
+                # Signal PSD: sum raised-cosine PSD of all classical channels
+                signal_psd = np.zeros_like(noise_f_grid, dtype=np.float64)
+                for ch in grid_all.channels:
+                    if ch.channel_type == "classical":
+                        signal_psd += ch.get_psd(noise_f_grid)
+                # Noise PSD: FWM + SpRS on the full grid
+                noise_fwd_psd, noise_bwd_psd = _compute_noise_spectrum_pair(
+                    "both", fiber, grid_all, noise_f_grid
+                )
+                total_fwd = (noise_fwd_psd + signal_psd) * df
+                total_bwd = (noise_bwd_psd + signal_psd) * df
+                all_by_ch[li][model_key]["fwd"] = np.asarray(total_fwd, dtype=np.float64)
+                all_by_ch[li][model_key]["bwd"] = np.asarray(total_bwd, dtype=np.float64)
+
+        valid_l_indices = [
+            li
+            for li in range(n_l)
+            if any(
+                np.any(all_by_ch[li][mk]["fwd"] > 0)
+                or np.any(all_by_ch[li][mk]["bwd"] > 0)
+                for mk in model_keys
+            )
+        ]
+        return all_by_ch, valid_l_indices
+
+    if noise_type == "only_signal":
         # x-axis: all channel center frequencies (classical + quantum)
         all_ch_freqs = np.array(
             [
@@ -619,25 +711,6 @@ def precompute_by_channel(
                 nli_fwd, nli_bwd = _compute_nli_pair(fiber, grid_all)
                 fwd[classical_mask] = nli_fwd + signal[classical_mask]
                 bwd[classical_mask] = nli_bwd + signal[classical_mask]
-
-                if noise_type == "with_signal":
-                    for q_idx in quantum_indices:
-                        grid = _build_model_grid(
-                            model_key,
-                            spec,
-                            _build_wdm_config([q_idx]),
-                            noise_f_grid,
-                            osa_csv_path,
-                        )
-                        q_fwd, q_bwd = _compute_noise_power_pair(
-                            "both",
-                            fiber,
-                            grid,
-                            continuous=bool(spec["continuous"]),
-                        )
-                        if len(q_fwd) > 0:
-                            fwd[q_idx] = float(q_fwd[0])
-                            bwd[q_idx] = float(q_bwd[0])
 
                 all_by_ch[li][model_key]["fwd"] = np.asarray(fwd, dtype=np.float64)
                 all_by_ch[li][model_key]["bwd"] = np.asarray(bwd, dtype=np.float64)
@@ -689,15 +762,16 @@ def precompute_by_channel(
                     noise_f_grid,
                     osa_csv_path,
                 )
-                fwd, bwd = _compute_noise_spectrum_pair(
+                df = float(np.mean(np.diff(noise_f_grid)))
+                fwd_psd, bwd_psd = _compute_noise_spectrum_pair(
                     noise_type, fiber, grid, noise_f_grid
                 )
                 all_by_ch[li][model_key] = {
-                    "fwd": np.asarray(fwd, dtype=np.float64),
-                    "bwd": np.asarray(bwd, dtype=np.float64),
+                    "fwd": np.asarray(fwd_psd * df, dtype=np.float64),
+                    "bwd": np.asarray(bwd_psd * df, dtype=np.float64),
                     "x": np.asarray(noise_f_grid, dtype=np.float64),
                     "x_kind": "frequency_grid",
-                    "y_kind": "psd",
+                    "y_kind": "power_per_bin",
                 }
             else:
                 # Discrete model: per-channel integrated power (N_q,) at channel centers
