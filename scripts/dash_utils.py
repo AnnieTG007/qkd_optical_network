@@ -203,7 +203,8 @@ def _build_noise_frequency_grid(config: WDMConfig) -> np.ndarray:
 
 
 def _build_wdm_config(quantum_indices: list[int]) -> WDMConfig:
-    return WDMConfig(**WDM_PARAMS, quantum_channel_indices=list(quantum_indices), P0=_get_P0())
+    params = {k: v for k, v in WDM_PARAMS.items() if k != "P0"}
+    return WDMConfig(**params, quantum_channel_indices=list(quantum_indices), P0=_get_P0())
 
 
 def _build_model_grid(
@@ -509,27 +510,33 @@ def precompute_by_length(
             ch_idx: {mk: {"fwd": np.zeros(n_l), "bwd": np.zeros(n_l)} for mk in model_keys}
             for ch_idx in range(n_ch)
         }
-        for model_key in model_keys:
-            spec = specs[model_key]
-            # Full grid with all classical channels (raised-cosine spectrum)
-            grid_all = _build_all_classical_grid(
-                dict(spec, beta_rolloff=WDM_PARAMS["beta_rolloff"]),
+        first_key = next(iter(model_keys))
+        first_spec = specs[first_key]
+        for li, length_km in enumerate(LENGTHS_KM):
+            fiber = _make_fiber(fiber_params, length_km)
+            # Noise spectrum is model-independent: compute once per length
+            grid_noise = _build_all_classical_grid(
+                dict(first_spec, beta_rolloff=WDM_PARAMS["beta_rolloff"]),
                 base_config,
                 noise_f_grid,
                 osa_csv_path,
             )
-            # Precompute signal PSD on the full frequency grid (sum of all classical channels)
-            signal_psd = np.zeros_like(noise_f_grid, dtype=np.float64)
-            for ch in grid_all.channels:
-                if ch.channel_type == "classical":
-                    signal_psd += ch.get_psd(noise_f_grid)
-
-            for li, length_km in enumerate(LENGTHS_KM):
-                fiber = _make_fiber(fiber_params, length_km)
-                # Noise PSD: FWM + SpRS on the full grid
-                noise_fwd_psd, noise_bwd_psd = _compute_noise_spectrum_pair(
-                    "both", fiber, grid_all, noise_f_grid
+            noise_fwd_psd, noise_bwd_psd = _compute_noise_spectrum_pair(
+                "both", fiber, grid_noise, noise_f_grid
+            )
+            for model_key in model_keys:
+                spec = specs[model_key]
+                # Signal PSD differs by model via beta_rolloff
+                grid_sig = _build_all_classical_grid(
+                    dict(spec, beta_rolloff=WDM_PARAMS["beta_rolloff"]),
+                    base_config,
+                    noise_f_grid,
+                    osa_csv_path,
                 )
+                signal_psd = np.zeros_like(noise_f_grid, dtype=np.float64)
+                for ch in grid_sig.channels:
+                    if ch.channel_type == "classical":
+                        signal_psd += ch.get_psd(noise_f_grid)
                 total_psd_fwd = noise_fwd_psd + signal_psd
                 total_psd_bwd = noise_bwd_psd + signal_psd
                 # Integrate over full grid to get total power [W]
@@ -666,24 +673,32 @@ def precompute_by_channel(
         }
         for li, length_km in enumerate(LENGTHS_KM):
             fiber = _make_fiber(fiber_params, length_km)
+            # Noise spectrum is model-independent: compute once per length
+            # All models share the same classical channel positions/powers
+            first_key = next(iter(model_keys))
+            first_spec = specs[first_key]
+            grid_noise = _build_all_classical_grid(
+                dict(first_spec, beta_rolloff=WDM_PARAMS["beta_rolloff"]),
+                base_config,
+                noise_f_grid,
+                osa_csv_path,
+            )
+            noise_fwd_psd, noise_bwd_psd = _compute_noise_spectrum_pair(
+                "both", fiber, grid_noise, noise_f_grid
+            )
             for model_key in model_keys:
                 spec = specs[model_key]
-                # Full grid with all classical channels (raised-cosine spectrum)
-                grid_all = _build_all_classical_grid(
+                # Signal PSD differs by model via beta_rolloff shape
+                grid_sig = _build_all_classical_grid(
                     dict(spec, beta_rolloff=WDM_PARAMS["beta_rolloff"]),
                     base_config,
                     noise_f_grid,
                     osa_csv_path,
                 )
-                # Signal PSD: sum raised-cosine PSD of all classical channels
                 signal_psd = np.zeros_like(noise_f_grid, dtype=np.float64)
-                for ch in grid_all.channels:
+                for ch in grid_sig.channels:
                     if ch.channel_type == "classical":
                         signal_psd += ch.get_psd(noise_f_grid)
-                # Noise PSD: FWM + SpRS on the full grid
-                noise_fwd_psd, noise_bwd_psd = _compute_noise_spectrum_pair(
-                    "both", fiber, grid_all, noise_f_grid
-                )
                 total_fwd = (noise_fwd_psd + signal_psd) * df
                 total_bwd = (noise_bwd_psd + signal_psd) * df
                 all_by_ch[li][model_key]["fwd"] = np.asarray(total_fwd, dtype=np.float64)
