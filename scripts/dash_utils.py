@@ -336,23 +336,26 @@ def _integrate_noise_psd_per_channel(
     return fwd_integrated, bwd_integrated
 
 
-def _compute_noise_pair(
+def _compute_noise_power_pair(
     noise_type: str,
     fiber,
     grid,
     continuous: bool,
-    integrate: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """计算 FWM/SpRS 噪声。
+    """计算 FWM/SpRS 噪声积分功率 (N_q,)。
+
+    连续模型：调用 compute_forward_conti/compute_backward_conti，返回 (N_q,) 积分功率
+    离散模型：调用 compute_forward/compute_backward，返回 (N_q,) 积分功率
 
     Args:
         noise_type: "fwm" | "sprs" | "both"
         fiber: Fiber instance
         grid: WDMGrid
         continuous: 是否为连续模型
-        integrate: 若为 True，对连续 PSD 积分到各量子信道（用于信道扫描，
-                  x 轴为信道频率）；若为 False，返回完整 PSD 数组（用于长度扫描，
-                  x 轴为光纤长度）
+
+    Returns
+    -------
+    (fwd, bwd), each shape (N_q,) — per-channel integrated noise power [W]
     """
     from qkd_sim.physical.noise import DiscreteFWMSolver, DiscreteSPRSSolver
 
@@ -363,12 +366,11 @@ def _compute_noise_pair(
 
     def _call_solver(solver):
         if continuous:
-            psd_f = np.asarray(solver.compute_forward_conti(fiber, grid, _f_grid), dtype=np.float64)
-            psd_b = np.asarray(solver.compute_backward_conti(fiber, grid, _f_grid), dtype=np.float64)
-            if integrate:
-                return _integrate_noise_psd_per_channel(psd_f, psd_b, grid, _f_grid)
-            # 长度扫描：返回 (N_f,) PSD 数组，调用方取 fwd[0]
-            return psd_f, psd_b
+            # compute_forward_conti 返回 (N_q,) 积分功率，不是 (N_f,)
+            return (
+                np.asarray(solver.compute_forward_conti(fiber, grid, _f_grid), dtype=np.float64),
+                np.asarray(solver.compute_backward_conti(fiber, grid, _f_grid), dtype=np.float64),
+            )
         # 离散模型：返回 (N_q,) 积分功率
         return (
             np.asarray(solver.compute_forward(fiber, grid), dtype=np.float64),
@@ -388,6 +390,40 @@ def _compute_noise_pair(
         bwd += b_i
 
     return fwd, bwd
+
+
+def _compute_noise_spectrum_pair(
+    noise_type: str,
+    fiber,
+    grid,
+    f_grid: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """返回完整 (N_f,) PSD 数组，仅适用于连续模型。
+
+    fwm: compute_fwm_spectrum_conti
+    sprs: compute_sprs_spectrum_conti
+    both: 两者逐点相加
+
+    Returns
+    -------
+    (fwd, bwd), each shape (N_f,)
+    """
+    from qkd_sim.physical.noise import DiscreteFWMSolver, DiscreteSPRSSolver
+
+    fwd = np.zeros_like(f_grid, dtype=np.float64)
+    bwd = np.zeros_like(f_grid, dtype=np.float64)
+
+    if noise_type in ("fwm", "both"):
+        solver = DiscreteFWMSolver()
+        fwd += solver.compute_fwm_spectrum_conti(fiber, grid, f_grid, direction="forward")
+        bwd += solver.compute_fwm_spectrum_conti(fiber, grid, f_grid, direction="backward")
+
+    if noise_type in ("sprs", "both"):
+        solver = DiscreteSPRSSolver()
+        fwd += solver.compute_sprs_spectrum_conti(fiber, grid, f_grid, direction="forward")
+        bwd += solver.compute_sprs_spectrum_conti(fiber, grid, f_grid, direction="backward")
+
+    return np.asarray(fwd, dtype=np.float64), np.asarray(bwd, dtype=np.float64)
 
 
 def _compute_nli_pair(fiber, grid) -> tuple[np.ndarray, np.ndarray]:
@@ -459,7 +495,7 @@ def precompute_by_length(
 
                 if noise_type == "with_signal":
                     for q_idx in quantum_indices:
-                        q_fwd, q_bwd = _compute_noise_pair(
+                        q_fwd, q_bwd = _compute_noise_power_pair(
                             "both",
                             fiber,
                             per_q_grids[q_idx],
@@ -501,7 +537,7 @@ def precompute_by_length(
             )
             for li, length_km in enumerate(LENGTHS_KM):
                 fiber = _make_fiber(fiber_params, length_km)
-                fwd, bwd = _compute_noise_pair(
+                fwd, bwd = _compute_noise_power_pair(
                     noise_type,
                     fiber,
                     grid,
@@ -535,7 +571,14 @@ def precompute_by_channel(
     """Precompute noise vs quantum channel frequency for all lengths.
 
     Returns (ALL_BY_CH, VALID_L_INDICES)
-    ALL_BY_CH[L_idx][model_key] = {"fwd": np.array(N_q), "bwd": np.array(N_q)}
+
+    ALL_BY_CH[L_idx][model_key] = {
+        "fwd": np.ndarray,       # (N_f,) for continuous PSD, (N_q,) for discrete channel power
+        "bwd": np.ndarray,
+        "x": np.ndarray,         # noise_f_grid for continuous, channel center freqs for discrete
+        "x_kind": str,           # "frequency_grid" | "channel_center"
+        "y_kind": str,           # "psd" | "channel_power"
+    }
     VALID_L_INDICES: list of L indices with non-zero noise
     """
     model_keys = get_noise_model_keys(noise_type)
@@ -545,8 +588,22 @@ def precompute_by_channel(
     n_ch = int(base_config.end_channel - base_config.start_channel + 1)
 
     if noise_type in ("only_signal", "with_signal"):
+        # x-axis: all channel center frequencies (classical + quantum)
+        all_ch_freqs = np.array(
+            [
+                WDM_PARAMS["start_freq"] + idx * WDM_PARAMS["channel_spacing"]
+                for idx in range(n_ch)
+            ],
+            dtype=np.float64,
+        )
         all_by_ch = {
-            li: {mk: {"fwd": np.zeros(n_ch), "bwd": np.zeros(n_ch)} for mk in model_keys}
+            li: {mk: {
+                "fwd": np.zeros(n_ch),
+                "bwd": np.zeros(n_ch),
+                "x": np.asarray(all_ch_freqs, dtype=np.float64),
+                "x_kind": "channel_center",
+                "y_kind": "channel_power",
+            } for mk in model_keys}
             for li in range(n_l)
         }
         for li, length_km in enumerate(LENGTHS_KM):
@@ -572,7 +629,7 @@ def precompute_by_channel(
                             noise_f_grid,
                             osa_csv_path,
                         )
-                        q_fwd, q_bwd = _compute_noise_pair(
+                        q_fwd, q_bwd = _compute_noise_power_pair(
                             "both",
                             fiber,
                             grid,
@@ -596,31 +653,80 @@ def precompute_by_channel(
         ]
         return all_by_ch, valid_l_indices
 
-    all_by_ch = {
-        li: {mk: {"fwd": np.zeros(n_q), "bwd": np.zeros(n_q)} for mk in model_keys}
-        for li in range(n_l)
-    }
+    # Precompute quantum channel center frequencies for discrete-model x-axis
+    q_center_freqs = np.array(
+        [
+            WDM_PARAMS["start_freq"] + idx * WDM_PARAMS["channel_spacing"]
+            for idx in quantum_indices
+        ],
+        dtype=np.float64,
+    )
+
+    # Initialize all_by_ch with metadata structure
+    all_by_ch: dict = {}
+    for li in range(n_l):
+        all_by_ch[li] = {}
+        for mk in model_keys:
+            all_by_ch[li][mk] = {
+                "fwd": np.array([]),
+                "bwd": np.array([]),
+                "x": np.array([]),
+                "x_kind": "",
+                "y_kind": "",
+            }
+
     for li, length_km in enumerate(LENGTHS_KM):
         fiber = _make_fiber(fiber_params, length_km)
         for model_key in model_keys:
             spec = specs[model_key]
-            for q_local_idx, q_idx in enumerate(quantum_indices):
+
+            if spec["continuous"]:
+                # Continuous model: full PSD spectrum (N_f,) on noise_f_grid
                 grid = _build_model_grid(
                     model_key,
                     spec,
-                    _build_wdm_config([q_idx]),
+                    base_config,  # Use full quantum channel config
                     noise_f_grid,
                     osa_csv_path,
                 )
-                fwd, bwd = _compute_noise_pair(
-                    noise_type,
-                    fiber,
-                    grid,
-                    continuous=bool(spec["continuous"]),
+                fwd, bwd = _compute_noise_spectrum_pair(
+                    noise_type, fiber, grid, noise_f_grid
                 )
-                if len(fwd) > 0:
-                    all_by_ch[li][model_key]["fwd"][q_local_idx] = float(fwd[0])
-                    all_by_ch[li][model_key]["bwd"][q_local_idx] = float(bwd[0])
+                all_by_ch[li][model_key] = {
+                    "fwd": np.asarray(fwd, dtype=np.float64),
+                    "bwd": np.asarray(bwd, dtype=np.float64),
+                    "x": np.asarray(noise_f_grid, dtype=np.float64),
+                    "x_kind": "frequency_grid",
+                    "y_kind": "psd",
+                }
+            else:
+                # Discrete model: per-channel integrated power (N_q,) at channel centers
+                fwd_arr = np.zeros(n_q, dtype=np.float64)
+                bwd_arr = np.zeros(n_q, dtype=np.float64)
+                for q_local_idx, q_idx in enumerate(quantum_indices):
+                    grid = _build_model_grid(
+                        model_key,
+                        spec,
+                        _build_wdm_config([q_idx]),
+                        noise_f_grid,
+                        osa_csv_path,
+                    )
+                    fwd, bwd = _compute_noise_power_pair(
+                        noise_type,
+                        fiber,
+                        grid,
+                        continuous=False,
+                    )
+                    if len(fwd) > 0:
+                        fwd_arr[q_local_idx] = float(fwd[0])
+                        bwd_arr[q_local_idx] = float(bwd[0])
+                all_by_ch[li][model_key] = {
+                    "fwd": np.asarray(fwd_arr, dtype=np.float64),
+                    "bwd": np.asarray(bwd_arr, dtype=np.float64),
+                    "x": np.asarray(q_center_freqs, dtype=np.float64),
+                    "x_kind": "channel_center",
+                    "y_kind": "channel_power",
+                }
 
     valid_l_indices = [
         li

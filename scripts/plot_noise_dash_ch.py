@@ -45,20 +45,47 @@ def _to_dbm(values_w: np.ndarray) -> np.ndarray:
     return out
 
 
-def _global_ranges(all_data: dict, model_keys: list[str]) -> tuple[tuple[float, float], tuple[float, float]]:
+def _to_dbm_per_hz(values_w_hz: np.ndarray) -> np.ndarray:
+    """Convert PSD [W/Hz] to dBm/Hz."""
+    out = np.full_like(values_w_hz, np.nan, dtype=np.float64)
+    mask = values_w_hz > 0
+    out[mask] = 10.0 * np.log10(values_w_hz[mask] / 1e-3)
+    return out
+
+
+def _global_ranges(all_data: dict, model_keys: list[str]) -> tuple[tuple[float, float], tuple[float, float], bool]:
+    """Compute y-axis ranges for the plot.
+
+    Returns (y_log, y_dbm, is_psd) where is_psd indicates if we're plotting PSD vs channel power.
+    For PSD (W/Hz), dBm conversion uses 10*log10 instead of dBm formula.
+    """
     positives: list[float] = []
+    y_kind_set = set()
     for curve_data in all_data.values():
         for model_key in model_keys:
-            positives.extend(curve_data[model_key]["fwd"][curve_data[model_key]["fwd"] > 0].tolist())
-            positives.extend(curve_data[model_key]["bwd"][curve_data[model_key]["bwd"] > 0].tolist())
+            entry = curve_data.get(model_key, {})
+            y_kind = entry.get("y_kind", "channel_power")
+            y_kind_set.add(y_kind)
+            fwd = np.asarray(entry.get("fwd", []), dtype=np.float64)
+            bwd = np.asarray(entry.get("bwd", []), dtype=np.float64)
+            positives.extend(fwd[fwd > 0].tolist())
+            positives.extend(bwd[bwd > 0].tolist())
     if not positives:
-        return (-18.0, -3.0), (-150.0, -30.0)
+        return (-18.0, -3.0), (-150.0, -30.0), False
 
     positives_arr = np.asarray(positives, dtype=np.float64)
     y_log = (float(np.log10(positives_arr.min()) - 0.3), float(np.log10(positives_arr.max()) + 0.3))
-    dbm = _to_dbm(positives_arr)
-    y_lin = (float(np.nanmin(dbm) - 3.0), float(np.nanmax(dbm) + 3.0))
-    return y_log, y_lin
+
+    is_psd = "psd" in y_kind_set
+    if is_psd:
+        # For PSD [W/Hz], convert to dBm/Hz: 10*log10(W/Hz) -> dBm/Hz
+        dbm_vals = _to_dbm_per_hz(positives_arr)
+        y_lin = (float(np.nanmin(dbm_vals) - 3.0), float(np.nanmax(dbm_vals) + 3.0))
+    else:
+        dbm = _to_dbm(positives_arr)
+        y_lin = (float(np.nanmin(dbm) - 3.0), float(np.nanmax(dbm) + 3.0))
+
+    return y_log, y_lin, is_psd
 
 
 parser = argparse.ArgumentParser()
@@ -93,20 +120,23 @@ ALL_BY_CH, VALID_L_INDICES = precompute_by_channel(
 if not VALID_L_INDICES:
     raise RuntimeError(f"No valid lengths found for noise type {NOISE_TYPE!r}")
 
-Y_LOG_RANGE, Y_DBM_RANGE = _global_ranges(ALL_BY_CH, model_keys)
+Y_LOG_RANGE, Y_DBM_RANGE, IS_PSD = _global_ranges(ALL_BY_CH, model_keys)
 elapsed = time.time() - t0
 print(f"Precompute done in {elapsed:.1f}s. Valid selections: {len(VALID_L_INDICES)}")
 
+# Diagnostic: verify continuous vs discrete model data shapes
+l_diag = VALID_L_INDICES[0]
+print(f"\n--- Diagnostic: noise_f_grid shape = {noise_f_grid.shape} ---")
+for mk in model_keys:
+    entry = ALL_BY_CH[l_diag].get(mk, {})
+    x = np.asarray(entry.get("x", []), dtype=np.float64)
+    fwd = np.asarray(entry.get("fwd", []), dtype=np.float64)
+    x_kind = entry.get("x_kind", "N/A")
+    y_kind = entry.get("y_kind", "N/A")
+    print(f"  {mk}: x.shape={x.shape}, fwd.shape={fwd.shape}, x_kind={x_kind}, y_kind={y_kind}")
+
 app = Dash(__name__)
 app.index_string = app.index_string.replace("</body>", "<script>" + _LEGEND_SYNC_JS + "</script></body>")
-
-all_channel_indices = list(range(int(WDM_PARAMS["end_channel"] - WDM_PARAMS["start_channel"] + 1)))
-if NOISE_TYPE in ("only_signal", "with_signal"):
-    x_indices = all_channel_indices
-else:
-    x_indices = base_quantum_indices
-
-x_freq_thz = np.array([WDM_PARAMS["start_freq"] + idx * WDM_PARAMS["channel_spacing"] for idx in x_indices], dtype=np.float64) / 1e12
 
 step = max(1, len(VALID_L_INDICES) // 10)
 slider_marks = {
@@ -157,62 +187,116 @@ def update_display(selection_idx: int) -> str:
 def update_graph(selection_idx: int) -> go.Figure:
     l_idx = VALID_L_INDICES[selection_idx]
     sweep = ALL_BY_CH[l_idx]
-    fig = make_subplots(
-        rows=1,
-        cols=2,
-        subplot_titles=("Noise Power [W]", "Noise Power [dBm]"),
+
+    # Determine subplot titles and y-axis based on data kinds present
+    y_kinds_present = set()
+    for model_key in model_keys:
+        entry = sweep.get(model_key, {})
+        if entry:
+            y_kinds_present.add(entry.get("y_kind", "channel_power"))
+
+    is_psd_plot = "psd" in y_kinds_present
+    subplot_titles = (
+        ("Noise PSD [W/Hz]", "Noise PSD [dBm/Hz]") if is_psd_plot
+        else ("Noise Power [W]", "Noise Power [dBm]")
     )
 
+    fig = make_subplots(rows=1, cols=2, subplot_titles=subplot_titles)
+
+    x_kind: str = "channel_center"  # default, updated inside loop if entries exist
     for model_key in model_keys:
         spec = specs[model_key]
+        entry = sweep.get(model_key, {})
+        if not entry or entry.get("fwd") is None or len(entry.get("fwd", [])) == 0:
+            continue
+
+        y_kind = entry.get("y_kind", "channel_power")
+        x_kind = entry.get("x_kind", "channel_center")
+        x_data = np.asarray(entry.get("x", []), dtype=np.float64)
+
+        # Convert x to THz for display
+        x_thz = x_data / 1e12
+
         for direction, dash_style in (("fwd", "solid"), ("bwd", "dot")):
-            arr_w = np.asarray(sweep[model_key][direction], dtype=np.float64)
-            mask = arr_w > 0
-            if not np.any(mask):
-                continue
+            arr_w = np.asarray(entry.get(direction, []), dtype=np.float64)
 
             name = f"{spec['label']} ({direction})"
             legendgroup = f"{model_key}-{direction}"
-            hover_w = "f=%{x:.4f} THz<br>P=%{y:.3e} W<extra>" + name + "</extra>"
-            hover_dbm = "f=%{x:.4f} THz<br>P=%{y:.2f} dBm<extra>" + name + "</extra>"
+
+            # Style based on y_kind
+            if y_kind == "psd":
+                # Continuous PSD: plot ALL frequency points.
+                # Zero-noise points are floored to 1e-20 so the line is continuous
+                # across the full band on a log y-axis (zeros would become -inf).
+                mode = "lines"
+                line_cfg = dict(color=spec["color"], width=2.0, dash=dash_style)
+                marker_cfg = None
+                x_plot = x_thz
+                y_plot = np.where(arr_w > 0, arr_w, 1e-20)
+                y_db = _to_dbm_per_hz(np.where(arr_w > 0, arr_w, 1e-20))
+                hover_w = "f=%{x:.4f} THz<br>PSD=%{y:.3e} W/Hz<extra>" + name + "</extra>"
+                hover_db = "f=%{x:.4f} THz<br>PSD=%{y:.2f} dBm/Hz<extra>" + name + "</extra>"
+            else:
+                # Discrete channel power: markers only, no connecting lines.
+                # connectgaps=False ensures no line is drawn between sparse
+                # non-adjacent channel-center points.
+                mask = arr_w > 0
+                if not np.any(mask):
+                    continue
+                mode = "markers"
+                line_cfg = None
+                marker_cfg = dict(size=6, color=spec["color"])
+                x_plot = x_thz[mask]
+                y_plot = arr_w[mask]
+                y_db = _to_dbm(arr_w[mask])
+                hover_w = "f=%{x:.4f} THz<br>P=%{y:.3e} W<extra>" + name + "</extra>"
+                hover_db = "f=%{x:.4f} THz<br>P=%{y:.2f} dBm<extra>" + name + "</extra>"
 
             fig.add_trace(
                 go.Scatter(
-                    x=x_freq_thz[mask],
-                    y=arr_w[mask],
-                    mode="lines+markers",
-                    line=dict(color=spec["color"], width=2.0, dash=dash_style),
-                    marker=dict(size=6, color=spec["color"]),
+                    x=x_plot,
+                    y=y_plot,
+                    mode=mode,
+                    line=line_cfg,
+                    marker=marker_cfg,
+                    connectgaps=False,
                     name=name,
                     legendgroup=legendgroup,
                     showlegend=True,
                     hovertemplate=hover_w,
-                    text=[_display_channel_label(x_indices[idx]) for idx in np.where(mask)[0]],
                 ),
                 row=1,
                 col=1,
             )
+
             fig.add_trace(
                 go.Scatter(
-                    x=x_freq_thz[mask],
-                    y=_to_dbm(arr_w[mask]),
-                    mode="lines+markers",
-                    line=dict(color=spec["color"], width=2.0, dash=dash_style),
-                    marker=dict(size=6, color=spec["color"]),
+                    x=x_plot,
+                    y=y_db,
+                    mode=mode,
+                    line=line_cfg,
+                    marker=marker_cfg,
+                    connectgaps=False,
                     name=name,
                     legendgroup=legendgroup,
                     showlegend=False,
-                    hovertemplate=hover_dbm,
-                    text=[_display_channel_label(x_indices[idx]) for idx in np.where(mask)[0]],
+                    hovertemplate=hover_db,
                 ),
                 row=1,
                 col=2,
             )
 
-    fig.update_xaxes(title_text="Channel Frequency [THz]", row=1, col=1)
-    fig.update_xaxes(title_text="Channel Frequency [THz]", row=1, col=2)
+    # X-axis label (depends on x_kind)
+    xaxis_title = "Frequency [THz]" if x_kind == "frequency_grid" else "Channel Frequency [THz]"
+
+    fig.update_xaxes(title_text=xaxis_title, row=1, col=1)
+    fig.update_xaxes(title_text=xaxis_title, row=1, col=2)
+
+    y_left_title = "PSD [W/Hz]" if is_psd_plot else "Power [W]"
+    y_right_title = "PSD [dBm/Hz]" if is_psd_plot else "Power [dBm]"
+
     fig.update_yaxes(
-        title_text="Power [W]",
+        title_text=y_left_title,
         type="log",
         range=list(Y_LOG_RANGE),
         showgrid=True,
@@ -221,7 +305,7 @@ def update_graph(selection_idx: int) -> go.Figure:
         **adaptive_log_ticks(*Y_LOG_RANGE),
     )
     fig.update_yaxes(
-        title_text="Power [dBm]",
+        title_text=y_right_title,
         type="linear",
         range=list(Y_DBM_RANGE),
         showgrid=True,
