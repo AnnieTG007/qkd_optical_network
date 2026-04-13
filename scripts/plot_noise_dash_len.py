@@ -11,7 +11,7 @@ import sys
 import time
 
 import dash
-from dash import Dash, Input, Output, dcc, html
+from dash import Dash, Input, Output, State, dcc, html
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -37,7 +37,7 @@ from scripts.dash_utils import (
     adaptive_log_ticks,
     get_noise_model_keys,
     precompute_by_length,
-    base_quantum_indices,  # 全局量子信道索引映射
+    set_power_override,
 )
 
 
@@ -74,16 +74,18 @@ print(f"Precomputing length sweep for type={NOISE_TYPE}")
 t0 = time.time()
 
 osa_csv_path = _resolve_osa_csv()
-base_quantum_indices = [
+base_quantum_indices_list = [
     i
     for i in range(int(WDM_PARAMS["end_channel"] - WDM_PARAMS["start_channel"] + 1))
     if i not in CLASSICAL_INDICES
 ]
-base_config = _build_wdm_config(base_quantum_indices)
+base_config = _build_wdm_config(base_quantum_indices_list)
 noise_f_grid = _build_noise_frequency_grid(base_config)
 specs = load_model_specs("fwm_noise")
 model_keys = get_noise_model_keys(NOISE_TYPE)
 
+# Initial precompute at default power (0 dBm)
+set_power_override(0.0)
 ALL_BY_LEN, VALID_INDICES = precompute_by_length(
     noise_type=NOISE_TYPE,
     specs=specs,
@@ -105,12 +107,12 @@ app.index_string = app.index_string.replace("</body>", "<script>" + _LEGEND_SYNC
 
 step = max(1, len(VALID_INDICES) // 10)
 slider_marks = {
-    i: {"label": _display_channel_label(base_quantum_indices[VALID_INDICES[i]]), "style": {"font-size": "9px"}}
+    i: {"label": _display_channel_label(base_quantum_indices_list[VALID_INDICES[i]]), "style": {"font-size": "9px"}}
     for i in range(0, len(VALID_INDICES), step)
 }
 if (len(VALID_INDICES) - 1) not in slider_marks:
     last = len(VALID_INDICES) - 1
-    slider_marks[last] = {"label": _display_channel_label(base_quantum_indices[VALID_INDICES[last]]), "style": {"font-size": "9px"}}
+    slider_marks[last] = {"label": _display_channel_label(base_quantum_indices_list[VALID_INDICES[last]]), "style": {"font-size": "9px"}}
 
 app.layout = html.Div(
     [
@@ -130,6 +132,21 @@ app.layout = html.Div(
             style=dict(width="92%", padding="10px 0"),
         ),
         html.Div(id="channel-display", style=dict(fontFamily="Courier New", fontSize="13px", padding="4px 0 10px 0")),
+        html.Div(
+            [
+                html.Label("Classical Channel Power [dBm]"),
+                dcc.Slider(
+                    id="power-slider",
+                    min=-15,
+                    max=15,
+                    step=0.5,
+                    value=0,
+                    marks={-15: "-15", -10: "-10", -5: "-5", 0: "0", 5: "5", 10: "10", 15: "15"},
+                ),
+            ],
+            style=dict(width="92%", padding="10px 0"),
+        ),
+        html.Div(id="power-display", style=dict(fontFamily="Courier New", fontSize="13px", padding="4px 0 10px 0")),
         dcc.Graph(id="length-graph"),
     ],
     style=dict(fontFamily="Arial", padding="20px"),
@@ -142,19 +159,51 @@ app.layout = html.Div(
 )
 def update_display(selection_idx: int) -> str:
     q_local = VALID_INDICES[selection_idx]
-    ch_idx = base_quantum_indices[q_local]  # 全局信道索引用于显示
+    ch_idx = base_quantum_indices_list[q_local]  # 全局信道索引用于显示
     freq_hz = WDM_PARAMS["start_freq"] + ch_idx * WDM_PARAMS["channel_spacing"]
     wl_nm = 299792458.0 / freq_hz * 1e9
     return f"Selected: {_display_channel_label(ch_idx)} | f = {freq_hz / 1e12:.4f} THz | lambda ~ {wl_nm:.2f} nm"
 
 
 @app.callback(
+    Output("power-display", "children"),
     Output("length-graph", "figure"),
-    Input("channel-slider", "value"),
+    Input("power-slider", "value"),
+    State("channel-slider", "value"),
+    prevent_initial_call=False,
 )
-def update_graph(selection_idx: int) -> go.Figure:
-    ch_idx = VALID_INDICES[selection_idx]
-    sweep = ALL_BY_LEN[ch_idx]
+def update_power_and_graph(power_dbm: float, channel_selection_idx: int) -> tuple[str, go.Figure]:
+    # Apply power override and recompute
+    set_power_override(power_dbm)
+    all_by_len, valid_indices = precompute_by_length(
+        noise_type=NOISE_TYPE,
+        specs=specs,
+        LENGTHS_KM=LENGTHS_KM,
+        base_config=base_config,
+        noise_f_grid=noise_f_grid,
+        osa_csv_path=osa_csv_path,
+        fiber_params=FIBER_PARAMS,
+    )
+    global Y_LOG_RANGE, Y_DBM_RANGE
+    Y_LOG_RANGE, Y_DBM_RANGE = _global_ranges(all_by_len, model_keys)
+    ch_idx = valid_indices[channel_selection_idx]
+    fig = _make_figure(all_by_len[ch_idx], ch_idx)
+    return f"Classical power: {power_dbm:.1f} dBm (recomputed)", fig
+
+
+@app.callback(
+    Output("length-graph", "figure", allow_duplicate=True),
+    Input("channel-slider", "value"),
+    State("power-slider", "value"),
+    prevent_initial_call=True,
+)
+def update_graph_on_channel(channel_selection_idx: int, power_dbm: float) -> go.Figure:
+    ch_idx = VALID_INDICES[channel_selection_idx]
+    fig = _make_figure(ALL_BY_LEN[ch_idx], ch_idx)
+    return fig
+
+
+def _make_figure(sweep: dict, ch_idx: int) -> go.Figure:
     fig = make_subplots(
         rows=1,
         cols=2,

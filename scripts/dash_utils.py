@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
@@ -49,6 +50,26 @@ FIBER_PARAMS = dict(
     rayleigh_coeff=4.8e-8,
     T_kelvin=300.0,
 )
+
+# --- Power override for classical channel launch power ---
+_POWER_OVERRIDE_DBM: Optional[float] = None
+
+
+def set_power_override(dbm: Optional[float]) -> None:
+    """Override P0 (classical channel launch power in dBm).
+
+    Set to None to revert to YAML-configured default.
+    """
+    global _POWER_OVERRIDE_DBM
+    _POWER_OVERRIDE_DBM = dbm
+
+
+def _get_P0() -> float:
+    """Return effective P0 in linear Watts."""
+    if _POWER_OVERRIDE_DBM is not None:
+        return 1e-3 * 10 ** (_POWER_OVERRIDE_DBM / 10.0)
+    return WDM_PARAMS["P0"]
+
 
 _LEGEND_SYNC_JS = """
 (function() {
@@ -182,7 +203,7 @@ def _build_noise_frequency_grid(config: WDMConfig) -> np.ndarray:
 
 
 def _build_wdm_config(quantum_indices: list[int]) -> WDMConfig:
-    return WDMConfig(**WDM_PARAMS, quantum_channel_indices=list(quantum_indices))
+    return WDMConfig(**WDM_PARAMS, quantum_channel_indices=list(quantum_indices), P0=_get_P0())
 
 
 def _build_model_grid(
@@ -202,7 +223,7 @@ def _build_model_grid(
             end_channel=base_config.end_channel,
             channel_spacing=base_config.channel_spacing,
             B_s=base_config.B_s,
-            P0=base_config.P0,
+            P0=_get_P0(),
             beta_rolloff=spec["beta_rolloff"],
             quantum_channel_indices=base_config.quantum_channel_indices,
         )
@@ -265,7 +286,7 @@ def _build_all_classical_grid(
         end_channel=base_config.end_channel,
         channel_spacing=base_config.channel_spacing,
         B_s=base_config.B_s,
-        P0=base_config.P0,
+        P0=_get_P0(),
         beta_rolloff=base_config.beta_rolloff if spec["beta_rolloff"] is None else spec["beta_rolloff"],
         quantum_channel_indices=[],
     )

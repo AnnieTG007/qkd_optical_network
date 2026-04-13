@@ -10,7 +10,7 @@ from pathlib import Path
 import sys
 import time
 
-from dash import Dash, Input, Output, dcc, html
+from dash import Dash, Input, Output, State, dcc, html
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -36,6 +36,7 @@ from scripts.dash_utils import (
     adaptive_log_ticks,
     get_noise_model_keys,
     precompute_by_channel,
+    set_power_override,
 )
 
 
@@ -90,6 +91,8 @@ noise_f_grid = _build_noise_frequency_grid(base_config)
 specs = load_model_specs("fwm_noise")
 model_keys = get_noise_model_keys(NOISE_TYPE)
 
+# Initial precompute at default power (0 dBm)
+set_power_override(0.0)
 ALL_BY_CH, VALID_L_INDICES = precompute_by_channel(
     noise_type=NOISE_TYPE,
     specs=specs,
@@ -147,6 +150,21 @@ app.layout = html.Div(
             style=dict(width="92%", padding="10px 0"),
         ),
         html.Div(id="length-display", style=dict(fontFamily="Courier New", fontSize="13px", padding="4px 0 10px 0")),
+        html.Div(
+            [
+                html.Label("Classical Channel Power [dBm]"),
+                dcc.Slider(
+                    id="power-slider",
+                    min=-15,
+                    max=15,
+                    step=0.5,
+                    value=0,
+                    marks={-15: "-15", -10: "-10", -5: "-5", 0: "0", 5: "5", 10: "10", 15: "15"},
+                ),
+            ],
+            style=dict(width="92%", padding="10px 0"),
+        ),
+        html.Div(id="power-display", style=dict(fontFamily="Courier New", fontSize="13px", padding="4px 0 10px 0")),
         dcc.Graph(id="channel-graph"),
     ],
     style=dict(fontFamily="Arial", padding="20px"),
@@ -163,13 +181,44 @@ def update_display(selection_idx: int) -> str:
 
 
 @app.callback(
+    Output("power-display", "children"),
     Output("channel-graph", "figure"),
-    Input("length-slider", "value"),
+    Input("power-slider", "value"),
+    State("length-slider", "value"),
+    prevent_initial_call=False,
 )
-def update_graph(selection_idx: int) -> go.Figure:
-    l_idx = VALID_L_INDICES[selection_idx]
-    sweep = ALL_BY_CH[l_idx]
+def update_power_and_graph(power_dbm: float, length_selection_idx: int) -> tuple[str, go.Figure]:
+    # Apply power override and recompute
+    set_power_override(power_dbm)
+    all_by_ch, valid_l_indices = precompute_by_channel(
+        noise_type=NOISE_TYPE,
+        specs=specs,
+        LENGTHS_KM=LENGTHS_KM,
+        base_config=base_config,
+        noise_f_grid=noise_f_grid,
+        osa_csv_path=osa_csv_path,
+        fiber_params=FIBER_PARAMS,
+    )
+    global Y_LOG_RANGE, Y_DBM_RANGE
+    Y_LOG_RANGE, Y_DBM_RANGE = _global_ranges(all_by_ch, model_keys)
+    l_idx = valid_l_indices[length_selection_idx]
+    fig = _make_figure(all_by_ch[l_idx], l_idx)
+    return f"Classical power: {power_dbm:.1f} dBm (recomputed)", fig
 
+
+@app.callback(
+    Output("channel-graph", "figure", allow_duplicate=True),
+    Input("length-slider", "value"),
+    State("power-slider", "value"),
+    prevent_initial_call=True,
+)
+def update_graph_on_length(length_selection_idx: int, power_dbm: float) -> go.Figure:
+    l_idx = VALID_L_INDICES[length_selection_idx]
+    fig = _make_figure(ALL_BY_CH[l_idx], l_idx)
+    return fig
+
+
+def _make_figure(sweep: dict, l_idx: int) -> go.Figure:
     fig = make_subplots(
         rows=1, cols=2,
         subplot_titles=("Noise Power [W]", "Noise Power [dBm]"),
@@ -191,7 +240,7 @@ def update_graph(selection_idx: int) -> go.Figure:
             legendgroup = f"{model_key}-{direction}"
 
             if spec["continuous"] or NOISE_TYPE == "with_signal":
-                # Continuous model or with_signal: lines on full f_grid, hide values below the noise floor
+                # Continuous model or with_signal: lines on full f_grid
                 mode = "lines"
                 line_cfg = dict(color=spec["color"], width=2.0, dash=dash_style)
                 marker_cfg = None
@@ -201,7 +250,7 @@ def update_graph(selection_idx: int) -> go.Figure:
                 hover_w = "f=%{x:.4f} THz<br>P=%{y:.3e} W<extra>" + name + "</extra>"
                 hover_db = "f=%{x:.4f} THz<br>P=%{y:.2f} dBm<extra>" + name + "</extra>"
             else:
-                # Discrete model: markers only at channel centers, no connecting lines
+                # Discrete model: markers only at channel centers
                 mask = arr_w >= NOISE_FLOOR_W
                 if not np.any(mask):
                     continue
