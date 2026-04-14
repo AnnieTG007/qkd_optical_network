@@ -89,6 +89,14 @@ base_quantum_indices = [
     for i in range(int(WDM_PARAMS["end_channel"] - WDM_PARAMS["start_channel"] + 1))
     if i not in CLASSICAL_INDICES
 ]
+# Quantum channel center frequencies for discrete model x-axis
+quantum_center_freqs = np.array(
+    [
+        WDM_PARAMS["start_freq"] + idx * WDM_PARAMS["channel_spacing"]
+        for idx in base_quantum_indices
+    ],
+    dtype=np.float64,
+)
 base_config = _build_wdm_config(base_quantum_indices)
 noise_f_grid = _build_noise_frequency_grid(base_config)
 specs = load_model_specs("fwm_noise")
@@ -195,13 +203,17 @@ def update_power_and_graph(power_dbm: float, length_selection_idx: int) -> tuple
     set_power_override(power_dbm)
     cached, loaded_power = _load_cached_power(NOISE_TYPE, model_keys, index_prefix="ch")
     if cached is not None:
-        # Load x metadata from current noise_f_grid
-        n_f = len(noise_f_grid)
+        # Restore x metadata by model type: continuous uses noise_f_grid, discrete uses channel centers
         for li in cached:
             for mk in cached[li]:
-                cached[li][mk]["x"] = np.asarray(noise_f_grid, dtype=np.float64)
-                cached[li][mk]["x_kind"] = "frequency_grid"
-                cached[li][mk]["y_kind"] = "power_per_bin"
+                if specs[mk]["continuous"] or NOISE_TYPE == "with_signal":
+                    cached[li][mk]["x"] = np.asarray(noise_f_grid, dtype=np.float64)
+                    cached[li][mk]["x_kind"] = "frequency_grid"
+                    cached[li][mk]["y_kind"] = "power_per_bin"
+                else:
+                    cached[li][mk]["x"] = np.asarray(quantum_center_freqs, dtype=np.float64)
+                    cached[li][mk]["x_kind"] = "channel_center"
+                    cached[li][mk]["y_kind"] = "channel_power"
         all_by_ch = cached
         valid_l_indices = [
             li for li in range(len(LENGTHS_KM))
