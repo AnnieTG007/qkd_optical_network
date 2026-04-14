@@ -39,7 +39,7 @@ def _load_wdm_params() -> dict:
 
 
 WDM_PARAMS = _load_wdm_params()
-CLASSICAL_INDICES = [38, 39, 40]
+CLASSICAL_INDICES = [29, 30, 31, 32, 34]
 NOISE_GRID_RESOLUTION_HZ = 5e9
 NOISE_FLOOR_W = 1e-23
 FREQ_GRID_PADDING_FACTOR = 1.5
@@ -105,199 +105,15 @@ FIBER_PARAMS = dict(
     T_kelvin=300.0,
 )
 
-# --- Multiprocessing for precomputation (disabled on Windows due to spawn path issues) ---
+# --- Multiprocessing for precomputation ---
+# Disabled on Windows (nt): spawn re-imports __main__ and hits module-level precompute call.
+# Enable via QKD_DASH_MP=1 env var on non-Windows systems for MP speedup.
 _MP_ENABLED = os.environ.get("QKD_DASH_MP", "1") != "0" and os.name != "nt"
 
 
 def _get_mp_workers() -> int:
     """Number of worker processes for precomputation."""
     return max(1, os.cpu_count() or 1)
-
-
-def _mp_worker_single_length(
-    li: int,
-    length_km: float,
-    noise_type: str,
-    model_keys: list[str],
-    specs: dict,
-    wdm_cfg: dict,
-    noise_f_grid: np.ndarray,
-    fiber_params: dict,
-    classical_indices: list[int],
-    n_f: int,
-    power_override_dbm: float | None,
-) -> tuple[int, list[dict]]:
-    """Worker: one length × all models. Runs in subprocess via ProcessPoolExecutor.
-
-    Re-imports all modules inside worker for Windows compatibility (spawn start method).
-    Returns (li, list of result dicts for each model_key in model_keys order).
-    """
-    import numpy as np
-    from qkd_sim.config.schema import WDMConfig
-    from qkd_sim.physical.fiber import Fiber
-    from qkd_sim.physical.signal import build_wdm_grid, SpectrumType
-    from qkd_sim.physical.noise import DiscreteFWMSolver, DiscreteSPRSSolver
-
-    def _make_fiber(fp: dict, L_km: float) -> Fiber:
-        return Fiber(
-            length=L_km * 1e3,
-            alpha=fp["alpha_dB_per_km"],
-            gamma=fp["gamma_per_W_km"],
-            D_c=fp["D_c"],
-            D_slope=fp["D_slope"],
-            rayleigh_coeff=fp["rayleigh_coeff"],
-            T_kelvin=fp["T_kelvin"],
-        )
-
-    def _P0(p_dbm: float | None) -> float:
-        p = 1e-3  # 0 dBm default
-        if p_dbm is not None:
-            p = 1e-3 * (10 ** (p_dbm / 10))
-        return p
-
-    def _noise_pair(nt: str, fib: Fiber, grd, fgr: np.ndarray):
-        fwd = np.zeros_like(fgr, dtype=np.float64)
-        bwd = np.zeros_like(fgr, dtype=np.float64)
-        if nt in ("fwm", "both"):
-            slv = DiscreteFWMSolver()
-            fwd += slv.compute_fwm_spectrum_conti(fib, grd, fgr, direction="forward")
-            bwd += slv.compute_fwm_spectrum_conti(fib, grd, fgr, direction="backward")
-        if nt in ("sprs", "both"):
-            slv = DiscreteSPRSSolver()
-            df = float(np.mean(np.diff(fgr)))
-            fwd += slv.compute_sprs_spectrum_conti(fib, grd, fgr, direction="forward") / df
-            bwd += slv.compute_sprs_spectrum_conti(fib, grd, fgr, direction="backward") / df
-        return np.asarray(fwd, dtype=np.float64), np.asarray(bwd, dtype=np.float64)
-
-    cfg = WDMConfig(**wdm_cfg)
-    p0 = _P0(power_override_dbm)
-    classical_set = set(classical_indices)
-    df = float(np.mean(np.diff(noise_f_grid)))
-
-    results: list[dict] = []
-
-    if noise_type == "with_signal":
-        # Noise grid: real quantum/classical split
-        noise_cfg = WDMConfig(
-            start_freq=cfg.start_freq,
-            start_channel=cfg.start_channel,
-            end_channel=cfg.end_channel,
-            channel_spacing=cfg.channel_spacing,
-            B_s=cfg.B_s,
-            P0=p0,
-            beta_rolloff=0.0,
-            quantum_channel_indices=list(cfg.quantum_channel_indices),
-            num_channels=int(cfg.num_channels),
-        )
-        grid_noise = build_wdm_grid(
-            config=noise_cfg,
-            spectrum_type=SpectrumType.RAISED_COSINE,
-            f_grid=noise_f_grid,
-            classical_channel_indices=classical_indices,
-        )
-        fiber = _make_fiber(fiber_params, length_km)
-        n_fwd, n_bwd = _noise_pair("both", fiber, grid_noise, noise_f_grid)
-        for mk in model_keys:
-            sp = specs[mk]
-            sig_psd = np.zeros(n_f, dtype=np.float64)
-            for idx, ch in enumerate(grid_noise.channels):
-                if idx in classical_set:
-                    sig_psd += ch.get_psd(noise_f_grid)
-            fwd = (n_fwd + sig_psd) * df
-            bwd = (n_bwd + sig_psd) * df
-            results.append({"fwd": fwd, "bwd": bwd})
-
-    elif noise_type == "only_signal":
-        # All-classical grid for NLI computation
-        all_idx = list(range(int(cfg.num_channels)))
-        allclassical_cfg = WDMConfig(
-            start_freq=cfg.start_freq,
-            start_channel=cfg.start_channel,
-            end_channel=cfg.end_channel,
-            channel_spacing=cfg.channel_spacing,
-            B_s=cfg.B_s,
-            P0=p0,
-            beta_rolloff=0.0,
-            quantum_channel_indices=[],
-            num_channels=int(cfg.num_channels),
-        )
-        grid_all = build_wdm_grid(
-            config=allclassical_cfg,
-            spectrum_type=SpectrumType.RAISED_COSINE,
-            f_grid=noise_f_grid,
-            classical_channel_indices=all_idx,
-        )
-        fiber = _make_fiber(fiber_params, length_km)
-        # Compute NLI using GN model (approximation: use FWM solver for NLI)
-        nli_fwd, nli_bwd = _noise_pair("fwm", fiber, grid_all, noise_f_grid)
-        for mk in model_keys:
-            sp = specs[mk]
-            sig_psd = np.zeros(n_f, dtype=np.float64)
-            for idx, ch in enumerate(grid_all.channels):
-                if idx in classical_set:
-                    sig_psd += ch.get_psd(noise_f_grid)
-            fwd = (nli_fwd + sig_psd) * df
-            bwd = (nli_bwd + sig_psd) * df
-            results.append({"fwd": fwd, "bwd": bwd})
-
-    else:
-        # fwm / sprs / both
-        fiber = _make_fiber(fiber_params, length_km)
-        for mk in model_keys:
-            sp = specs[mk]
-            if sp["continuous"]:
-                mc = WDMConfig(
-                    start_freq=cfg.start_freq,
-                    start_channel=cfg.start_channel,
-                    end_channel=cfg.end_channel,
-                    channel_spacing=cfg.channel_spacing,
-                    B_s=cfg.B_s,
-                    P0=p0,
-                    beta_rolloff=sp["beta_rolloff"] if sp["beta_rolloff"] is not None else 0.0,
-                    quantum_channel_indices=list(cfg.quantum_channel_indices),
-                    num_channels=int(cfg.num_channels),
-                )
-                grid = build_wdm_grid(
-                    config=mc,
-                    spectrum_type=sp["spectrum_type"],
-                    f_grid=noise_f_grid,
-                    classical_channel_indices=classical_indices,
-                )
-                fwd, bwd = _noise_pair(noise_type, fiber, grid, noise_f_grid)
-                fwd = fwd * df
-                bwd = bwd * df
-            else:
-                # Discrete: per quantum channel
-                n_q = len(cfg.quantum_channel_indices)
-                fwd_arr = np.zeros(n_q, dtype=np.float64)
-                bwd_arr = np.zeros(n_q, dtype=np.float64)
-                for qi, q_idx in enumerate(cfg.quantum_channel_indices):
-                    qc = WDMConfig(
-                        start_freq=cfg.start_freq,
-                        start_channel=cfg.start_channel,
-                        end_channel=cfg.end_channel,
-                        channel_spacing=cfg.channel_spacing,
-                        B_s=cfg.B_s,
-                        P0=p0,
-                        beta_rolloff=0.0,
-                        quantum_channel_indices=[q_idx],
-                        num_channels=int(cfg.num_channels),
-                    )
-                    grid = build_wdm_grid(
-                        config=qc,
-                        spectrum_type=sp["spectrum_type"],
-                        f_grid=noise_f_grid,
-                        classical_channel_indices=classical_indices,
-                    )
-                    fwd, bwd = _noise_pair(noise_type, fiber, grid, noise_f_grid)
-                    if len(fwd) > 0:
-                        fwd_arr[qi] = float(fwd[0])
-                        bwd_arr[qi] = float(bwd[0])
-                fwd = fwd_arr
-                bwd = bwd_arr
-            results.append({"fwd": fwd, "bwd": bwd})
-
-    return li, results
 
 
 # --- Power override for classical channel launch power ---
@@ -318,6 +134,110 @@ def _get_P0() -> float:
     if _POWER_OVERRIDE_DBM is not None:
         return 1e-3 * 10 ** (_POWER_OVERRIDE_DBM / 10.0)
     return WDM_PARAMS["P0"]
+
+
+# --- Power-based CSV caching for instant slider response ---
+_PRECOMPUTED_DIR = _PROJECT_ROOT / "data" / "precomputed"
+_POWER_CACHE: dict[float, dict] = {}  # power_dbm -> precomputed result dict
+
+
+def _power_csv_path(noise_type: str, model_key: str, direction: str, power_dbm: float, index_prefix: str = "ch") -> Path:
+    """CSV path for a specific (noise_type, model, direction, power, index_prefix) combination."""
+    return _PRECOMPUTED_DIR / f"{index_prefix}_{noise_type}_{model_key}_{direction}_p{int(power_dbm):+d}.csv"
+
+
+def _save_power_csv(data: np.ndarray, filepath: Path) -> None:
+    """Save 2D power array to CSV (rows = outer index, cols = inner index)."""
+    import csv
+
+    _PRECOMPUTED_DIR.mkdir(parents=True, exist_ok=True)
+    with open(filepath, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        for row in data:
+            writer.writerow([f"{v:.6e}" for v in row])
+
+
+def _load_power_csv(filepath: Path) -> np.ndarray:
+    """Load 2D power array from CSV."""
+    import csv
+
+    rows = []
+    with open(filepath, encoding="utf-8") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            rows.append([float(x) for x in row])
+    return np.array(rows, dtype=np.float64)
+
+
+def _cache_precomputed_result(
+    all_by_idx: dict, power_dbm: float, noise_type: str, model_keys: list[str], index_prefix: str = "ch"
+) -> None:
+    """Save precomputed result to CSV for each (model, direction) at given power.
+
+    index_prefix: "ch" for precompute_by_channel (rows = length indices), "len" for precompute_by_length (rows = channel indices).
+    """
+    if not all_by_idx:
+        return
+    first_key = min(all_by_idx.keys())
+
+    for mk in model_keys:
+        ref_shape = all_by_idx[first_key][mk]["fwd"].shape
+        if not all(all_by_idx[k][mk]["fwd"].shape == ref_shape for k in all_by_idx):
+            continue  # Skip mixed-shape models
+        for direction in ("fwd", "bwd"):
+            data = np.array(
+                [all_by_idx[k][mk][direction] for k in sorted(all_by_idx.keys())],
+                dtype=np.float64,
+            )
+            _save_power_csv(data, _power_csv_path(noise_type, mk, direction, power_dbm, index_prefix))
+
+
+def _load_cached_power(noise_type: str, model_keys: list[str], index_prefix: str = "ch") -> tuple[dict | None, float]:
+    """Try to load cached precomputed result for current power override.
+
+    index_prefix: "ch" for length-indexed data (precompute_by_channel), "len" for channel-indexed data (precompute_by_length).
+    """
+    power = _POWER_OVERRIDE_DBM if _POWER_OVERRIDE_DBM is not None else 0.0
+    # Try exact power match in memory cache (distinguish by prefix)
+    cache_key = (index_prefix, power)
+    if cache_key in _POWER_CACHE:
+        return _POWER_CACHE[cache_key], power
+    # Try CSV files for this power (only for continuous models)
+    # Find first continuous model as reference
+    first_cont_mk = None
+    for mk in model_keys:
+        fwd_path = _power_csv_path(noise_type, mk, "fwd", power, index_prefix)
+        if fwd_path.exists():
+            first_cont_mk = mk
+            break
+    if first_cont_mk is None:
+        return None, power  # No cached continuous models
+    # Load continuous models from CSV
+    # For "ch": outer index = length (n_l=18), data shape = (n_l, n_f)
+    # For "len": outer index = channel (n_ch=61), data shape = (n_ch, n_l)
+    # Determine outer dimension from the first CSV's row count
+    ref_path = _power_csv_path(noise_type, first_cont_mk, "fwd", power, index_prefix)
+    ref_data = _load_power_csv(ref_path)
+    n_outer = ref_data.shape[0]
+
+    all_by_idx = {}
+    for idx in range(n_outer):
+        all_by_idx[idx] = {}
+        for mk in model_keys:
+            fwd_path = _power_csv_path(noise_type, mk, "fwd", power, index_prefix)
+            bwd_path = _power_csv_path(noise_type, mk, "bwd", power, index_prefix)
+            if fwd_path.exists() and bwd_path.exists():
+                fwd_data = _load_power_csv(fwd_path)
+                bwd_data = _load_power_csv(bwd_path)
+                all_by_idx[idx][mk] = {
+                    "fwd": fwd_data[idx] if idx < len(fwd_data) else np.array([]),
+                    "bwd": bwd_data[idx] if idx < len(bwd_data) else np.array([]),
+                    "x": np.array([]),
+                    "x_kind": "",
+                    "y_kind": "",
+                }
+    _POWER_CACHE[cache_key] = all_by_idx
+    return all_by_idx, power
 
 
 _LEGEND_SYNC_JS = """
@@ -1056,7 +976,10 @@ def precompute_by_channel(
 
     # --- Multiprocessing dispatch for default noise types ---
     if _MP_ENABLED and n_l > 1 and noise_type not in ("with_signal", "only_signal"):
-        # Serialize data for subprocess (numpy arrays and Path don't pickle cleanly from class attrs)
+        # Import worker from separate module (avoids Windows spawn path issues)
+        from scripts.dash_workers import mp_worker_single_length
+
+        # Serialize data for subprocess
         wdm_cfg_dict = dict(
             start_freq=base_config.start_freq,
             start_channel=base_config.start_channel,
@@ -1075,7 +998,7 @@ def precompute_by_channel(
         with ProcessPoolExecutor(max_workers=_get_mp_workers()) as executor:
             for li, length_km in enumerate(LENGTHS_KM):
                 fut = executor.submit(
-                    _mp_worker_single_length,
+                    mp_worker_single_length,
                     li, length_km, noise_type,
                     model_keys, specs,
                     wdm_cfg_dict, noise_f_list,

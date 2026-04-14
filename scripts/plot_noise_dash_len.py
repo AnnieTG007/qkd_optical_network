@@ -39,6 +39,8 @@ from scripts.dash_utils import (
     get_noise_model_keys,
     precompute_by_length,
     set_power_override,
+    _cache_precomputed_result,
+    _load_cached_power,
 )
 
 
@@ -183,22 +185,31 @@ def update_display(selection_idx: int) -> str:
     prevent_initial_call=False,
 )
 def update_power_and_graph(power_dbm: float, channel_selection_idx: int) -> tuple[str, go.Figure]:
-    # Apply power override and recompute
+    # Apply power override and try to load from CSV cache
     set_power_override(power_dbm)
-    all_by_len, valid_indices = precompute_by_length(
-        noise_type=NOISE_TYPE,
-        specs=specs,
-        LENGTHS_KM=LENGTHS_KM,
-        base_config=base_config,
-        noise_f_grid=noise_f_grid,
-        osa_csv_path=osa_csv_path,
-        fiber_params=FIBER_PARAMS,
-    )
+    cached, loaded_power = _load_cached_power(NOISE_TYPE, model_keys, index_prefix="len")
+    if cached is not None:
+        all_by_len = cached
+        label = f"Classical power: {power_dbm:.1f} dBm (loaded from cache)"
+    else:
+        all_by_len, _ = precompute_by_length(
+            noise_type=NOISE_TYPE,
+            specs=specs,
+            LENGTHS_KM=LENGTHS_KM,
+            base_config=base_config,
+            noise_f_grid=noise_f_grid,
+            osa_csv_path=osa_csv_path,
+            fiber_params=FIBER_PARAMS,
+        )
+        _cache_precomputed_result(all_by_len, loaded_power, NOISE_TYPE, model_keys, index_prefix="len")
+        label = f"Classical power: {power_dbm:.1f} dBm (computed)"
+
     global Y_LOG_RANGE, Y_DBM_RANGE
     Y_LOG_RANGE, Y_DBM_RANGE = _global_ranges(all_by_len, model_keys)
-    ch_idx = valid_indices[channel_selection_idx]
+    # Use VALID_INDICES (from startup precompute) to map slider position to channel
+    ch_idx = VALID_INDICES[channel_selection_idx]
     fig = _make_figure(all_by_len[ch_idx], ch_idx)
-    return f"Classical power: {power_dbm:.1f} dBm (recomputed)", fig
+    return label, fig
 
 
 @app.callback(
@@ -208,7 +219,11 @@ def update_power_and_graph(power_dbm: float, channel_selection_idx: int) -> tupl
     prevent_initial_call=True,
 )
 def update_graph_on_channel(channel_selection_idx: int, power_dbm: float) -> go.Figure:
-    ch_idx = VALID_INDICES[channel_selection_idx]
+    if NOISE_TYPE == "with_signal":
+        ch_idx = VALID_INDICES[channel_selection_idx]
+    else:
+        q_local = VALID_INDICES[channel_selection_idx]
+        ch_idx = base_quantum_indices_list[q_local]
     fig = _make_figure(ALL_BY_LEN[ch_idx], ch_idx)
     return fig
 

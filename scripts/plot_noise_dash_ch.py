@@ -38,6 +38,8 @@ from scripts.dash_utils import (
     get_noise_model_keys,
     precompute_by_channel,
     set_power_override,
+    _load_cached_power,
+    _cache_precomputed_result,
 )
 
 
@@ -189,22 +191,45 @@ def update_display(selection_idx: int) -> str:
     prevent_initial_call=False,
 )
 def update_power_and_graph(power_dbm: float, length_selection_idx: int) -> tuple[str, go.Figure]:
-    # Apply power override and recompute
+    # Apply power override and try to load from CSV cache
     set_power_override(power_dbm)
-    all_by_ch, valid_l_indices = precompute_by_channel(
-        noise_type=NOISE_TYPE,
-        specs=specs,
-        LENGTHS_KM=LENGTHS_KM,
-        base_config=base_config,
-        noise_f_grid=noise_f_grid,
-        osa_csv_path=osa_csv_path,
-        fiber_params=FIBER_PARAMS,
-    )
+    cached, loaded_power = _load_cached_power(NOISE_TYPE, model_keys, index_prefix="ch")
+    if cached is not None:
+        # Load x metadata from current noise_f_grid
+        n_f = len(noise_f_grid)
+        for li in cached:
+            for mk in cached[li]:
+                cached[li][mk]["x"] = np.asarray(noise_f_grid, dtype=np.float64)
+                cached[li][mk]["x_kind"] = "frequency_grid"
+                cached[li][mk]["y_kind"] = "power_per_bin"
+        all_by_ch = cached
+        valid_l_indices = [
+            li for li in range(len(LENGTHS_KM))
+            if any(
+                np.any(all_by_ch[li][mk]["fwd"] > 0) or np.any(all_by_ch[li][mk]["bwd"] > 0)
+                for mk in model_keys
+            )
+        ]
+        label = f"Classical power: {power_dbm:.1f} dBm (loaded from cache)"
+    else:
+        # Cache miss: recompute
+        all_by_ch, valid_l_indices = precompute_by_channel(
+            noise_type=NOISE_TYPE,
+            specs=specs,
+            LENGTHS_KM=LENGTHS_KM,
+            base_config=base_config,
+            noise_f_grid=noise_f_grid,
+            osa_csv_path=osa_csv_path,
+            fiber_params=FIBER_PARAMS,
+        )
+        # Save to CSV cache
+        _cache_precomputed_result(all_by_ch, loaded_power, NOISE_TYPE, model_keys, index_prefix="ch")
+        label = f"Classical power: {power_dbm:.1f} dBm (computed)"
     global Y_LOG_RANGE, Y_DBM_RANGE
     Y_LOG_RANGE, Y_DBM_RANGE = _global_ranges(all_by_ch, model_keys)
     l_idx = valid_l_indices[length_selection_idx]
     fig = _make_figure(all_by_ch[l_idx], l_idx)
-    return f"Classical power: {power_dbm:.1f} dBm (recomputed)", fig
+    return label, fig
 
 
 @app.callback(
