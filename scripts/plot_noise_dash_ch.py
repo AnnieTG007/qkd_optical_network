@@ -56,14 +56,21 @@ def _to_dbm(values_w: np.ndarray) -> np.ndarray:
 def _global_ranges(all_data: dict, model_keys: list[str]) -> tuple[tuple[float, float], tuple[float, float]]:
     """Compute y-axis ranges for the plot.
 
-    Returns (y_log, y_dbm). All data is now in [W] (power per bin or channel power).
+    Returns (y_log, y_dbm). All data is in [W] (power per bin or channel power).
+    For power_per_bin entries, integrates over OSA_RBW_HZ (1 GHz) before dBm conversion.
     """
+    OSA_RBW_HZ = 1e9  # OSA reference bandwidth, Hz (same as dash_utils.OSA_RBW_HZ)
     positives: list[float] = []
     for curve_data in all_data.values():
         for model_key in model_keys:
             entry = curve_data.get(model_key, {})
             fwd = np.asarray(entry.get("fwd", []), dtype=np.float64)
             bwd = np.asarray(entry.get("bwd", []), dtype=np.float64)
+            y_kind = entry.get("y_kind", "")
+            if y_kind == "power_per_bin":
+                # Integrate PSD over reference bandwidth to get equivalent power [W]
+                fwd = fwd * OSA_RBW_HZ
+                bwd = bwd * OSA_RBW_HZ
             positives.extend(fwd[fwd >= NOISE_FLOOR_W].tolist())
             positives.extend(bwd[bwd >= NOISE_FLOOR_W].tolist())
     if not positives:
@@ -284,9 +291,13 @@ def update_graph_on_length(length_selection_idx: int, power_idx: int) -> go.Figu
 
 
 def _make_figure(sweep: dict, l_idx: int) -> go.Figure:
+    if NOISE_TYPE == "only_signal":
+        subplot_titles = ("Signal Power [W]", "Signal Power [dBm]")
+    else:
+        subplot_titles = ("Noise Power [W]", "Noise Power [dBm]")
     fig = make_subplots(
         rows=1, cols=2,
-        subplot_titles=("Noise Power [W]", "Noise Power [dBm]"),
+        subplot_titles=subplot_titles,
     )
 
     for model_key in model_keys:

@@ -1140,41 +1140,48 @@ def precompute_by_channel(
         return all_by_ch, valid_l_indices
 
     if noise_type == "only_signal":
-        # x-axis: all channel center frequencies (classical + quantum)
-        all_ch_freqs = np.array(
-            [
-                WDM_PARAMS["start_freq"] + idx * WDM_PARAMS["channel_spacing"]
-                for idx in range(n_ch)
-            ],
-            dtype=np.float64,
-        )
-        all_by_ch = {
-            li: {mk: {
-                "fwd": np.zeros(n_ch),
-                "bwd": np.zeros(n_ch),
-                "x": np.asarray(all_ch_freqs, dtype=np.float64),
-                "x_kind": "channel_center",
-                "y_kind": "channel_power",
-            } for mk in model_keys}
-            for li in range(n_l)
-        }
-        # G_TX is independent of fiber length; compute once per model, assign to all lengths
+        # Continuous models: use full frequency grid + PSD for waveform display
+        # Discrete model: use channel power at classical channel centers
+        all_by_ch: dict = {li: {} for li in range(n_l)}
+        df = float(np.mean(np.diff(noise_f_grid)))
         for model_key in model_keys:
             spec = specs[model_key]
             grid_all = _build_all_classical_grid(spec, base_config, noise_f_grid, osa_csv_path)
-            signal = _integrate_signal_per_channel(grid_all, grid_all.f_grid)
-            classical_mask = np.array([ch.channel_type == "classical" for ch in grid_all.channels], dtype=bool)
+            classical_mask = np.array(
+                [ch.channel_type == "classical" for ch in grid_all.channels], dtype=bool
+            )
 
-            fwd = np.zeros(n_ch, dtype=np.float64)
-            bwd = np.zeros(n_ch, dtype=np.float64)
-            fwd[classical_mask] = signal[classical_mask]
-            # bwd remains zeros (no backward-propagating signal at transmit side)
+            if spec["continuous"]:
+                # Continuous model: full f_grid + PSD → waveform line
+                psd_total = grid_all.get_total_psd()  # shape (N_f,)
+                fwd_arr = np.asarray(psd_total, dtype=np.float64)
+                bwd_arr = np.zeros(len(psd_total), dtype=np.float64)
+                x_arr = np.asarray(noise_f_grid, dtype=np.float64)
+                x_kind = "frequency_grid"
+                y_kind = "power_per_bin"
+            else:
+                # Discrete model: channel power at classical channel centers
+                signal = _integrate_signal_per_channel(grid_all, noise_f_grid)
+                fwd = np.zeros(n_ch, dtype=np.float64)
+                fwd[classical_mask] = signal[classical_mask]
+                fwd_arr = np.asarray(fwd, dtype=np.float64)
+                bwd_arr = np.zeros(n_ch, dtype=np.float64)
+                x_arr = np.array(
+                    [WDM_PARAMS["start_freq"] + idx * WDM_PARAMS["channel_spacing"]
+                     for idx in range(n_ch)],
+                    dtype=np.float64,
+                )
+                x_kind = "channel_center"
+                y_kind = "channel_power"
 
-            fwd_arr = np.asarray(fwd, dtype=np.float64)
-            bwd_arr = np.asarray(bwd, dtype=np.float64)
             for li in range(n_l):
-                all_by_ch[li][model_key]["fwd"] = fwd_arr
-                all_by_ch[li][model_key]["bwd"] = bwd_arr
+                all_by_ch[li][model_key] = {
+                    "fwd": fwd_arr,
+                    "bwd": bwd_arr,
+                    "x": x_arr,
+                    "x_kind": x_kind,
+                    "y_kind": y_kind,
+                }
 
         valid_l_indices = [
             li
