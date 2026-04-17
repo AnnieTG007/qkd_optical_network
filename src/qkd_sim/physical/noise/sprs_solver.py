@@ -226,8 +226,17 @@ class DiscreteSPRSSolver(NoiseSolver):
     >>> P_bwd = solver.compute_backward(fiber, wdm_grid)  # shape (N_q,)
     """
 
-    def __init__(self) -> None:
-        pass
+    def __init__(self, noise_bandwidth_hz: float | None = 20e9) -> None:
+        """离散 SpRS 求解器。
+
+        Parameters
+        ----------
+        noise_bandwidth_hz : float | None
+            噪声收集带宽 [Hz]。用于拉曼截面公式 σ ∝ B_noise。
+            默认 20 GHz。不为 None 时覆盖量子信道的 B_s。
+            传入 None 则回退到每个量子信道的 B_s。
+        """
+        self._noise_bandwidth_hz = noise_bandwidth_hz
 
     def _prepare(
         self,
@@ -284,12 +293,20 @@ class DiscreteSPRSSolver(NoiseSolver):
 
         n_th = _phonon_occupation(delta_f, fiber.T_kelvin)  # shape (N_q, N_c)
 
-        # 离散模型的噪声收集带宽取目标量子信道带宽。
-        q_chs = wdm_grid.get_quantum_channels()
-        noise_bandwidth = np.array(
-            [ch.B_s for ch in q_chs],
-            dtype=np.float64,
-        ).reshape(-1, 1)
+        # B_noise：显式配置优先；否则取量子信道带宽 B_s。
+        if self._noise_bandwidth_hz is not None:
+            q_chs = wdm_grid.get_quantum_channels()
+            noise_bandwidth = np.full(
+                (len(q_chs), 1),
+                self._noise_bandwidth_hz,
+                dtype=np.float64,
+            )
+        else:
+            q_chs = wdm_grid.get_quantum_channels()
+            noise_bandwidth = np.array(
+                [ch.B_s for ch in q_chs],
+                dtype=np.float64,
+            ).reshape(-1, 1)
 
         sigma = _raman_cross_section(
             f_q,
