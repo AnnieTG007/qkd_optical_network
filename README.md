@@ -32,12 +32,6 @@ pip install gymnasium
 pip install -e .
 ```
 
-### conda 环境（已验证）
-
-```
-C:\Users\Annie\miniconda3\envs\qkd_env\python.exe
-```
-
 ## 快速开始
 
 ### 1. 噪声计算
@@ -145,39 +139,3 @@ docs/
 ├── formulas_sprs.md       # SpRS 噪声公式
 └── formulas_nonlinear.md  # GN-model 公式
 ```
-
-## 核心参数
-
-### WDM 信道频率（ITU-T G.694.1）
-
-频率公式：`f(n) = 190.1 THz + (n - 1) × 100 GHz`
-
-| 信道 | 频率 |
-|------|------|
-| C01 | 190.1 THz |
-| C39 | 193.9 THz |
-| C61 | 196.1 THz |
-
-### SpRS B_noise 参数
-
-离散 SpRS 模型的噪声收集带宽 `B_noise`：
-- **默认 20 GHz**
-- 与 `channel_spacing`（100 GHz）和信号带宽 `B_s`（32 GHz）独立
-- 可通过 `DiscreteSPRSSolver(noise_bandwidth_hz=xxx)` 配置
-
-## 公式修正记录
-
-| 项目 | 修正 |
-|------|------|
-| `alpha_dB_km_to_per_m` | ×1e-3（原误写 1e3） |
-| FWM 连续前向系数 | γ²/9（非 4γ²/9） |
-| SpRS 噪声带宽 | `bandwidth`→`B_noise`（非泵浦-信号频移 Δf） |
-| GN-model | Poggiolini Eq.1 + Eq.120 |
-
-详见 `docs/formulas_*.md` 和 `.claude/devjournal.md`。
-
-## 注意事项
-
-- `.claude/` 目录为本地文档（不在 GitHub 同步）
-- `.cupy_cache/` 为 CuPy 编译缓存，已加入 `.gitignore`
-- 项目指南同时维护于 `CLAUDE.md`（面向 Claude）和 `AGENTS.md`（面向 Codex），两者同步更新

@@ -641,11 +641,12 @@ def _build_all_classical_grid(
         B_s=base_config.B_s,
         P0=_get_P0(),
         beta_rolloff=base_config.beta_rolloff if spec["beta_rolloff"] is None else spec["beta_rolloff"],
-        quantum_channel_indices=[],
+        quantum_channel_indices=base_config.quantum_channel_indices,
         channel_powers_W=base_config.channel_powers_W,
         num_channels=int(base_config.num_channels),
     )
-    all_indices = list(range(int(base_config.num_channels)))
+    # Do NOT pass classical_channel_indices — derive it as complement of quantum_channel_indices
+    # (avoids explicit overlap validation)
     if spec["spectrum_type"] == SpectrumType.OSA_SAMPLED:
         return build_wdm_grid(
             config=model_config,
@@ -653,14 +654,12 @@ def _build_all_classical_grid(
             f_grid=f_grid,
             osa_csv_path=osa_csv_path,
             osa_rbw=OSA_RBW_HZ,
-            classical_channel_indices=all_indices,
             modulation_format="16QAM",
         )
     return build_wdm_grid(
         config=model_config,
         spectrum_type=spec["spectrum_type"],
         f_grid=f_grid,
-        classical_channel_indices=all_indices,
         modulation_format="16QAM" if spec["spectrum_type"] == SpectrumType.RAISED_COSINE else "OOK",
     )
 
