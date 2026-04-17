@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import os
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 from typing import Optional
 
 import numpy as np
@@ -39,7 +42,7 @@ def _load_wdm_params() -> dict:
 
 
 WDM_PARAMS = _load_wdm_params()
-CLASSICAL_INDICES = [29, 30, 31, 32, 34]
+CLASSICAL_INDICES = [38, 39, 40]
 NOISE_GRID_RESOLUTION_HZ = 5e9
 NOISE_FLOOR_W = 1e-23
 FREQ_GRID_PADDING_FACTOR = 1.5
@@ -106,14 +109,130 @@ FIBER_PARAMS = dict(
 )
 
 # --- Multiprocessing for precomputation ---
-# Disabled on Windows (nt): spawn re-imports __main__ and hits module-level precompute call.
+# Disabled on Windows (nt): scipy Cython DLLs fail to load in spawned subprocesses.
 # Enable via QKD_DASH_MP=1 env var on non-Windows systems for MP speedup.
 _MP_ENABLED = os.environ.get("QKD_DASH_MP", "1") != "0" and os.name != "nt"
+_PROFILE_ENABLED = os.environ.get("QKD_DASH_PROFILE", "1").lower() not in ("0", "false", "no")
+_CSV_CACHE_ENABLED = os.environ.get("QKD_DASH_CSV_CACHE", "1").lower() not in ("0", "false", "no")
+_PROFILE_INDENT = 0
+
+
+def describe_compute_device() -> str:
+    """Return the active compute backend used by Dash noise precomputation."""
+    try:
+        from qkd_sim.utils.gpu_utils import get_array_module, has_cupy
+
+        if has_cupy():
+            xp = get_array_module()
+            device_id = xp.cuda.runtime.getDevice()
+            props = xp.cuda.runtime.getDeviceProperties(device_id)
+            name = props.get("name", b"CUDA GPU")
+            if isinstance(name, bytes):
+                name = name.decode("utf-8", errors="replace")
+            return f"CUDA GPU: {name} (CuPy; FWM continuous spectrum path)"
+    except Exception as exc:
+        return f"CPU (NumPy/SciPy; GPU detection failed: {exc})"
+    return "CPU (NumPy/SciPy)"
+
+
+def print_compute_device() -> None:
+    """Print compute backend once at script startup."""
+    print(f"Compute device: {describe_compute_device()}")
+
+
+def set_csv_cache_enabled(enabled: bool) -> None:
+    """Enable or disable Dash precompute CSV cache I/O."""
+    global _CSV_CACHE_ENABLED
+    _CSV_CACHE_ENABLED = bool(enabled)
+
+
+@contextmanager
+def profile_scope(label: str) -> Iterator[None]:
+    """Print elapsed time for a named Dash precomputation step."""
+    global _PROFILE_INDENT
+    if not _PROFILE_ENABLED:
+        yield
+        return
+
+    indent = "  " * _PROFILE_INDENT
+    _PROFILE_INDENT += 1
+    t_start = time.perf_counter()
+    try:
+        yield
+    finally:
+        elapsed = time.perf_counter() - t_start
+        _PROFILE_INDENT -= 1
+        print(f"[profile] {indent}{label}: {elapsed:.3f}s")
 
 
 def _get_mp_workers() -> int:
     """Number of worker processes for precomputation."""
     return max(1, os.cpu_count() or 1)
+
+
+# --- Worker functions for multiprocessing (must be module-level for Windows spawn) ---
+
+def _precompute_length_worker(
+    power_dbm: float,
+    noise_type: str,
+    specs: dict,
+    LENGTHS_KM: np.ndarray,
+    base_config: WDMConfig,
+    noise_f_grid: np.ndarray,
+    osa_csv_path: Path,
+    fiber_params: dict,
+) -> tuple[float, dict, list]:
+    """Worker: precompute by length for one power level. Runs in subprocess."""
+    set_power_override(float(power_dbm))
+    all_by_idx, valid_ch = precompute_by_length(
+        noise_type, specs, LENGTHS_KM, base_config,
+        noise_f_grid, osa_csv_path, fiber_params,
+    )
+    return float(power_dbm), all_by_idx, valid_ch
+
+
+def _precompute_channel_worker(
+    power_dbm: float,
+    noise_type: str,
+    specs: dict,
+    LENGTHS_KM: np.ndarray,
+    base_config: WDMConfig,
+    noise_f_grid: np.ndarray,
+    osa_csv_path: Path,
+    fiber_params: dict,
+) -> tuple[float, dict, list]:
+    """Worker: precompute by channel for one power level. Runs in subprocess."""
+    set_power_override(float(power_dbm))
+    all_by_idx, valid_l = precompute_by_channel(
+        noise_type, specs, LENGTHS_KM, base_config,
+        noise_f_grid, osa_csv_path, fiber_params,
+    )
+    return float(power_dbm), all_by_idx, valid_l
+
+
+# --- Power levels for startup precomputation (step=5 dBm, 7 values) ---
+PRECOMPUTE_POWER_LEVELS = [-15.0, -10.0, -5.0, 0.0, 5.0, 10.0, 15.0]
+
+
+# --- Clear stale CSV cache ---
+def _clear_precomputed_csv_files(index_prefix: str | None = None) -> None:
+    """Delete CSV files in precomputed dir to avoid stale data from changed params.
+
+    index_prefix: if None, delete all; if "ch" or "len", only that subset.
+    """
+    if not _CSV_CACHE_ENABLED:
+        return
+    skipped: list[str] = []
+    for f in _PRECOMPUTED_DIR.glob("*.csv"):
+        if index_prefix is None or f.name.startswith(index_prefix):
+            try:
+                f.unlink()
+            except PermissionError:
+                skipped.append(f.name)
+    if skipped:
+        preview = ", ".join(skipped[:3])
+        suffix = "" if len(skipped) <= 3 else f", ... +{len(skipped) - 3} more"
+        print(f"[profile] warning: skipped {len(skipped)} locked CSV cache files: {preview}{suffix}")
 
 
 # --- Power override for classical channel launch power ---
@@ -150,11 +269,16 @@ def _save_power_csv(data: np.ndarray, filepath: Path) -> None:
     """Save 2D power array to CSV (rows = outer index, cols = inner index)."""
     import csv
 
+    if not _CSV_CACHE_ENABLED:
+        return
     _PRECOMPUTED_DIR.mkdir(parents=True, exist_ok=True)
-    with open(filepath, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        for row in data:
-            writer.writerow([f"{v:.6e}" for v in row])
+    try:
+        with open(filepath, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            for row in data:
+                writer.writerow([f"{v:.6e}" for v in row])
+    except PermissionError as exc:
+        print(f"[profile] warning: skip CSV cache write for {filepath.name}: {exc}")
 
 
 def _load_power_csv(filepath: Path) -> np.ndarray:
@@ -238,6 +362,61 @@ def _load_cached_power(noise_type: str, model_keys: list[str], index_prefix: str
                 }
     _POWER_CACHE[cache_key] = all_by_idx
     return all_by_idx, power
+
+
+def _scale_precomputed_result(all_by_idx: dict, scale: float) -> dict:
+    """Scale cached fwd/bwd noise arrays while preserving x-axis metadata."""
+    scaled: dict = {}
+    for outer_idx, model_data in all_by_idx.items():
+        scaled[outer_idx] = {}
+        for model_key, entry in model_data.items():
+            scaled[outer_idx][model_key] = {
+                "fwd": np.asarray(entry.get("fwd", []), dtype=np.float64) * scale,
+                "bwd": np.asarray(entry.get("bwd", []), dtype=np.float64) * scale,
+                "x": np.asarray(entry.get("x", []), dtype=np.float64),
+                "x_kind": entry.get("x_kind", ""),
+                "y_kind": entry.get("y_kind", ""),
+            }
+    return scaled
+
+
+def _combine_precomputed_results(
+    fwm_by_idx: dict,
+    sprs_by_idx: dict,
+    fwm_scale: float,
+    sprs_scale: float,
+) -> dict:
+    """Combine separately precomputed FWM and SpRS data for ``both`` plots."""
+    combined: dict = {}
+    for outer_idx in sorted(set(fwm_by_idx.keys()) & set(sprs_by_idx.keys())):
+        combined[outer_idx] = {}
+        model_keys = sorted(set(fwm_by_idx[outer_idx].keys()) & set(sprs_by_idx[outer_idx].keys()))
+        for model_key in model_keys:
+            fwm_entry = fwm_by_idx[outer_idx][model_key]
+            sprs_entry = sprs_by_idx[outer_idx][model_key]
+            combined[outer_idx][model_key] = {
+                "fwd": (
+                    np.asarray(fwm_entry.get("fwd", []), dtype=np.float64) * fwm_scale
+                    + np.asarray(sprs_entry.get("fwd", []), dtype=np.float64) * sprs_scale
+                ),
+                "bwd": (
+                    np.asarray(fwm_entry.get("bwd", []), dtype=np.float64) * fwm_scale
+                    + np.asarray(sprs_entry.get("bwd", []), dtype=np.float64) * sprs_scale
+                ),
+                "x": np.asarray(fwm_entry.get("x", sprs_entry.get("x", [])), dtype=np.float64),
+                "x_kind": fwm_entry.get("x_kind", sprs_entry.get("x_kind", "")),
+                "y_kind": fwm_entry.get("y_kind", sprs_entry.get("y_kind", "")),
+            }
+    return combined
+
+
+def _power_scaling_factor(noise_type: str, power_dbm: float) -> float | None:
+    """Return exact pump-power scaling from the 0 dBm precompute."""
+    if noise_type == "sprs":
+        return float(10.0 ** (power_dbm / 10.0))
+    if noise_type == "fwm":
+        return float(10.0 ** (3.0 * power_dbm / 10.0))
+    return None
 
 
 _LEGEND_SYNC_JS = """
@@ -396,6 +575,7 @@ def _build_model_grid(
             P0=_get_P0(),
             beta_rolloff=spec["beta_rolloff"],
             quantum_channel_indices=base_config.quantum_channel_indices,
+            channel_powers_W=base_config.channel_powers_W,
             num_channels=int(base_config.num_channels),
         )
     else:
@@ -409,12 +589,14 @@ def _build_model_grid(
             osa_csv_path=osa_csv_path,
             osa_rbw=OSA_RBW_HZ,
             classical_channel_indices=CLASSICAL_INDICES,
+            modulation_format="16QAM",
         )
     return build_wdm_grid(
         config=model_config,
         spectrum_type=spec["spectrum_type"],
         f_grid=f_grid,
         classical_channel_indices=CLASSICAL_INDICES,
+        modulation_format="16QAM" if spec["spectrum_type"] == SpectrumType.RAISED_COSINE else "OOK",
     )
 
 
@@ -460,6 +642,7 @@ def _build_all_classical_grid(
         P0=_get_P0(),
         beta_rolloff=base_config.beta_rolloff if spec["beta_rolloff"] is None else spec["beta_rolloff"],
         quantum_channel_indices=[],
+        channel_powers_W=base_config.channel_powers_W,
         num_channels=int(base_config.num_channels),
     )
     all_indices = list(range(int(base_config.num_channels)))
@@ -471,12 +654,14 @@ def _build_all_classical_grid(
             osa_csv_path=osa_csv_path,
             osa_rbw=OSA_RBW_HZ,
             classical_channel_indices=all_indices,
+            modulation_format="16QAM",
         )
     return build_wdm_grid(
         config=model_config,
         spectrum_type=spec["spectrum_type"],
         f_grid=f_grid,
         classical_channel_indices=all_indices,
+        modulation_format="16QAM" if spec["spectrum_type"] == SpectrumType.RAISED_COSINE else "OOK",
     )
 
 
@@ -608,8 +793,12 @@ def _compute_noise_spectrum_pair(
     fiber,
     grid,
     f_grid: np.ndarray,
+    L_arr: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """返回完整 (N_f,) PSD 数组，仅适用于连续模型。
+    """返回完整 PSD 数组，适用于连续模型。
+
+    当 L_arr=None 时返回 (N_f,)，当 L_arr 给出时返回 (N_f, N_L) —
+    每列对应一个光纤长度。
 
     fwm: compute_fwm_spectrum_conti
     sprs: compute_sprs_spectrum_conti
@@ -617,24 +806,51 @@ def _compute_noise_spectrum_pair(
 
     Returns
     -------
-    (fwd, bwd), each shape (N_f,)
+    (fwd, bwd), each shape (N_f,) or (N_f, N_L)
     """
     from qkd_sim.physical.noise import DiscreteFWMSolver, DiscreteSPRSSolver
 
-    fwd = np.zeros_like(f_grid, dtype=np.float64)
-    bwd = np.zeros_like(f_grid, dtype=np.float64)
+    n_f = len(f_grid)
+    n_l = 1 if L_arr is None else int(L_arr.shape[0])
+    fwd = np.zeros((n_f, n_l), dtype=np.float64)
+    bwd = np.zeros((n_f, n_l), dtype=np.float64)
 
     if noise_type in ("fwm", "both"):
         solver = DiscreteFWMSolver()
-        fwd += solver.compute_fwm_spectrum_conti(fiber, grid, f_grid, direction="forward")
-        bwd += solver.compute_fwm_spectrum_conti(fiber, grid, f_grid, direction="backward")
+        fwm_fwd = solver.compute_fwm_spectrum_conti(
+            fiber, grid, f_grid, direction="forward", L_arr=L_arr
+        )
+        fwm_bwd = solver.compute_fwm_spectrum_conti(
+            fiber, grid, f_grid, direction="backward", L_arr=L_arr
+        )
+        if L_arr is None:
+            fwd[:, 0] += fwm_fwd
+            bwd[:, 0] += fwm_bwd
+        else:
+            fwd += fwm_fwd
+            bwd += fwm_bwd
 
     if noise_type in ("sprs", "both"):
         solver = DiscreteSPRSSolver()
         df_grid = float(np.mean(np.diff(f_grid)))
-        fwd += solver.compute_sprs_spectrum_conti(fiber, grid, f_grid, direction="forward") / df_grid
-        bwd += solver.compute_sprs_spectrum_conti(fiber, grid, f_grid, direction="backward") / df_grid
+        if L_arr is None:
+            sprs_fwd = solver.compute_sprs_spectrum_conti(fiber, grid, f_grid, direction="forward")
+            sprs_bwd = solver.compute_sprs_spectrum_conti(fiber, grid, f_grid, direction="backward")
+            fwd[:, 0] += sprs_fwd
+            bwd[:, 0] += sprs_bwd
+        else:
+            sprs_fwd = solver.compute_sprs_spectrum_conti_l_array(
+                fiber, grid, f_grid, L_arr=L_arr, direction="forward"
+            )
+            sprs_bwd = solver.compute_sprs_spectrum_conti_l_array(
+                fiber, grid, f_grid, L_arr=L_arr, direction="backward"
+            )
+            fwd += sprs_fwd
+            bwd += sprs_bwd
 
+    # Return (N_f,) for backward compatibility
+    if n_l == 1:
+        return np.asarray(fwd.ravel(), dtype=np.float64), np.asarray(bwd.ravel(), dtype=np.float64)
     return np.asarray(fwd, dtype=np.float64), np.asarray(bwd, dtype=np.float64)
 
 
@@ -673,6 +889,13 @@ def precompute_by_length(
     n_q = len(quantum_indices)
     n_l = len(LENGTHS_KM)
     n_ch = int(base_config.num_channels)
+    power_label = _POWER_OVERRIDE_DBM if _POWER_OVERRIDE_DBM is not None else 0.0
+    if _PROFILE_ENABLED:
+        print(
+            "[profile] precompute_by_channel "
+            f"type={noise_type}, power={power_label:+.1f} dBm, "
+            f"lengths={n_l}, quantum_channels={n_q}, freq_points={len(noise_f_grid)}, models={len(model_keys)}"
+        )
 
     if noise_type == "with_signal":
         # Continuous PSD: noise (FWM+SpRS) + signal, integrate to power per length
@@ -683,45 +906,50 @@ def precompute_by_length(
             ch_idx: {mk: {"fwd": np.zeros(n_l), "bwd": np.zeros(n_l)} for mk in model_keys}
             for ch_idx in range(n_ch)
         }
-        # Classical set: only C38/39/40 (zero-based indices)
+        # Classical set: only C39/C40/C41 (zero-based indices [38, 39, 40])
         classical_set = set(CLASSICAL_INDICES)
-        for li, length_km in enumerate(LENGTHS_KM):
-            fiber = _make_fiber(fiber_params, length_km)
-            # Noise spectrum: use REAL quantum/classical split (only C38/39/40 are pumps)
-            model_config_noise = WDMConfig(
-                start_freq=base_config.start_freq,
-                start_channel=base_config.start_channel,
-                end_channel=base_config.end_channel,
-                channel_spacing=base_config.channel_spacing,
-                B_s=base_config.B_s,
-                P0=_get_P0(),
-                beta_rolloff=WDM_PARAMS["beta_rolloff"],
-                quantum_channel_indices=list(base_config.quantum_channel_indices),
-                num_channels=int(base_config.num_channels),
-            )
-            grid_noise = build_wdm_grid(
-                config=model_config_noise,
-                spectrum_type=SpectrumType.RAISED_COSINE,
-                f_grid=noise_f_grid,
-                classical_channel_indices=CLASSICAL_INDICES,
-            )
-            noise_fwd_psd, noise_bwd_psd = _compute_noise_spectrum_pair(
-                "both", fiber, grid_noise, noise_f_grid
-            )
-            for model_key in model_keys:
-                spec = specs[model_key]
-                # Signal PSD: sum ONLY over classical channels (C38/39/40)
-                signal_psd = np.zeros_like(noise_f_grid, dtype=np.float64)
-                for idx, ch in enumerate(grid_noise.channels):
-                    if idx in classical_set:
-                        signal_psd += ch.get_psd(noise_f_grid)
-                total_psd_fwd = noise_fwd_psd + signal_psd
-                total_psd_bwd = noise_bwd_psd + signal_psd
-                # Integrate over full grid to get total power [W]
-                total_fwd_power = float(np.sum(total_psd_fwd) * df)
-                total_bwd_power = float(np.sum(total_psd_bwd) * df)
-                # All channels (classical + quantum) get the SAME total power
-                # because the grid covers all channels uniformly
+        L_arr = np.array(LENGTHS_KM, dtype=np.float64) * 1e3  # km → m
+        fiber_base = _make_fiber(fiber_params, LENGTHS_KM[0])
+        model_config_noise = WDMConfig(
+            start_freq=base_config.start_freq,
+            start_channel=base_config.start_channel,
+            end_channel=base_config.end_channel,
+            channel_spacing=base_config.channel_spacing,
+            B_s=base_config.B_s,
+            P0=_get_P0(),
+            beta_rolloff=WDM_PARAMS["beta_rolloff"],
+            quantum_channel_indices=list(base_config.quantum_channel_indices),
+            channel_powers_W=base_config.channel_powers_W,
+            num_channels=int(base_config.num_channels),
+        )
+        grid_noise = build_wdm_grid(
+            config=model_config_noise,
+            spectrum_type=SpectrumType.RAISED_COSINE,
+            f_grid=noise_f_grid,
+            classical_channel_indices=CLASSICAL_INDICES,
+            modulation_format="16QAM",
+        )
+        # Vectorize over all lengths at once
+        noise_fwd_psd_all, noise_bwd_psd_all = _compute_noise_spectrum_pair(
+            "both", fiber_base, grid_noise, noise_f_grid, L_arr=L_arr
+        )  # shape (N_f, N_L) or (N_f,) when n_l==1
+        # Guard: if n_l==1, result is 1D; expand to 2D for [:, li] indexing
+        if noise_fwd_psd_all.ndim == 1:
+            noise_fwd_psd_all = noise_fwd_psd_all[:, np.newaxis]
+            noise_bwd_psd_all = noise_bwd_psd_all[:, np.newaxis]
+        # Signal PSD: sum ONLY over classical channels (C39/C40/C41) — computed once, shared by all model_keys
+        signal_psd = np.zeros(len(noise_f_grid), dtype=np.float64)
+        for idx, ch in enumerate(grid_noise.channels):
+            if idx in classical_set:
+                signal_psd += ch.get_psd(noise_f_grid)
+        for model_key in model_keys:
+            spec = specs[model_key]
+            # noise_fwd_psd_all has shape (N_f, N_L); broadcast with signal_psd
+            for li in range(n_l):
+                total_fwd_psd = noise_fwd_psd_all[:, li] + signal_psd
+                total_bwd_psd = noise_bwd_psd_all[:, li] + signal_psd
+                total_fwd_power = float(np.sum(total_fwd_psd) * df)
+                total_bwd_power = float(np.sum(total_bwd_psd) * df)
                 for ch_idx in range(n_ch):
                     all_by_len[ch_idx][model_key]["fwd"][li] = total_fwd_power
                     all_by_len[ch_idx][model_key]["bwd"][li] = total_bwd_power
@@ -748,14 +976,13 @@ def precompute_by_length(
             signal = _integrate_signal_per_channel(grid_all, grid_all.f_grid)
             classical_mask = np.array([ch.channel_type == "classical" for ch in grid_all.channels], dtype=bool)
 
-            for li, length_km in enumerate(LENGTHS_KM):
-                fiber = _make_fiber(fiber_params, length_km)
-                nli_fwd, nli_bwd = _compute_nli_pair(fiber, grid_all)
-                fwd = np.zeros(n_ch, dtype=np.float64)
-                bwd = np.zeros(n_ch, dtype=np.float64)
-                fwd[classical_mask] = nli_fwd + signal[classical_mask]
-                bwd[classical_mask] = nli_bwd + signal[classical_mask]
+            # G_TX is independent of fiber length; compute once outside the length loop
+            fwd = np.zeros(n_ch, dtype=np.float64)
+            bwd = np.zeros(n_ch, dtype=np.float64)
+            fwd[classical_mask] = signal[classical_mask]
+            # bwd remains zeros (no backward-propagating signal at transmit side)
 
+            for li in range(n_l):
                 for ch_idx in range(n_ch):
                     all_by_len[ch_idx][model_key]["fwd"][li] = float(fwd[ch_idx])
                     all_by_len[ch_idx][model_key]["bwd"][li] = float(bwd[ch_idx])
@@ -779,17 +1006,23 @@ def precompute_by_length(
         q_local_idx: {mk: {"fwd": np.zeros(n_l), "bwd": np.zeros(n_l)} for mk in model_keys}
         for q_local_idx in range(n_q)
     }
+    # Pre-build all grids per (q_local_idx, model_key) to avoid repeated _build_model_grid calls
+    grid_cache: dict[tuple[int, str], object] = {}
     for q_local_idx, q_idx in enumerate(quantum_indices):
         single_q_config = _build_wdm_config([q_idx])
         for model_key in model_keys:
             spec = specs[model_key]
-            grid = _build_model_grid(
-                model_key,
-                spec,
-                single_q_config,
-                noise_f_grid,
-                osa_csv_path,
-            )
+            cache_key = (q_local_idx, model_key)
+            if cache_key not in grid_cache:
+                grid_cache[cache_key] = _build_model_grid(
+                    model_key,
+                    spec,
+                    single_q_config,
+                    noise_f_grid,
+                    osa_csv_path,
+                )
+            grid = grid_cache[cache_key]
+            # Fiber varies with length, not with q_idx or model_key; create once per length
             for li, length_km in enumerate(LENGTHS_KM):
                 fiber = _make_fiber(fiber_params, length_km)
                 fwd, bwd = _compute_noise_power_pair(
@@ -857,11 +1090,11 @@ def precompute_by_channel(
             } for mk in model_keys}
             for li in range(n_l)
         }
-        # Classical set: only C38/39/40 (zero-based indices)
+        # Classical set: only C39/C40/C41 (zero-based indices [38, 39, 40])
         classical_set = set(CLASSICAL_INDICES)
         for li, length_km in enumerate(LENGTHS_KM):
             fiber = _make_fiber(fiber_params, length_km)
-            # Noise spectrum: use REAL quantum/classical split (only C38/39/40 are pumps)
+            # Noise spectrum: use REAL quantum/classical split (only C39/C40/C41 are pumps)
             model_config_noise = WDMConfig(
                 start_freq=base_config.start_freq,
                 start_channel=base_config.start_channel,
@@ -871,6 +1104,7 @@ def precompute_by_channel(
                 P0=_get_P0(),
                 beta_rolloff=WDM_PARAMS["beta_rolloff"],
                 quantum_channel_indices=list(base_config.quantum_channel_indices),
+                channel_powers_W=base_config.channel_powers_W,
                 num_channels=int(base_config.num_channels),
             )
             grid_noise = build_wdm_grid(
@@ -878,17 +1112,18 @@ def precompute_by_channel(
                 spectrum_type=SpectrumType.RAISED_COSINE,
                 f_grid=noise_f_grid,
                 classical_channel_indices=CLASSICAL_INDICES,
+                modulation_format="16QAM",
             )
             noise_fwd_psd, noise_bwd_psd = _compute_noise_spectrum_pair(
                 "both", fiber, grid_noise, noise_f_grid
             )
+            # Signal PSD: sum ONLY over classical channels (C39/C40/C41) — computed once, shared by all model_keys
+            signal_psd = np.zeros_like(noise_f_grid, dtype=np.float64)
+            for idx, ch in enumerate(grid_noise.channels):
+                if idx in classical_set:
+                    signal_psd += ch.get_psd(noise_f_grid)
             for model_key in model_keys:
                 spec = specs[model_key]
-                # Signal PSD: sum ONLY over classical channels (C38/39/40)
-                signal_psd = np.zeros_like(noise_f_grid, dtype=np.float64)
-                for idx, ch in enumerate(grid_noise.channels):
-                    if idx in classical_set:
-                        signal_psd += ch.get_psd(noise_f_grid)
                 total_fwd = (noise_fwd_psd + signal_psd) * df
                 total_bwd = (noise_bwd_psd + signal_psd) * df
                 all_by_ch[li][model_key]["fwd"] = np.asarray(total_fwd, dtype=np.float64)
@@ -924,22 +1159,23 @@ def precompute_by_channel(
             } for mk in model_keys}
             for li in range(n_l)
         }
-        for li, length_km in enumerate(LENGTHS_KM):
-            fiber = _make_fiber(fiber_params, length_km)
-            for model_key in model_keys:
-                spec = specs[model_key]
-                grid_all = _build_all_classical_grid(spec, base_config, noise_f_grid, osa_csv_path)
-                signal = _integrate_signal_per_channel(grid_all, grid_all.f_grid)
-                classical_mask = np.array([ch.channel_type == "classical" for ch in grid_all.channels], dtype=bool)
+        # G_TX is independent of fiber length; compute once per model, assign to all lengths
+        for model_key in model_keys:
+            spec = specs[model_key]
+            grid_all = _build_all_classical_grid(spec, base_config, noise_f_grid, osa_csv_path)
+            signal = _integrate_signal_per_channel(grid_all, grid_all.f_grid)
+            classical_mask = np.array([ch.channel_type == "classical" for ch in grid_all.channels], dtype=bool)
 
-                fwd = np.zeros(n_ch, dtype=np.float64)
-                bwd = np.zeros(n_ch, dtype=np.float64)
-                nli_fwd, nli_bwd = _compute_nli_pair(fiber, grid_all)
-                fwd[classical_mask] = nli_fwd + signal[classical_mask]
-                bwd[classical_mask] = nli_bwd + signal[classical_mask]
+            fwd = np.zeros(n_ch, dtype=np.float64)
+            bwd = np.zeros(n_ch, dtype=np.float64)
+            fwd[classical_mask] = signal[classical_mask]
+            # bwd remains zeros (no backward-propagating signal at transmit side)
 
-                all_by_ch[li][model_key]["fwd"] = np.asarray(fwd, dtype=np.float64)
-                all_by_ch[li][model_key]["bwd"] = np.asarray(bwd, dtype=np.float64)
+            fwd_arr = np.asarray(fwd, dtype=np.float64)
+            bwd_arr = np.asarray(bwd, dtype=np.float64)
+            for li in range(n_l):
+                all_by_ch[li][model_key]["fwd"] = fwd_arr
+                all_by_ch[li][model_key]["bwd"] = bwd_arr
 
         valid_l_indices = [
             li
@@ -1025,24 +1261,65 @@ def precompute_by_channel(
         return all_by_ch, valid_l_indices
     # --- End multiprocessing ---
 
-    for li, length_km in enumerate(LENGTHS_KM):
-        fiber = _make_fiber(fiber_params, length_km)
-        for model_key in model_keys:
-            spec = specs[model_key]
+    # Continuous model: iterate per length (original approach, avoids L_arr issues with sprs)
+    # Cache: grid depends only on model_key (not on q_idx or li)
+    grid_cache: dict[str, object] = {}
 
-            if spec["continuous"]:
-                # Continuous model: full PSD spectrum (N_f,) on noise_f_grid
-                grid = _build_model_grid(
-                    model_key,
-                    spec,
-                    base_config,  # Use full quantum channel config
-                    noise_f_grid,
-                    osa_csv_path,
-                )
-                df = float(np.mean(np.diff(noise_f_grid)))
+    for model_key in model_keys:
+        spec = specs[model_key]
+        if not spec["continuous"]:
+            continue
+        t_grid = 0.0
+        t_fiber = 0.0
+        t_solver = 0.0
+        t_store = 0.0
+        if model_key not in grid_cache:
+            _t = time.perf_counter()
+            grid_cache[model_key] = _build_model_grid(
+                model_key,
+                spec,
+                base_config,
+                noise_f_grid,
+                osa_csv_path,
+            )
+            t_grid += time.perf_counter() - _t
+        grid = grid_cache[model_key]
+        df = float(np.mean(np.diff(noise_f_grid)))
+
+        if noise_type in ("fwm", "sprs"):
+            _t = time.perf_counter()
+            fiber = _make_fiber(fiber_params, float(LENGTHS_KM[0]))
+            L_arr = np.asarray(LENGTHS_KM, dtype=np.float64) * 1e3
+            t_fiber += time.perf_counter() - _t
+            _t = time.perf_counter()
+            fwd_psd_all, bwd_psd_all = _compute_noise_spectrum_pair(
+                noise_type, fiber, grid, noise_f_grid, L_arr=L_arr
+            )  # shape (N_f, N_L)
+            t_solver += time.perf_counter() - _t
+            if fwd_psd_all.ndim == 1:
+                fwd_psd_all = fwd_psd_all[:, np.newaxis]
+                bwd_psd_all = bwd_psd_all[:, np.newaxis]
+            for li in range(n_l):
+                _t = time.perf_counter()
+                all_by_ch[li][model_key] = {
+                    "fwd": np.asarray(fwd_psd_all[:, li] * df, dtype=np.float64),
+                    "bwd": np.asarray(bwd_psd_all[:, li] * df, dtype=np.float64),
+                    "x": np.asarray(noise_f_grid, dtype=np.float64),
+                    "x_kind": "frequency_grid",
+                    "y_kind": "power_per_bin",
+                }
+                t_store += time.perf_counter() - _t
+        else:
+            for li, length_km in enumerate(LENGTHS_KM):
+                _t = time.perf_counter()
+                fiber = _make_fiber(fiber_params, length_km)
+                t_fiber += time.perf_counter() - _t
+                _t = time.perf_counter()
                 fwd_psd, bwd_psd = _compute_noise_spectrum_pair(
                     noise_type, fiber, grid, noise_f_grid
-                )
+                )  # shape (N_f,)
+                t_solver += time.perf_counter() - _t
+                _t = time.perf_counter()
                 all_by_ch[li][model_key] = {
                     "fwd": np.asarray(fwd_psd * df, dtype=np.float64),
                     "bwd": np.asarray(bwd_psd * df, dtype=np.float64),
@@ -1050,34 +1327,73 @@ def precompute_by_channel(
                     "x_kind": "frequency_grid",
                     "y_kind": "power_per_bin",
                 }
-            else:
-                # Discrete model: per-channel integrated power (N_q,) at channel centers
-                fwd_arr = np.zeros(n_q, dtype=np.float64)
-                bwd_arr = np.zeros(n_q, dtype=np.float64)
-                for q_local_idx, q_idx in enumerate(quantum_indices):
-                    grid = _build_model_grid(
-                        model_key,
-                        spec,
-                        _build_wdm_config([q_idx]),
-                        noise_f_grid,
-                        osa_csv_path,
-                    )
-                    fwd, bwd = _compute_noise_power_pair(
-                        noise_type,
-                        fiber,
-                        grid,
-                        continuous=False,
-                    )
-                    if len(fwd) > 0:
-                        fwd_arr[q_local_idx] = float(fwd[0])
-                        bwd_arr[q_local_idx] = float(bwd[0])
-                all_by_ch[li][model_key] = {
-                    "fwd": np.asarray(fwd_arr, dtype=np.float64),
-                    "bwd": np.asarray(bwd_arr, dtype=np.float64),
-                    "x": np.asarray(q_center_freqs, dtype=np.float64),
-                    "x_kind": "channel_center",
-                    "y_kind": "channel_power",
-                }
+                t_store += time.perf_counter() - _t
+        if _PROFILE_ENABLED:
+            print(
+                "[profile]   continuous "
+                f"model={model_key}: grid={t_grid:.3f}s, fiber={t_fiber:.3f}s, "
+                f"solver={t_solver:.3f}s, store={t_store:.3f}s"
+            )
+
+    # Discrete model: grid per (model_key, q_idx), reuse grid_cache for same model_key
+    for model_key in model_keys:
+        spec = specs[model_key]
+        if spec["continuous"]:
+            continue  # Already handled above
+        t_grid = 0.0
+        t_fiber = 0.0
+        t_solver = 0.0
+        t_store = 0.0
+        solver_calls = 0
+        # Build one grid per q_idx (quantum channel changes which channel is "quantum")
+        q_idx_to_grid: dict[int, object] = {}
+        for q_local_idx, q_idx in enumerate(quantum_indices):
+            if q_idx not in q_idx_to_grid:
+                _t = time.perf_counter()
+                q_idx_to_grid[q_idx] = _build_model_grid(
+                    model_key,
+                    spec,
+                    _build_wdm_config([q_idx]),
+                    noise_f_grid,
+                    osa_csv_path,
+                )
+                t_grid += time.perf_counter() - _t
+
+        for li, length_km in enumerate(LENGTHS_KM):
+            _t = time.perf_counter()
+            fiber = _make_fiber(fiber_params, length_km)
+            t_fiber += time.perf_counter() - _t
+            fwd_arr = np.zeros(n_q, dtype=np.float64)
+            bwd_arr = np.zeros(n_q, dtype=np.float64)
+            for q_local_idx, q_idx in enumerate(quantum_indices):
+                grid = q_idx_to_grid[q_idx]
+                _t = time.perf_counter()
+                fwd, bwd = _compute_noise_power_pair(
+                    noise_type,
+                    fiber,
+                    grid,
+                    continuous=False,
+                )
+                t_solver += time.perf_counter() - _t
+                solver_calls += 1
+                if len(fwd) > 0:
+                    fwd_arr[q_local_idx] = float(fwd[0])
+                    bwd_arr[q_local_idx] = float(bwd[0])
+            _t = time.perf_counter()
+            all_by_ch[li][model_key] = {
+                "fwd": np.asarray(fwd_arr, dtype=np.float64),
+                "bwd": np.asarray(bwd_arr, dtype=np.float64),
+                "x": np.asarray(q_center_freqs, dtype=np.float64),
+                "x_kind": "channel_center",
+                "y_kind": "channel_power",
+            }
+            t_store += time.perf_counter() - _t
+        if _PROFILE_ENABLED:
+            print(
+                "[profile]   discrete "
+                f"model={model_key}: grid={t_grid:.3f}s, fiber={t_fiber:.3f}s, "
+                f"solver={t_solver:.3f}s, store={t_store:.3f}s, solver_calls={solver_calls}"
+            )
 
     valid_l_indices = [
         li
@@ -1100,3 +1416,231 @@ def get_noise_model_keys(noise_type: str) -> list[str]:
         return list(load_model_specs("fwm_noise").keys())
     except Exception:
         return ["discrete", "osa"]
+
+
+# --- Startup precomputation of ALL power levels (step=5 dBm, 7 values) ---
+def precompute_by_channel_all_powers(
+    noise_type: str,
+    specs: dict,
+    LENGTHS_KM: np.ndarray,
+    base_config: WDMConfig,
+    noise_f_grid: np.ndarray,
+    osa_csv_path: Path,
+    fiber_params: dict,
+) -> tuple[dict, list]:
+    """Precompute ALL power levels at startup, save to CSV and memory cache.
+
+    Clears stale CSV cache first, then computes for each power level in
+    PRECOMPUTE_POWER_LEVELS in parallel (if total work justifies spawn overhead),
+    stores in both CSV (for Origin) and _POWER_CACHE (for instant slider response).
+
+    Returns (all_by_ch at 0 dBm, valid_l_indices).
+    """
+    import multiprocessing
+
+    with profile_scope("precompute_by_channel_all_powers: clear stale CSV cache"):
+        _clear_precomputed_csv_files("ch")
+        _POWER_CACHE.clear()
+
+    if noise_type in ("sprs", "fwm"):
+        print(
+            "[profile] precompute_by_channel_all_powers: "
+            f"using 0 dBm base result plus {'linear' if noise_type == 'sprs' else 'cubic'} power scaling"
+        )
+        set_power_override(0.0)
+        with profile_scope("power +0 dBm: base precompute_by_channel"):
+            base_all_by_idx, base_valid_l = precompute_by_channel(
+                noise_type, specs, LENGTHS_KM, base_config,
+                noise_f_grid, osa_csv_path, fiber_params,
+            )
+        results: dict[float, tuple[dict, list]] = {}
+        for p in PRECOMPUTE_POWER_LEVELS:
+            scale = _power_scaling_factor(noise_type, float(p))
+            assert scale is not None
+            with profile_scope(f"power {p:+.0f} dBm: scale from 0 dBm"):
+                all_by_idx = (
+                    base_all_by_idx
+                    if float(p) == 0.0
+                    else _scale_precomputed_result(base_all_by_idx, scale)
+                )
+            with profile_scope(f"power {p:+.0f} dBm: save CSV cache"):
+                _cache_precomputed_result(all_by_idx, p, noise_type, list(specs.keys()), index_prefix="ch")
+            _POWER_CACHE[("ch", float(p))] = all_by_idx
+            results[float(p)] = (all_by_idx, base_valid_l)
+
+        set_power_override(0.0)
+        return results[0.0]
+
+    if noise_type == "both":
+        print(
+            "[profile] precompute_by_channel_all_powers: "
+            "using separate 0 dBm FWM/SpRS bases plus cubic/linear power scaling"
+        )
+        set_power_override(0.0)
+        with profile_scope("power +0 dBm: base FWM precompute_by_channel"):
+            fwm_base_by_idx, fwm_valid_l = precompute_by_channel(
+                "fwm", specs, LENGTHS_KM, base_config,
+                noise_f_grid, osa_csv_path, fiber_params,
+            )
+        with profile_scope("power +0 dBm: base SpRS precompute_by_channel"):
+            sprs_base_by_idx, sprs_valid_l = precompute_by_channel(
+                "sprs", specs, LENGTHS_KM, base_config,
+                noise_f_grid, osa_csv_path, fiber_params,
+            )
+        base_valid_l = sorted(set(fwm_valid_l) & set(sprs_valid_l))
+        results: dict[float, tuple[dict, list]] = {}
+        for p in PRECOMPUTE_POWER_LEVELS:
+            fwm_scale = _power_scaling_factor("fwm", float(p))
+            sprs_scale = _power_scaling_factor("sprs", float(p))
+            assert fwm_scale is not None and sprs_scale is not None
+            with profile_scope(f"power {p:+.0f} dBm: combine FWM/SpRS bases"):
+                all_by_idx = _combine_precomputed_results(
+                    fwm_base_by_idx, sprs_base_by_idx, fwm_scale, sprs_scale
+                )
+            with profile_scope(f"power {p:+.0f} dBm: save CSV cache"):
+                _cache_precomputed_result(all_by_idx, p, noise_type, list(specs.keys()), index_prefix="ch")
+            _POWER_CACHE[("ch", float(p))] = all_by_idx
+            results[float(p)] = (all_by_idx, base_valid_l)
+
+        set_power_override(0.0)
+        return results[0.0]
+
+    # Sequential fast path: avoids spawn overhead for fast noise types (e.g. sprs ~1s total)
+    if not _MP_ENABLED or len(PRECOMPUTE_POWER_LEVELS) <= 2:
+        results: dict[float, tuple[dict, list]] = {}
+        for p in PRECOMPUTE_POWER_LEVELS:
+            set_power_override(float(p))
+            with profile_scope(f"power {p:+.0f} dBm: precompute_by_channel"):
+                all_by_idx, valid_l = precompute_by_channel(
+                    noise_type, specs, LENGTHS_KM, base_config,
+                    noise_f_grid, osa_csv_path, fiber_params,
+                )
+            with profile_scope(f"power {p:+.0f} dBm: save CSV cache"):
+                _cache_precomputed_result(all_by_idx, p, noise_type, list(specs.keys()), index_prefix="ch")
+            _POWER_CACHE[("ch", p)] = all_by_idx
+            results[p] = (all_by_idx, valid_l)
+    else:
+        # Parallel: all power levels are independent
+        n_workers = min(len(PRECOMPUTE_POWER_LEVELS), _get_mp_workers())
+        ctx = multiprocessing.get_context()
+        with profile_scope(f"all powers: parallel precompute ({n_workers} workers)"):
+            with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
+                futures = {
+                    executor.submit(
+                        _precompute_channel_worker,
+                        p, noise_type, specs, LENGTHS_KM, base_config,
+                        noise_f_grid, osa_csv_path, fiber_params,
+                    ): p
+                    for p in PRECOMPUTE_POWER_LEVELS
+                }
+                results = {}
+                for fut in futures:
+                    p, all_by_idx, valid_l = fut.result()
+                    # Cache is already written inside the worker
+                    _POWER_CACHE[("ch", p)] = all_by_idx
+                    results[p] = (all_by_idx, valid_l)
+
+    # Extract 0 dBm result
+    result_all, result_valid = results[0.0]
+
+    # Restore 0 dBm in memory cache and power override
+    set_power_override(0.0)
+    _POWER_CACHE[("ch", 0.0)] = result_all
+    return result_all, result_valid
+
+
+def precompute_by_length_all_powers(
+    noise_type: str,
+    specs: dict,
+    LENGTHS_KM: np.ndarray,
+    base_config: WDMConfig,
+    noise_f_grid: np.ndarray,
+    osa_csv_path: Path,
+    fiber_params: dict,
+) -> tuple[dict, list]:
+    """Precompute ALL power levels at startup, save to CSV and memory cache.
+
+    Clears stale CSV cache first, then computes for each power level in
+    PRECOMPUTE_POWER_LEVELS in parallel (if total work justifies spawn overhead),
+    stores in both CSV (for Origin) and _POWER_CACHE (for instant slider response).
+
+    Returns (all_by_len at 0 dBm, valid_ch_indices).
+    """
+    import multiprocessing
+
+    _clear_precomputed_csv_files("len")
+    _POWER_CACHE.clear()
+
+    if noise_type == "both":
+        print(
+            "[profile] precompute_by_length_all_powers: "
+            "using separate 0 dBm FWM/SpRS bases plus cubic/linear power scaling"
+        )
+        set_power_override(0.0)
+        with profile_scope("power +0 dBm: base FWM precompute_by_length"):
+            fwm_base_by_idx, fwm_valid_ch = precompute_by_length(
+                "fwm", specs, LENGTHS_KM, base_config,
+                noise_f_grid, osa_csv_path, fiber_params,
+            )
+        with profile_scope("power +0 dBm: base SpRS precompute_by_length"):
+            sprs_base_by_idx, sprs_valid_ch = precompute_by_length(
+                "sprs", specs, LENGTHS_KM, base_config,
+                noise_f_grid, osa_csv_path, fiber_params,
+            )
+        base_valid_ch = sorted(set(fwm_valid_ch) & set(sprs_valid_ch))
+        results: dict[float, tuple[dict, list]] = {}
+        for p in PRECOMPUTE_POWER_LEVELS:
+            fwm_scale = _power_scaling_factor("fwm", float(p))
+            sprs_scale = _power_scaling_factor("sprs", float(p))
+            assert fwm_scale is not None and sprs_scale is not None
+            with profile_scope(f"power {p:+.0f} dBm: combine FWM/SpRS bases"):
+                all_by_idx = _combine_precomputed_results(
+                    fwm_base_by_idx, sprs_base_by_idx, fwm_scale, sprs_scale
+                )
+            with profile_scope(f"power {p:+.0f} dBm: save CSV cache"):
+                _cache_precomputed_result(all_by_idx, p, noise_type, list(specs.keys()), index_prefix="len")
+            _POWER_CACHE[("len", float(p))] = all_by_idx
+            results[float(p)] = (all_by_idx, base_valid_ch)
+
+        set_power_override(0.0)
+        return results[0.0]
+
+    # Sequential fast path: avoids spawn overhead for fast noise types (e.g. sprs ~1s total)
+    if not _MP_ENABLED or len(PRECOMPUTE_POWER_LEVELS) <= 2:
+        results: dict[float, tuple[dict, list]] = {}
+        for p in PRECOMPUTE_POWER_LEVELS:
+            set_power_override(float(p))
+            all_by_idx, valid_ch = precompute_by_length(
+                noise_type, specs, LENGTHS_KM, base_config,
+                noise_f_grid, osa_csv_path, fiber_params,
+            )
+            _cache_precomputed_result(all_by_idx, p, noise_type, list(specs.keys()), index_prefix="len")
+            _POWER_CACHE[("len", p)] = all_by_idx
+            results[p] = (all_by_idx, valid_ch)
+    else:
+        # Parallel: all power levels are independent
+        n_workers = min(len(PRECOMPUTE_POWER_LEVELS), _get_mp_workers())
+        ctx = multiprocessing.get_context()
+        with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
+            futures = {
+                executor.submit(
+                    _precompute_length_worker,
+                    p, noise_type, specs, LENGTHS_KM, base_config,
+                    noise_f_grid, osa_csv_path, fiber_params,
+                ): p
+                for p in PRECOMPUTE_POWER_LEVELS
+            }
+            results = {}
+            for fut in futures:
+                p, all_by_idx, valid_ch = fut.result()
+                # CSV caching is done inside the worker via precompute_by_length
+                _POWER_CACHE[("len", p)] = all_by_idx
+                results[p] = (all_by_idx, valid_ch)
+
+    # Extract 0 dBm result
+    result_all, result_valid = results[0.0]
+
+    # Restore 0 dBm in memory cache and power override
+    set_power_override(0.0)
+    _POWER_CACHE[("len", 0.0)] = result_all
+    return result_all, result_valid

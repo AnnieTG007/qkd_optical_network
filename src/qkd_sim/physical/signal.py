@@ -1,10 +1,11 @@
 """WDM 信号建模：频谱类型、信道、网格与 G_TX 构建。
 
 公式来源: docs/formulas_signal.md
-支持三种频谱类型:
+支持四种频谱类型:
   - SINGLE_FREQ: 离散单频（功率集中于中心频率）
   - RAISED_COSINE: 连续升余弦滚降谱（公式 3.1），矩形谱为 beta=0 的特例
-  - OSA_SAMPLED: OSA 实测谱（公式 3.2）
+  - NRZ_OOK: 连续 NRZ-OOK 谱（公式 3.2）
+  - OSA_SAMPLED: OSA 实测谱（公式 3.3）
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ class SpectrumType(Enum):
 
     SINGLE_FREQ = "single_freq"
     RAISED_COSINE = "raised_cosine"
+    NRZ_OOK = "nrz_ook"
     OSA_SAMPLED = "osa_sampled"
 
 
@@ -189,6 +191,8 @@ class WDMChannel:
             return np.zeros_like(f_grid)
         elif self.spectrum_type == SpectrumType.RAISED_COSINE:
             raw = self._psd_raised_cosine(f_grid)
+        elif self.spectrum_type == SpectrumType.NRZ_OOK:
+            raw = self._psd_nrz_ook(f_grid)
         elif self.spectrum_type == SpectrumType.OSA_SAMPLED:
             raw = self._psd_osa(f_grid)
         else:
@@ -226,6 +230,30 @@ class WDMChannel:
         psd[mask_roll] = (self.power / R_s) * 0.5 * (1.0 + np.cos(cos_arg))
 
         return psd
+
+    def _psd_nrz_ook(self, f_grid: np.ndarray) -> np.ndarray:
+        """NRZ-OOK PSD。公式 3.2 (formulas_signal.md)。
+
+        G_TX(f) = (P_ch / R_b) * sinc^2(pi*f*T_b) / (1 + (f/f_c)^2)
+
+        其中 T_b = 1/R_b，f_c = 0.7 * R_b，R_b = B_s（比特速率 = 信号带宽）。
+        """
+        R_b = self.B_s
+        T_b = 1.0 / R_b
+        f_c = 0.7 * R_b
+
+        delta_f = f_grid - self.f_center
+
+        # sinc^2 component: sinc(x) = sin(x)/x, sinc(0) = 1
+        x = np.pi * delta_f * T_b
+        with np.errstate(divide='ignore', invalid='ignore'):
+            sinc_sq = np.where(np.abs(x) < 1e-12, 1.0, np.sin(x) / x)
+            sinc_sq = sinc_sq ** 2
+
+        # Lorentzian component
+        lorentzian = 1.0 / (1.0 + (delta_f / f_c) ** 2)
+
+        return (self.power / R_b) * sinc_sq * lorentzian
 
     def _psd_osa(self, f_grid: np.ndarray) -> np.ndarray:
         """OSA 实测谱插值。公式 3.3 (formulas_signal.md)。
@@ -317,6 +345,7 @@ def build_wdm_grid(
     osa_csv_path: str | Path | None = None,
     osa_rbw: float | None = None,
     classical_channel_indices: list[int] | None = None,
+    modulation_format: str = "OOK",
 ) -> WDMGrid:
     """根据 WDMConfig 构建 WDM 信道网格。
 
@@ -329,8 +358,15 @@ def build_wdm_grid(
       - config.quantum_channel_indices 中的信道为量子信道
       - 其余信道为 inactive（无功率，不参与噪声计算）
 
+    ``config.num_channels`` 由 ``start_channel`` / ``end_channel`` 派生，
+    ``config.channel_powers_W`` 可对单个经典信道做功率覆盖。
+
     频率网格公式 (formulas_signal.md 第5节):
         f_channels = start_freq + (channel_number - start_channel) * spacing
+
+    调制格式 (modulation_format) 对连续解析模型的影响：
+      - "OOK"：classical 信道用 NRZ_OOK；OSA 默认用 spectrum_OOK.csv
+      - "16QAM"：classical 信道用 RAISED_COSINE；OSA 默认用 spectrum_16QAM.csv
 
     OSA_SAMPLED 谱型：
       - 从 osa_csv_path 加载模板后，将峰值平移对齐到每个经典信道的 f_center
@@ -350,13 +386,20 @@ def build_wdm_grid(
         OSA 分辨率带宽 [Hz]（OSA_SAMPLED 类型必需）
     classical_channel_indices : list[int] or None
         显式指定经典信道索引（覆盖默认行为）
+    modulation_format : str
+        调制格式，"OOK" 或 "16QAM"（默认 "OOK"）
 
     Returns
     -------
     WDMGrid
     """
-    all_indices_set = set(range(int(config.num_channels)))
+    if modulation_format not in ("OOK", "16QAM"):
+        raise ValueError(f"modulation_format must be 'OOK' or '16QAM', got '{modulation_format}'")
+
+    num_channels = int(config.num_channels)
+    all_indices_set = set(range(num_channels))
     quantum_set = set(config.quantum_channel_indices)
+    power_overrides = config.channel_powers_W or {}
 
     if not quantum_set.issubset(all_indices_set):
         raise ValueError("quantum_channel_indices contains out-of-range values")
@@ -373,16 +416,25 @@ def build_wdm_grid(
                 f"Classical and quantum channel sets overlap: {sorted(overlap)}"
             )
 
-    indices = np.arange(config.start_channel, config.start_channel + config.num_channels, dtype=float)
+    indices = np.arange(config.start_channel, config.start_channel + num_channels, dtype=float)
     f_channels = config.start_freq + (indices - config.start_channel) * config.channel_spacing
+
+    # 确定调制格式对应的解析谱型
+    if modulation_format == "OOK":
+        analytic_stype = SpectrumType.NRZ_OOK
+        osa_default_name = "spectrum_OOK.csv"
+    else:  # 16QAM
+        analytic_stype = SpectrumType.RAISED_COSINE
+        osa_default_name = "spectrum_16QAM.csv"
 
     # OSA 模板预处理（峰值对齐至各信道 f_center）
     osa_offsets = None
     osa_template_psd = None
     if spectrum_type == SpectrumType.OSA_SAMPLED:
-        if osa_csv_path is None or osa_rbw is None:
-            raise ValueError("OSA_SAMPLED requires osa_csv_path and osa_rbw")
-        osa_f_raw, osa_psd_raw = load_osa_csv(Path(osa_csv_path), osa_rbw)
+        if osa_rbw is None:
+            raise ValueError("OSA_SAMPLED requires osa_rbw")
+        csv_path = osa_csv_path if osa_csv_path is not None else osa_default_name
+        osa_f_raw, osa_psd_raw = load_osa_csv(Path(csv_path), osa_rbw)
         template_center = float(osa_f_raw[int(np.argmax(osa_psd_raw))])
         osa_offsets = osa_f_raw - template_center  # 相对偏移
         osa_template_psd = osa_psd_raw
@@ -391,8 +443,12 @@ def build_wdm_grid(
     for i, f_c in enumerate(f_channels):
         if i in classical_set:
             ch_type = "classical"
-            power = config.P0
-            ch_stype = spectrum_type
+            power = power_overrides.get(i, config.P0)
+            # 解析谱型由调制格式决定（连续模型），但 SINGLE_FREQ 保持不变
+            if spectrum_type == SpectrumType.SINGLE_FREQ:
+                ch_stype = SpectrumType.SINGLE_FREQ
+            else:
+                ch_stype = analytic_stype if spectrum_type != SpectrumType.OSA_SAMPLED else spectrum_type
             osa_f_ch = None
             osa_psd_ch = None
             if ch_stype == SpectrumType.OSA_SAMPLED:
@@ -450,7 +506,7 @@ def build_frequency_grid(
     ndarray
         均匀频率网格 [Hz]
     """
-    half_span = (config.num_channels - 1) / 2.0 * config.channel_spacing
+    half_span = (int(config.num_channels) - 1) / 2.0 * config.channel_spacing
     center_freq = config.start_freq + half_span
     padding = padding_factor * config.channel_spacing
     f_min = center_freq - half_span - padding

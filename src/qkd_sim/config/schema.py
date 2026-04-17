@@ -7,6 +7,7 @@ dataclass 的 __post_init__ 统一转换为 SI 基本单位。
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -87,10 +88,6 @@ class WDMConfig:
     频率公式: f(n) = start_freq + (n - start_channel) * channel_spacing
     ITU-T G.694.1 标准 C-band: start_freq=190.1e12, start_channel=1, end_channel=61
 
-    支持灵活信道间隔：在 YAML 中指定 num_channels，start_freq 和 end_freq 保持不变。
-    示例: start_freq=190.1e12, channel_spacing=200e9, num_channels=31
-          → 信道: C01(190.1), C02(190.3), ..., C31(196.1) THz
-
     Attributes
     ----------
     start_freq : float
@@ -100,10 +97,10 @@ class WDMConfig:
     start_channel : float
         起始信道号（支持半信道，如 1.5）
     end_channel : float
-        终止信道号（当 num_channels 指定时自动计算）
+        终止信道号
     num_channels : int | None
-        信道总数。指定时 end_channel 由 start_channel + num_channels - 1 计算，
-        使得修改 channel_spacing 时可以保持 start_freq 和 end_freq 不变。
+        信道总数（由 start_channel / end_channel 派生）。
+        为兼容旧调用保留该字段；若显式传入，必须与派生值一致。
     B_s : float
         信号带宽 / 符号速率 [Hz]
     P0 : float
@@ -112,6 +109,8 @@ class WDMConfig:
         升余弦滚降因子 [0, 1]，0 = 矩形谱
     quantum_channel_indices : list[int]
         量子信道在信道数组中的索引列表（0-based）
+    channel_powers_W : dict[int, float] | None
+        可选：zero-based 经典信道功率覆盖 [W]。未列出的经典信道使用 P0。
     """
 
     start_freq: float
@@ -122,13 +121,66 @@ class WDMConfig:
     P0: float
     beta_rolloff: float = 0.0
     quantum_channel_indices: list[int] = field(default_factory=list)
+    channel_powers_W: dict[int, float] | None = None
     num_channels: int | None = None  # 可选：信道总数
 
     def __post_init__(self) -> None:
-        if self.num_channels is not None:
-            object.__setattr__(
-                self, 'end_channel', self.start_channel + self.num_channels - 1
+        if self.channel_spacing <= 0.0:
+            raise ValueError("channel_spacing must be positive")
+        if self.B_s <= 0.0:
+            raise ValueError("B_s must be positive")
+        if self.P0 < 0.0:
+            raise ValueError("P0 must be non-negative")
+
+        derived_channels = self.end_channel - self.start_channel + 1.0
+        derived_rounded = int(round(derived_channels))
+        if derived_rounded <= 0 or not math.isclose(
+            derived_channels,
+            float(derived_rounded),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError(
+                "start_channel and end_channel must define a positive integer "
+                f"number of channels; got {self.start_channel} -> {self.end_channel}"
             )
+
+        if self.num_channels is not None and int(self.num_channels) != derived_rounded:
+            raise ValueError(
+                "num_channels conflicts with start_channel/end_channel: "
+                f"derived {derived_rounded}, got {self.num_channels}"
+            )
+        object.__setattr__(self, "num_channels", derived_rounded)
+
+        invalid_quantum = [
+            idx for idx in self.quantum_channel_indices
+            if idx < 0 or idx >= derived_rounded
+        ]
+        if invalid_quantum:
+            raise ValueError(
+                "quantum_channel_indices contains out-of-range values: "
+                f"{invalid_quantum}"
+            )
+
+        if self.channel_powers_W is None:
+            return
+
+        normalized_channel_powers: dict[int, float] = {}
+        for raw_idx, raw_power in self.channel_powers_W.items():
+            idx = int(raw_idx)
+            power = float(raw_power)
+            if idx < 0 or idx >= derived_rounded:
+                raise ValueError(
+                    "channel_powers_W contains out-of-range channel index: "
+                    f"{raw_idx}"
+                )
+            if power < 0.0:
+                raise ValueError(
+                    "channel_powers_W contains negative power: "
+                    f"channel {raw_idx} -> {raw_power}"
+                )
+            normalized_channel_powers[idx] = power
+        object.__setattr__(self, "channel_powers_W", normalized_channel_powers)
 
 
 @dataclass

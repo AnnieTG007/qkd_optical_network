@@ -45,7 +45,7 @@ $$
 
 ---
 
-## 3. G_TX(f) 的两种建模方式
+## 3. G_TX(f) 的三种建模方式
 
 ### 3.1 升余弦滚降谱（矩形谱为 β=0 的特例）
 
@@ -87,7 +87,23 @@ $$
 
 注意：功率归一化条件 $\int G_{\text{TX}}(f) df = P_{\text{ch}}$ 需要验证。
 
-### 3.2 OSA真实采样
+### 3.2 NRZ-OOK 信号建模（公式 3.2）
+
+NRZ-OOK 信号的功率谱密度为：
+
+$$
+G_{\text{TX}}(f) = \frac{P_{\text{ch}}}{R_b} \cdot \text{sinc}^2(\pi f T_b) \cdot \frac{1}{1 + \left(\frac{f}{f_c}\right)^2}
+$$
+
+其中：
+- $T_b = 1 / R_b$：比特周期 [s]（$R_b$ 为比特速率，通常 $R_b = B_s$）
+- $f_c = 0.7 R_b$：截止频率 [Hz]
+
+**峰值高度**：NRZ-OOK 谱在 f=0 处取得峰值，高于同等功率的矩形谱峰值。
+
+注意：功率归一化条件 $\int G_{\text{TX}}(f) df = P_{\text{ch}}$ 由 `normalize_psd_to_power` 在计算时强制满足。
+
+### 3.3 OSA真实采样
 
 直接读取OSA（光谱分析仪）返回的频谱采样数据作为 G_TX(f)。
 

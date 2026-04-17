@@ -8,6 +8,7 @@
 - g_R(f₁,f₂)：拉曼系数 = g_eff/A_eff [1/(W·m)]
 - n_th(Δf)：声子占据因子 [无量纲]
 - Δf = |f₁ - f₂|：泵浦-信号频率差 [Hz]
+- B_noise：接收端噪声收集带宽 / 等效光学带宽 [Hz]
 - h：普朗克常数 = 6.626e-34 [J·s]
 - k：玻尔兹曼常数 = 1.381e-23 [J/K]
 - T：工作温度 [K]
@@ -38,18 +39,21 @@ $$
 斯托克斯过程（f₂ > f₁，泵浦频率高于信号频率）：
 
 $$
-\sigma_{1,2} = 2 \times h \times f_1 \times g_R(f_2, f_1) \times (1 + n_{\text{th}}(\Delta f)) \times \Delta f
+\sigma_{1,2} = 2 \times h \times f_1 \times g_R(f_2, f_1) \times (1 + n_{\text{th}}(\Delta f)) \times B_{\text{noise}}
 $$
 
 反斯托克斯过程（f₂ < f₁，泵浦频率低于信号频率）：
 
 $$
-\sigma_{1,2} = 2 \times h \times f_1 \times g_R(f_1, f_2) \times n_{\text{th}}(\Delta f) \times \frac{f_1}{f_2} \times \Delta f
+\sigma_{1,2} = 2 \times h \times f_1 \times g_R(f_1, f_2) \times n_{\text{th}}(\Delta f) \times \frac{f_1}{f_2} \times B_{\text{noise}}
 $$
 
 单位：[1/m]
 
-注意：σ_{1,2} 中的 Δf 是泵浦-信号频率差 |f₁-f₂| [Hz]，不是积分微元。此定义在离散和连续模型中保持不变。
+注意：
+- `Δf = |f₁-f₂|` 仅用于计算 `g_R` 和 `n_th`
+- `B_noise` 表示接收端噪声收集带宽，不是 Raman 频移
+- 离散模型通常取目标量子信道带宽；连续谱绘制时通常取输出频率 bin 宽度 `df`
 
 ---
 

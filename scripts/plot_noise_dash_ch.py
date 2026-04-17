@@ -26,6 +26,7 @@ from scripts.dash_utils import (
     FIBER_PARAMS,
     LENGTHS_KM,
     NOISE_FLOOR_W,
+    PRECOMPUTE_POWER_LEVELS,
     WDM_PARAMS,
     _LEGEND_SYNC_JS,
     _build_caption,
@@ -36,10 +37,12 @@ from scripts.dash_utils import (
     adaptive_linear_ticks,
     adaptive_log_ticks,
     get_noise_model_keys,
-    precompute_by_channel,
+    precompute_by_channel_all_powers,
+    print_compute_device,
+    profile_scope,
+    set_csv_cache_enabled,
     set_power_override,
-    _load_cached_power,
-    _cache_precomputed_result,
+    _POWER_CACHE,
 )
 
 
@@ -74,40 +77,76 @@ def _global_ranges(all_data: dict, model_keys: list[str]) -> tuple[tuple[float, 
     return y_log, y_lin
 
 
+def _select_profile_lengths(lengths_km: np.ndarray, count: int | None) -> np.ndarray:
+    """Return evenly spaced fiber lengths for bounded profiling runs."""
+    if count is None or count >= len(lengths_km):
+        return np.asarray(lengths_km, dtype=np.float64)
+    if count <= 1:
+        return np.asarray([float(lengths_km[len(lengths_km) // 2])], dtype=np.float64)
+    indices = np.linspace(0, len(lengths_km) - 1, num=count, dtype=int)
+    indices = np.unique(indices)
+    return np.asarray([float(lengths_km[i]) for i in indices], dtype=np.float64)
+
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--type", default="fwm", choices=["fwm", "sprs", "both", "only_signal", "with_signal"])
+parser.add_argument(
+    "--profile-only",
+    action="store_true",
+    help="Run a bounded 0 dBm precompute profile and exit before starting Dash.",
+)
+parser.add_argument(
+    "--profile-length-count",
+    type=int,
+    default=3,
+    help="Number of evenly spaced fiber lengths used with --profile-only.",
+)
 ARGS = parser.parse_args()
 NOISE_TYPE = ARGS.type
+ACTIVE_LENGTHS_KM = _select_profile_lengths(
+    LENGTHS_KM,
+    ARGS.profile_length_count if ARGS.profile_only else None,
+)
+if ARGS.profile_only:
+    PRECOMPUTE_POWER_LEVELS[:] = [0.0]
+    set_csv_cache_enabled(False)
 
 print("=" * 60)
-print(f"Precomputing channel sweep for type={NOISE_TYPE}")
-t0 = time.time()
+print_compute_device()
+if ARGS.profile_only:
+    print(
+        f"Profiling type={NOISE_TYPE} at 0 dBm with "
+        f"{len(ACTIVE_LENGTHS_KM)} fiber length samples: {ACTIVE_LENGTHS_KM.tolist()}"
+    )
+else:
+    print(f"Precomputing ALL power levels for type={NOISE_TYPE}")
+t0 = time.perf_counter()
 
-osa_csv_path = _resolve_osa_csv()
-base_quantum_indices = [
-    i
-    for i in range(int(WDM_PARAMS["end_channel"] - WDM_PARAMS["start_channel"] + 1))
-    if i not in CLASSICAL_INDICES
-]
-# Quantum channel center frequencies for discrete model x-axis
-quantum_center_freqs = np.array(
-    [
-        WDM_PARAMS["start_freq"] + idx * WDM_PARAMS["channel_spacing"]
-        for idx in base_quantum_indices
-    ],
-    dtype=np.float64,
-)
-base_config = _build_wdm_config(base_quantum_indices)
-noise_f_grid = _build_noise_frequency_grid(base_config)
-specs = load_model_specs("fwm_noise")
-model_keys = get_noise_model_keys(NOISE_TYPE)
+with profile_scope("startup: build config, frequency grid, model specs"):
+    osa_csv_path = _resolve_osa_csv()
+    base_quantum_indices = [
+        i
+        for i in range(int(WDM_PARAMS["end_channel"] - WDM_PARAMS["start_channel"] + 1))
+        if i not in CLASSICAL_INDICES
+    ]
+    # Quantum channel center frequencies for discrete model x-axis
+    quantum_center_freqs = np.array(
+        [
+            WDM_PARAMS["start_freq"] + idx * WDM_PARAMS["channel_spacing"]
+            for idx in base_quantum_indices
+        ],
+        dtype=np.float64,
+    )
+    base_config = _build_wdm_config(base_quantum_indices)
+    noise_f_grid = _build_noise_frequency_grid(base_config)
+    specs = load_model_specs("fwm_noise")
+    model_keys = get_noise_model_keys(NOISE_TYPE)
 
-# Initial precompute at default power (0 dBm)
-set_power_override(0.0)
-ALL_BY_CH, VALID_L_INDICES = precompute_by_channel(
+# Precompute ALL power levels at startup
+ALL_BY_CH, VALID_L_INDICES = precompute_by_channel_all_powers(
     noise_type=NOISE_TYPE,
     specs=specs,
-    LENGTHS_KM=LENGTHS_KM,
+    LENGTHS_KM=ACTIVE_LENGTHS_KM,
     base_config=base_config,
     noise_f_grid=noise_f_grid,
     osa_csv_path=osa_csv_path,
@@ -116,8 +155,17 @@ ALL_BY_CH, VALID_L_INDICES = precompute_by_channel(
 if not VALID_L_INDICES:
     raise RuntimeError(f"No valid lengths found for noise type {NOISE_TYPE!r}")
 
-Y_LOG_RANGE, Y_DBM_RANGE = _global_ranges(ALL_BY_CH, model_keys)
-elapsed = time.time() - t0
+with profile_scope("startup: global y-axis range"):
+    Y_LOG_RANGE, Y_DBM_RANGE = _global_ranges(ALL_BY_CH, model_keys)
+
+# Precompute y-axis ranges for all power levels (avoids repeated _global_ranges
+# calls on every slider callback — each call iterates all cached data).
+with profile_scope("startup: y-axis ranges for all power levels"):
+    _POWER_Y_RANGES: dict[float, tuple[tuple[float, float], tuple[float, float]]] = {}
+    for p in PRECOMPUTE_POWER_LEVELS:
+        data = _POWER_CACHE.get(("ch", p), _POWER_CACHE.get(("ch", 0.0), {}))
+        _POWER_Y_RANGES[p] = _global_ranges(data, model_keys)
+elapsed = time.perf_counter() - t0
 print(f"Precompute done in {elapsed:.1f}s. Valid selections: {len(VALID_L_INDICES)}")
 
 # Diagnostic: verify continuous vs discrete model data shapes
@@ -131,17 +179,20 @@ for mk in model_keys:
     y_kind = entry.get("y_kind", "N/A")
     print(f"  {mk}: x.shape={x.shape}, fwd.shape={fwd.shape}, x_kind={x_kind}, y_kind={y_kind}")
 
+if ARGS.profile_only:
+    sys.exit(0)
+
 app = Dash(__name__)
 app.index_string = app.index_string.replace("</body>", "<script>" + _LEGEND_SYNC_JS + "</script></body>")
 
 step = max(1, len(VALID_L_INDICES) // 10)
 slider_marks = {
-    i: {"label": f"{LENGTHS_KM[VALID_L_INDICES[i]]:.0f}", "style": {"font-size": "9px"}}
+    i: {"label": f"{ACTIVE_LENGTHS_KM[VALID_L_INDICES[i]]:.0f}", "style": {"font-size": "9px"}}
     for i in range(0, len(VALID_L_INDICES), step)
 }
 if (len(VALID_L_INDICES) - 1) not in slider_marks:
     last = len(VALID_L_INDICES) - 1
-    slider_marks[last] = {"label": f"{LENGTHS_KM[VALID_L_INDICES[last]]:.0f}", "style": {"font-size": "9px"}}
+    slider_marks[last] = {"label": f"{ACTIVE_LENGTHS_KM[VALID_L_INDICES[last]]:.0f}", "style": {"font-size": "9px"}}
 
 app.layout = html.Div(
     [
@@ -166,11 +217,11 @@ app.layout = html.Div(
                 html.Label("Classical Channel Power [dBm]"),
                 dcc.Slider(
                     id="power-slider",
-                    min=-15,
-                    max=15,
-                    step=0.5,
-                    value=0,
-                    marks={-15: "-15", -10: "-10", -5: "-5", 0: "0", 5: "5", 10: "10", 15: "15"},
+                    min=0,
+                    max=len(PRECOMPUTE_POWER_LEVELS) - 1,
+                    step=1,
+                    value=3,  # 0 dBm is index 3
+                    marks={i: f"{int(p)}" for i, p in enumerate(PRECOMPUTE_POWER_LEVELS)},
                 ),
             ],
             style=dict(width="92%", padding="10px 0"),
@@ -188,7 +239,7 @@ app.layout = html.Div(
 )
 def update_display(selection_idx: int) -> str:
     l_idx = VALID_L_INDICES[selection_idx]
-    return f"Selected fiber length: {LENGTHS_KM[l_idx]:.1f} km"
+    return f"Selected fiber length: {ACTIVE_LENGTHS_KM[l_idx]:.1f} km"
 
 
 @app.callback(
@@ -198,47 +249,16 @@ def update_display(selection_idx: int) -> str:
     State("length-slider", "value"),
     prevent_initial_call=False,
 )
-def update_power_and_graph(power_dbm: float, length_selection_idx: int) -> tuple[str, go.Figure]:
-    # Apply power override and try to load from CSV cache
+def update_power_and_graph(power_idx: int, length_selection_idx: int) -> tuple[str, go.Figure]:
+    power_dbm = PRECOMPUTE_POWER_LEVELS[power_idx]
     set_power_override(power_dbm)
-    cached, loaded_power = _load_cached_power(NOISE_TYPE, model_keys, index_prefix="ch")
-    if cached is not None:
-        # Restore x metadata by model type: continuous uses noise_f_grid, discrete uses channel centers
-        for li in cached:
-            for mk in cached[li]:
-                if specs[mk]["continuous"] or NOISE_TYPE == "with_signal":
-                    cached[li][mk]["x"] = np.asarray(noise_f_grid, dtype=np.float64)
-                    cached[li][mk]["x_kind"] = "frequency_grid"
-                    cached[li][mk]["y_kind"] = "power_per_bin"
-                else:
-                    cached[li][mk]["x"] = np.asarray(quantum_center_freqs, dtype=np.float64)
-                    cached[li][mk]["x_kind"] = "channel_center"
-                    cached[li][mk]["y_kind"] = "channel_power"
-        all_by_ch = cached
-        valid_l_indices = [
-            li for li in range(len(LENGTHS_KM))
-            if any(
-                np.any(all_by_ch[li][mk]["fwd"] > 0) or np.any(all_by_ch[li][mk]["bwd"] > 0)
-                for mk in model_keys
-            )
-        ]
-        label = f"Classical power: {power_dbm:.1f} dBm (loaded from cache)"
-    else:
-        # Cache miss: recompute
-        all_by_ch, valid_l_indices = precompute_by_channel(
-            noise_type=NOISE_TYPE,
-            specs=specs,
-            LENGTHS_KM=LENGTHS_KM,
-            base_config=base_config,
-            noise_f_grid=noise_f_grid,
-            osa_csv_path=osa_csv_path,
-            fiber_params=FIBER_PARAMS,
-        )
-        # Save to CSV cache
-        _cache_precomputed_result(all_by_ch, loaded_power, NOISE_TYPE, model_keys, index_prefix="ch")
-        label = f"Classical power: {power_dbm:.1f} dBm (computed)"
+    cache_key = ("ch", power_dbm)
+    all_by_ch = _POWER_CACHE.get(cache_key, _POWER_CACHE.get(("ch", 0.0), {}))
+    valid_l_indices = VALID_L_INDICES
+    label = f"Classical power: {power_dbm:.1f} dBm (precomputed)"
     global Y_LOG_RANGE, Y_DBM_RANGE
-    Y_LOG_RANGE, Y_DBM_RANGE = _global_ranges(all_by_ch, model_keys)
+    _y_range = _POWER_Y_RANGES.get(power_dbm, (Y_LOG_RANGE, Y_DBM_RANGE))
+    Y_LOG_RANGE, Y_DBM_RANGE = _y_range
     l_idx = valid_l_indices[length_selection_idx]
     fig = _make_figure(all_by_ch[l_idx], l_idx)
     return label, fig
@@ -250,9 +270,16 @@ def update_power_and_graph(power_dbm: float, length_selection_idx: int) -> tuple
     State("power-slider", "value"),
     prevent_initial_call=True,
 )
-def update_graph_on_length(length_selection_idx: int, power_dbm: float) -> go.Figure:
+def update_graph_on_length(length_selection_idx: int, power_idx: int) -> go.Figure:
+    power_dbm = PRECOMPUTE_POWER_LEVELS[power_idx]
+    set_power_override(power_dbm)
+    cache_key = ("ch", power_dbm)
+    all_by_ch = _POWER_CACHE.get(cache_key, _POWER_CACHE.get(("ch", 0.0), {}))
+    global Y_LOG_RANGE, Y_DBM_RANGE
+    _y_range = _POWER_Y_RANGES.get(power_dbm, (Y_LOG_RANGE, Y_DBM_RANGE))
+    Y_LOG_RANGE, Y_DBM_RANGE = _y_range
     l_idx = VALID_L_INDICES[length_selection_idx]
-    fig = _make_figure(ALL_BY_CH[l_idx], l_idx)
+    fig = _make_figure(all_by_ch[l_idx], l_idx)
     return fig
 
 
@@ -361,7 +388,8 @@ def _make_figure(sweep: dict, l_idx: int) -> go.Figure:
         width=1500,
         height=560,
         legend=dict(groupclick="toggleitem"),
-        title=f"Noise vs Channel Frequency [{NOISE_TYPE}] | L = {LENGTHS_KM[l_idx]:.1f} km",
+        title=f"Noise vs Channel Frequency [{NOISE_TYPE}]"
+        + (f" | L = {ACTIVE_LENGTHS_KM[l_idx]:.1f} km" if NOISE_TYPE != "only_signal" else " | G_TX (fiber-length independent)"),
         annotations=[
             dict(
                 x=0.5,

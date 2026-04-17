@@ -27,6 +27,7 @@ from scripts.dash_utils import (
     FIBER_PARAMS,
     LENGTHS_KM,
     NOISE_FLOOR_W,
+    PRECOMPUTE_POWER_LEVELS,
     WDM_PARAMS,
     _LEGEND_SYNC_JS,
     _build_caption,
@@ -37,10 +38,10 @@ from scripts.dash_utils import (
     adaptive_linear_ticks,
     adaptive_log_ticks,
     get_noise_model_keys,
-    precompute_by_length,
+    precompute_by_length_all_powers,
+    print_compute_device,
     set_power_override,
-    _cache_precomputed_result,
-    _load_cached_power,
+    _POWER_CACHE,
 )
 
 
@@ -73,7 +74,8 @@ ARGS = parser.parse_args()
 NOISE_TYPE = ARGS.type
 
 print("=" * 60)
-print(f"Precomputing length sweep for type={NOISE_TYPE}")
+print_compute_device()
+print(f"Precomputing ALL power levels for type={NOISE_TYPE}")
 t0 = time.time()
 
 osa_csv_path = _resolve_osa_csv()
@@ -87,9 +89,8 @@ noise_f_grid = _build_noise_frequency_grid(base_config)
 specs = load_model_specs("fwm_noise")
 model_keys = get_noise_model_keys(NOISE_TYPE)
 
-# Initial precompute at default power (0 dBm)
-set_power_override(0.0)
-ALL_BY_LEN, VALID_INDICES = precompute_by_length(
+# Precompute ALL power levels at startup
+ALL_BY_LEN, VALID_INDICES = precompute_by_length_all_powers(
     noise_type=NOISE_TYPE,
     specs=specs,
     LENGTHS_KM=LENGTHS_KM,
@@ -146,11 +147,11 @@ app.layout = html.Div(
                 html.Label("Classical Channel Power [dBm]"),
                 dcc.Slider(
                     id="power-slider",
-                    min=-15,
-                    max=15,
-                    step=0.5,
-                    value=0,
-                    marks={-15: "-15", -10: "-10", -5: "-5", 0: "0", 5: "5", 10: "10", 15: "15"},
+                    min=0,
+                    max=len(PRECOMPUTE_POWER_LEVELS) - 1,
+                    step=1,
+                    value=3,  # 0 dBm is index 3
+                    marks={i: f"{int(p)}" for i, p in enumerate(PRECOMPUTE_POWER_LEVELS)},
                 ),
             ],
             style=dict(width="92%", padding="10px 0"),
@@ -184,29 +185,14 @@ def update_display(selection_idx: int) -> str:
     State("channel-slider", "value"),
     prevent_initial_call=False,
 )
-def update_power_and_graph(power_dbm: float, channel_selection_idx: int) -> tuple[str, go.Figure]:
-    # Apply power override and try to load from CSV cache
+def update_power_and_graph(power_idx: int, channel_selection_idx: int) -> tuple[str, go.Figure]:
+    power_dbm = PRECOMPUTE_POWER_LEVELS[power_idx]
     set_power_override(power_dbm)
-    cached, loaded_power = _load_cached_power(NOISE_TYPE, model_keys, index_prefix="len")
-    if cached is not None:
-        all_by_len = cached
-        label = f"Classical power: {power_dbm:.1f} dBm (loaded from cache)"
-    else:
-        all_by_len, _ = precompute_by_length(
-            noise_type=NOISE_TYPE,
-            specs=specs,
-            LENGTHS_KM=LENGTHS_KM,
-            base_config=base_config,
-            noise_f_grid=noise_f_grid,
-            osa_csv_path=osa_csv_path,
-            fiber_params=FIBER_PARAMS,
-        )
-        _cache_precomputed_result(all_by_len, loaded_power, NOISE_TYPE, model_keys, index_prefix="len")
-        label = f"Classical power: {power_dbm:.1f} dBm (computed)"
-
+    cache_key = ("len", power_dbm)
+    all_by_len = _POWER_CACHE.get(cache_key, _POWER_CACHE.get(("len", 0.0), {}))
+    label = f"Classical power: {power_dbm:.1f} dBm (precomputed)"
     global Y_LOG_RANGE, Y_DBM_RANGE
     Y_LOG_RANGE, Y_DBM_RANGE = _global_ranges(all_by_len, model_keys)
-    # Use VALID_INDICES (from startup precompute) to map slider position to channel
     ch_idx = VALID_INDICES[channel_selection_idx]
     fig = _make_figure(all_by_len[ch_idx], ch_idx)
     return label, fig
@@ -218,7 +204,7 @@ def update_power_and_graph(power_dbm: float, channel_selection_idx: int) -> tupl
     State("power-slider", "value"),
     prevent_initial_call=True,
 )
-def update_graph_on_channel(channel_selection_idx: int, power_dbm: float) -> go.Figure:
+def update_graph_on_channel(channel_selection_idx: int, power_idx: int) -> go.Figure:
     if NOISE_TYPE == "with_signal":
         ch_idx = VALID_INDICES[channel_selection_idx]
     else:

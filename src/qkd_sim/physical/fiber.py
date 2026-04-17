@@ -14,6 +14,11 @@ from scipy.constants import c as c_light
 from qkd_sim.config.schema import FiberConfig
 
 
+def _array_cache_key(arr: np.ndarray) -> tuple:
+    """Convert a NumPy array to a hashable cache key (preserves dtype + values)."""
+    return (arr.flags["C_CONTIGUOUS"], arr.dtype.str, tuple(arr.ravel()))
+
+
 class Fiber:
     """光纤参数容器，支持频率相关的物理参数查询。
 
@@ -44,6 +49,8 @@ class Fiber:
         self._A_eff = config.A_eff            # m²
         self._rayleigh_coeff = config.rayleigh_coeff  # 1/m³
         self._T = config.T_kelvin             # K
+        # Phase-mismatch memoization cache: key = (key(f2), key(f3), key(f4)), value = Δβ
+        self._pm_cache: dict = {}
 
     # ---- 属性访问 ----
 
@@ -159,6 +166,15 @@ class Fiber:
         f3 = np.asarray(f3, dtype=np.float64)
         f4 = np.asarray(f4, dtype=np.float64)
 
+        # Memoization helps repeated scalar/small-array calls, but large arrays
+        # are usually one-off in continuous FWM sweeps. Building tuple keys for
+        # those arrays can dominate runtime, so skip caching above this size.
+        cache_key = None
+        if max(f2.size, f3.size, f4.size) <= 4096:
+            cache_key = (_array_cache_key(f2), _array_cache_key(f3), _array_cache_key(f4))
+            if cache_key in self._pm_cache:
+                return self._pm_cache[cache_key]
+
         # 使用 f₂ 对应波长作为展开中心
         lambda_c = c_light / f2
 
@@ -173,6 +189,8 @@ class Fiber:
             * df32 * df42
             * (D_c + (lambda_c**2 / (2.0 * c_light)) * (df32 + df42) * self._D_slope)
         )
+        if cache_key is not None:
+            self._pm_cache[cache_key] = delta_beta
         return delta_beta
 
     def get_effective_length(self, freq: float | np.ndarray | None = None) -> float:

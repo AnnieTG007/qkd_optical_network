@@ -54,19 +54,22 @@ def _raman_cross_section(
     g_R: np.ndarray,
     n_th: np.ndarray,
     delta_f: np.ndarray,
-    bandwidth: float,
+    noise_bandwidth: float | np.ndarray,
 ) -> np.ndarray:
     """拉曼横截面积 σ_{1,2}，区分 Stokes / anti-Stokes。
 
-    公式 3.1.4 (formulas_sprs.md):
+    这里采用的实现口径与 Raman amplifier 文献中的 spontaneous-noise 项一致：
+    ``g_R`` 和 ``n_th`` 由泵浦-信号频移 ``delta_f = |f_q - f_c|`` 决定，
+    而乘法中的频率项对应接收端噪声带宽 ``noise_bandwidth``，不是 Raman 频移本身。
+
+    公式 3.1.4 (formulas_sprs.md, 修订后):
         Stokes (f_c > f_q，泵浦频率高于量子信道，散射光为低频):
-            σ = 2·h·f_q · g_R(f_c, f_q) · (1 + n_th) · Δf
+            σ = 2·h·f_q · g_R(f_c, f_q) · (1 + n_th) · B_noise
 
         anti-Stokes (f_c < f_q，泵浦频率低于量子信道，散射光为高频):
-            σ = 2·h·f_q · g_R(f_q, f_c) · n_th · (f_q/f_c) · Δf
+            σ = 2·h·f_q · g_R(f_q, f_c) · n_th · (f_q/f_c) · B_noise
 
-    这里的 Δf 是信道采样带宽（channel.spacing），而非 |f_q - f_c|。
-    delta_f 参数仅用于插值 g_R 和计算声子占据因子 n_th。
+    ``delta_f`` 参数仅用于插值 ``g_R`` 和计算声子占据因子 ``n_th``。
 
     Parameters
     ----------
@@ -80,8 +83,9 @@ def _raman_cross_section(
         声子占据因子
     delta_f : ndarray, shape (N_q, N_c)
         频移绝对值 |f_q - f_c| [Hz]（用于插值和 n_th）
-    bandwidth : float
-        信道采样带宽 [Hz]，即信道间隔（离散模型）或频率网格步长（连续模型）
+    noise_bandwidth : float or ndarray
+        噪声收集带宽 [Hz]。离散模型通常取量子信道带宽，连续谱绘制时
+        取输出频率 bin 宽度 ``df``。
 
     Returns
     -------
@@ -97,12 +101,17 @@ def _raman_cross_section(
     f_q_bc = np.broadcast_to(f_q, g_R.shape)
     f_c_bc = np.broadcast_to(f_c, g_R.shape)
 
-    # Stokes 分量：Δf = bandwidth（采样带宽，不是实际频移）
+    noise_bandwidth = np.broadcast_to(
+        np.asarray(noise_bandwidth, dtype=np.float64),
+        g_R.shape,
+    )
+
+    # Stokes 分量：频率项取接收端噪声带宽 B_noise
     sigma[stokes_mask] = (
         2.0 * h * f_q_bc[stokes_mask]
         * g_R[stokes_mask]
         * (1.0 + n_th[stokes_mask])
-        * bandwidth
+        * noise_bandwidth[stokes_mask]
     )
 
     # anti-Stokes 分量
@@ -112,7 +121,7 @@ def _raman_cross_section(
         * g_R[anti_mask]
         * n_th[anti_mask]
         * (f_q_bc[anti_mask] / f_c_bc[anti_mask])
-        * bandwidth
+        * noise_bandwidth[anti_mask]
     )
 
     return sigma
@@ -275,11 +284,21 @@ class DiscreteSPRSSolver(NoiseSolver):
 
         n_th = _phonon_occupation(delta_f, fiber.T_kelvin)  # shape (N_q, N_c)
 
-        # 采样带宽：离散模型取经典信道带宽 B_s（等于 channel.spacing）
-        c_chs = wdm_grid.get_classical_channels()
-        bandwidth = c_chs[0].B_s  # 所有经典信道 B_s 相同
+        # 离散模型的噪声收集带宽取目标量子信道带宽。
+        q_chs = wdm_grid.get_quantum_channels()
+        noise_bandwidth = np.array(
+            [ch.B_s for ch in q_chs],
+            dtype=np.float64,
+        ).reshape(-1, 1)
 
-        sigma = _raman_cross_section(f_q, f_c, g_R, n_th, delta_f, bandwidth)
+        sigma = _raman_cross_section(
+            f_q,
+            f_c,
+            g_R,
+            n_th,
+            delta_f,
+            noise_bandwidth,
+        )
         return sigma
 
     def compute_forward(self, fiber: Fiber, wdm_grid: WDMGrid) -> np.ndarray:
@@ -410,8 +429,17 @@ class DiscreteSPRSSolver(NoiseSolver):
         delta_f = np.abs(f_q - f_2)
         g_R = get_raman_gain(delta_f=delta_f, f_pump=f_2, A_eff=fiber.A_eff)
         n_th = _phonon_occupation(delta_f, fiber.T_kelvin)
+        noise_bandwidth = np.array(
+            [ch.B_s for ch in q_chs],
+            dtype=np.float64,
+        ).reshape(-1, 1)
         sigma = _raman_cross_section(
-            f_q=f_q, f_c=f_2, g_R=g_R, n_th=n_th, delta_f=delta_f, bandwidth=df
+            f_q=f_q,
+            f_c=f_2,
+            g_R=g_R,
+            n_th=n_th,
+            delta_f=delta_f,
+            noise_bandwidth=noise_bandwidth,
         )
 
         G_fwd = _forward_propagation(
@@ -459,8 +487,17 @@ class DiscreteSPRSSolver(NoiseSolver):
         delta_f = np.abs(f_q - f_2)
         g_R = get_raman_gain(delta_f=delta_f, f_pump=f_2, A_eff=fiber.A_eff)
         n_th = _phonon_occupation(delta_f, fiber.T_kelvin)
+        noise_bandwidth = np.array(
+            [ch.B_s for ch in q_chs],
+            dtype=np.float64,
+        ).reshape(-1, 1)
         sigma = _raman_cross_section(
-            f_q=f_q, f_c=f_2, g_R=g_R, n_th=n_th, delta_f=delta_f, bandwidth=df
+            f_q=f_q,
+            f_c=f_2,
+            g_R=g_R,
+            n_th=n_th,
+            delta_f=delta_f,
+            noise_bandwidth=noise_bandwidth,
         )
 
         G_bwd = _backward_propagation(
@@ -475,51 +512,88 @@ class DiscreteSPRSSolver(NoiseSolver):
         assert P_bwd.shape == (len(q_chs),)
         return P_bwd
 
-    # --- 噪声 PSD 谱计算（在 f_grid 每点计算 G_sprs(f)）-----------
+    # --- 噪声 PSD 谱计算 — 向量化版本（全频率一次计算）-----------
 
-    def _compute_sprs_psd_at_f1(
+    def _compute_sprs_psd_batch(
         self,
         fiber: Fiber,
         f_grid: np.ndarray,
         G_pump: np.ndarray,
-        alpha2: np.ndarray,
-        f1: float,
         direction: str,
         df: float,
-    ) -> float:
-        """在单个输出频率 f1 处计算 SpRS 噪声 PSD G_sprs(f1) [W/Hz]。
+    ) -> np.ndarray:
+        """向量化计算 SpRS 噪声 PSD G_sprs(f) [W/Hz]，一次处理全部 f_grid 点。
 
-        用于 compute_sprs_spectrum_conti，在 f_grid 每个频率点调用。
+        将原来的 N_f 次循环（每次 O(N_f²)）合并为一次 O(N_f²) 操作，
+        通过 2D 广播完全消除 Python for 循环。
+
+        Parameters
+        ----------
+        fiber : Fiber
+        f_grid : ndarray, shape (N_f,)
+        G_pump : ndarray, shape (N_f,)  — 总泵浦 PSD
+        direction : {"forward", "backward"}
+        df : float  — 频率网格步长
+
+        Returns
+        -------
+        ndarray, shape (N_f,)  — G_sprs(f) at each f_grid point
         """
-        f_grid_arr = np.asarray(f_grid, dtype=np.float64).reshape(1, -1)
-        G_pump_arr = np.asarray(G_pump, dtype=np.float64).reshape(1, -1)
-        alpha2_arr = np.asarray(alpha2, dtype=np.float64).reshape(1, -1)
+        # ---- 构建 2D 频率矩阵 ----
+        # f1_2d[j, k] = f_grid[j] (信号频率，输出点 j)
+        # f2_2d[j, k] = f_grid[k] (泵浦频率，积分点 k)
+        f1_2d = f_grid.reshape(-1, 1)      # (N_f, 1)
+        f2_2d = f_grid.reshape(1, -1)        # (1, N_f)
+        delta_f_2d = np.abs(f1_2d - f2_2d)  # (N_f, N_f)
 
-        f1_arr = np.full_like(f_grid_arr, f1, dtype=np.float64)
-        alpha1_val = float(np.asarray(fiber.get_loss_at_freq(f1), dtype=np.float64))
-        alpha1_arr = np.full_like(f_grid_arr, alpha1_val)
+        # ---- 拉曼参数（2D 广播）----
+        g_R_2d = get_raman_gain(
+            delta_f=delta_f_2d,
+            f_pump=f2_2d,
+            A_eff=fiber.A_eff,
+        )  # (N_f, N_f)
+        n_th_2d = _phonon_occupation(delta_f_2d, fiber.T_kelvin)  # (N_f, N_f)
+        sigma_2d = _raman_cross_section(
+            f_q=f1_2d,
+            f_c=f2_2d,
+            g_R=g_R_2d,
+            n_th=n_th_2d,
+            delta_f=delta_f_2d,
+            noise_bandwidth=df,
+        )  # (N_f, N_f)
 
-        delta_f = np.abs(f1_arr - f_grid_arr)
-        g_R = get_raman_gain(delta_f=delta_f, f_pump=f_grid_arr, A_eff=fiber.A_eff)
-        n_th = _phonon_occupation(delta_f, fiber.T_kelvin)
-        sigma = _raman_cross_section(
-            f_q=f1_arr, f_c=f_grid_arr, g_R=g_R, n_th=n_th, delta_f=delta_f, bandwidth=df
-        )
+        # ---- 衰减系数（2D 广播）----
+        alpha1_2d = fiber.get_loss_at_freq(f_grid).reshape(-1, 1)  # (N_f, 1)
+        alpha2_2d = fiber.get_loss_at_freq(f_grid).reshape(1, -1)  # (1, N_f)
 
+        # ---- 泵浦功率（2D 广播）----
+        G_pump_2d = np.asarray(G_pump, dtype=np.float64).reshape(1, -1)  # (1, N_f)
+
+        # ---- 方向传播积分 ----
         if direction == "forward":
-            integrand = _forward_propagation(
-                sigma=sigma, P_pump=G_pump_arr,
-                alpha1=alpha1_arr, alpha2=alpha2_arr, L=fiber.L,
-            )
+            integrand_2d = _forward_propagation(
+                sigma=sigma_2d,
+                P_pump=G_pump_2d,
+                alpha1=alpha1_2d,
+                alpha2=alpha2_2d,
+                L=fiber.L,
+            )  # (N_f, N_f)
         elif direction == "backward":
-            integrand = _backward_propagation(
-                sigma=sigma, P_pump=G_pump_arr,
-                alpha1=alpha1_arr, alpha2=alpha2_arr, L=fiber.L,
-            )
+            integrand_2d = _backward_propagation(
+                sigma=sigma_2d,
+                P_pump=G_pump_2d,
+                alpha1=alpha1_2d,
+                alpha2=alpha2_2d,
+                L=fiber.L,
+            )  # (N_f, N_f)
         else:
             raise ValueError(f"Unsupported direction: {direction}")
 
-        return float(np.sum(integrand) * df)
+        # ---- 积分（沿泵浦轴求和）----
+        # 对每个信号频率 f_grid[j]，对所有泵浦频率积分
+        # integrand_2d[j, k]: f_grid[j] 作为信号、f_grid[k] 作为泵浦的贡献
+        out_bin_power = np.sum(integrand_2d, axis=1) * df  # (N_f,) [W]
+        return out_bin_power / df  # [W/Hz]
 
     def compute_sprs_spectrum_conti(
         self,
@@ -554,14 +628,94 @@ class DiscreteSPRSSolver(NoiseSolver):
         if not np.any(G_pump > 0.0):
             return np.zeros_like(f_grid, dtype=np.float64)
 
-        alpha2 = np.asarray(fiber.get_loss_at_freq(f_grid), dtype=np.float64)
+        # 向量化路径：一次 O(N_f²) 计算，无 Python for 循环
+        return self._compute_sprs_psd_batch(
+            fiber=fiber,
+            f_grid=f_grid,
+            G_pump=G_pump,
+            direction=direction,
+            df=df,
+        )
 
-        out = np.zeros_like(f_grid, dtype=np.float64)
-        for idx, f1 in enumerate(f_grid):
-            out[idx] = self._compute_sprs_psd_at_f1(
-                fiber=fiber, f_grid=f_grid,
-                G_pump=G_pump, alpha2=alpha2,
-                f1=float(f1), direction=direction,
-                df=df,
-            )
+    def compute_sprs_spectrum_conti_l_array(
+        self,
+        fiber: Fiber,
+        wdm_grid: WDMGrid,
+        f_grid: np.ndarray,
+        L_arr: np.ndarray,
+        direction: str = "forward",
+    ) -> np.ndarray:
+        """Compute continuous SpRS spectrum for multiple fiber lengths.
+
+        This is the same formula path as ``compute_sprs_spectrum_conti``, but
+        it hoists the Raman cross-section, pump PSD, and loss matrices outside
+        the length loop. The returned array has shape ``(N_f, N_L)`` and each
+        column matches a separate call using ``fiber.L == L_arr[i]``.
+        """
+        f_grid = np.asarray(f_grid, dtype=np.float64)
+        L_values = np.asarray(L_arr, dtype=np.float64).reshape(-1)
+        df = self._validate_frequency_grid(f_grid)
+
+        G_classical = self._build_classical_psd_matrix(wdm_grid, f_grid, df)
+        G_pump = G_classical.sum(axis=0)
+        if not np.any(G_pump > 0.0):
+            return np.zeros((f_grid.size, L_values.size), dtype=np.float64)
+
+        f1_2d = f_grid.reshape(-1, 1)
+        f2_2d = f_grid.reshape(1, -1)
+        delta_f_2d = np.abs(f1_2d - f2_2d)
+
+        g_R_2d = get_raman_gain(
+            delta_f=delta_f_2d,
+            f_pump=f2_2d,
+            A_eff=fiber.A_eff,
+        )
+        n_th_2d = _phonon_occupation(delta_f_2d, fiber.T_kelvin)
+        sigma_2d = _raman_cross_section(
+            f_q=f1_2d,
+            f_c=f2_2d,
+            g_R=g_R_2d,
+            n_th=n_th_2d,
+            delta_f=delta_f_2d,
+            noise_bandwidth=df,
+        )
+
+        alpha_grid = fiber.get_loss_at_freq(f_grid)
+        alpha1_2d = alpha_grid.reshape(-1, 1)
+        alpha2_2d = alpha_grid.reshape(1, -1)
+        base_2d = np.asarray(G_pump, dtype=np.float64).reshape(1, -1) * sigma_2d
+
+        out = np.zeros((f_grid.size, L_values.size), dtype=np.float64)
+        max_l_batch = 4
+        for start in range(0, L_values.size, max_l_batch):
+            stop = min(start + max_l_batch, L_values.size)
+            L_batch = L_values[start:stop].reshape(1, 1, -1)
+
+            if direction == "forward":
+                d_alpha = alpha2_2d - alpha1_2d
+                equal_mask = np.abs(d_alpha) < _ALPHA_EPS
+                d_alpha_3d = d_alpha[:, :, np.newaxis]
+                equal_3d = equal_mask[:, :, np.newaxis]
+                exp_m_alpha1_L = np.exp(-alpha1_2d[:, :, np.newaxis] * L_batch)
+                integral = np.where(
+                    equal_3d,
+                    L_batch,
+                    (1.0 - np.exp(-d_alpha_3d * L_batch))
+                    / np.where(equal_3d, 1.0, d_alpha_3d),
+                )
+                batch = base_2d[:, :, np.newaxis] * exp_m_alpha1_L * integral
+            elif direction == "backward":
+                sum_alpha = alpha1_2d + alpha2_2d
+                sum_alpha_3d = sum_alpha[:, :, np.newaxis]
+                batch = (
+                    base_2d[:, :, np.newaxis]
+                    * (1.0 - np.exp(-sum_alpha_3d * L_batch))
+                    / sum_alpha_3d
+                )
+            else:
+                raise ValueError(f"Unsupported direction: {direction}")
+
+            out_bin_power = np.sum(batch, axis=1) * df
+            out[:, start:stop] = out_bin_power / df
+
         return out
