@@ -8,7 +8,7 @@ dataclass 的 __post_init__ 统一转换为 SI 基本单位。
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -108,9 +108,9 @@ class WDMConfig:
     beta_rolloff : float
         升余弦滚降因子 [0, 1]，0 = 矩形谱
     quantum_channel_indices : list[int]
-        量子信道在信道数组中的索引列表（0-based）
+        量子信道 ITU G.694.1 信道号列表（1-based），如 [1, 2, 3] 表示 C01/C02/C03。
     channel_powers_W : dict[int, float] | None
-        可选：zero-based 经典信道功率覆盖 [W]。未列出的经典信道使用 P0。
+        可选：经典信道 ITU 信道号（1-based）→ 功率 [W] 覆盖。未列出的经典信道使用 P0。
     """
 
     start_freq: float
@@ -120,6 +120,8 @@ class WDMConfig:
     B_s: float
     P0: float
     beta_rolloff: float = 0.0
+    ook_filter_order: int = 1          # NRZ-OOK Butterworth 滤波器阶数（m=1 退化为 Lorentzian）
+    ook_f3db_hz: float | None = None   # NRZ-OOK -3dB 截止频率 [Hz]；None = 从 sinc² 严格计算
     quantum_channel_indices: list[int] = field(default_factory=list)
     channel_powers_W: dict[int, float] | None = None
     num_channels: int | None = None  # 可选：信道总数
@@ -152,14 +154,17 @@ class WDMConfig:
             )
         object.__setattr__(self, "num_channels", derived_rounded)
 
+        # ITU 信道号范围 = [start_channel, end_channel]（支持半整数 interleave）
+        itn_min = self.start_channel
+        itn_max = self.end_channel
         invalid_quantum = [
             idx for idx in self.quantum_channel_indices
-            if idx < 0 or idx >= derived_rounded
+            if idx < itn_min or idx > itn_max
         ]
         if invalid_quantum:
             raise ValueError(
                 "quantum_channel_indices contains out-of-range values: "
-                f"{invalid_quantum}"
+                f"{invalid_quantum} (valid: {itn_min}-{itn_max})"
             )
 
         if self.channel_powers_W is None:
@@ -169,10 +174,10 @@ class WDMConfig:
         for raw_idx, raw_power in self.channel_powers_W.items():
             idx = int(raw_idx)
             power = float(raw_power)
-            if idx < 0 or idx >= derived_rounded:
+            if idx < itn_min or idx > itn_max:
                 raise ValueError(
                     "channel_powers_W contains out-of-range channel index: "
-                    f"{raw_idx}"
+                    f"{raw_idx} (valid: {itn_min}-{itn_max})"
                 )
             if power < 0.0:
                 raise ValueError(
@@ -239,7 +244,107 @@ def load_wdm_config(path: str | Path) -> WDMConfig:
     """
     with open(path, encoding="utf-8") as f:
         raw: dict[str, Any] = yaml.safe_load(f)
-    return WDMConfig(**raw)
+    valid_keys = {fld.name for fld in fields(WDMConfig)}
+    filtered = {k: v for k, v in raw.items() if k in valid_keys}
+    return WDMConfig(**filtered)
+
+
+@dataclass
+class SKRConfig:
+    """BB84 QKD 安全码率配置。
+
+    光纤衰减 alpha 由 FiberConfig 提供，不在此重复定义。
+    公式来源: docs/formulas_skr.md
+
+    YAML 输入字段:
+        eta_spd            : float  SPD 量子效率 (η_spd)
+        IL_dB              : float  插入损耗 [dB]（不含光纤衰减）
+        dark_count_prob    : float  暗计数概率/脉冲 (p_dark)
+        noise_count_prob   : float  噪声光子计数概率/脉冲 (p_noise)，默认 0.0
+        mu_signal          : float  信号态平均光子数 (μ)
+        e_det              : float  探测器本征误码率 (e_Det)
+        f_ec               : float  纠错效率 (f_e)，典型 1.16
+        R_rep              : float  脉冲重复率 [Hz]
+        q_sifting          : float  筛选效率（BB84 = 0.5）
+        mu_decoy           : float  诱骗态平均光子数 (ν)
+        p_signal           : float  信号态发送概率 (p_μ)
+        p_decoy            : float  诱骗态发送概率 (p_ν)
+        N_pulse            : float  总脉冲数
+        gamma_ks           : float  Gaussian 置信倍数 (γ_ks)，近似有限长用
+        P_X_alice          : float  Alice X 基矢选取概率
+        P_X_bob            : float  Bob X 基矢选取概率
+        R_0                : float  信号发射率 [Hz]（严格有限长块长计算用）
+        epsilon_cor        : float  正确性参数 (ε_cor)
+        epsilon_sec        : float  保密性参数 (ε_sec)
+        concentration_method : str  浓度不等式方法："Hoeffding" 或 "Azuma"
+
+    __post_init__ 计算字段:
+        IL       : float  插入损耗线性值 = 10^(-IL_dB/10)
+        p_vacuum : float  真空态发送概率 = 1 - p_signal - p_decoy
+    """
+
+    # 接收端硬件
+    eta_spd: float
+    IL_dB: float
+    dark_count_prob: float
+    noise_count_prob: float
+    mu_signal: float
+    e_det: float
+
+    # 协议参数
+    f_ec: float
+    R_rep: float
+    q_sifting: float
+
+    # 诱骗态 + 近似有限长
+    mu_decoy: float
+    p_signal: float
+    p_decoy: float
+    N_pulse: float
+    gamma_ks: float
+
+    # 严格有限长
+    P_X_alice: float
+    P_X_bob: float
+    R_0: float
+    epsilon_cor: float
+    epsilon_sec: float
+    concentration_method: str = "Hoeffding"
+
+    # 由 __post_init__ 计算
+    IL: float = field(init=False, repr=False)
+    p_vacuum: float = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.IL = 10.0 ** (-self.IL_dB / 10.0)
+        self.p_vacuum = 1.0 - self.p_signal - self.p_decoy
+        if self.p_vacuum < -1e-9:
+            raise ValueError("p_signal + p_decoy must be ≤ 1")
+        if self.mu_signal <= self.mu_decoy:
+            raise ValueError("mu_signal must be > mu_decoy (strict finite-key requirement)")
+        if self.concentration_method not in ("Hoeffding", "Azuma"):
+            raise ValueError(
+                f"concentration_method must be 'Hoeffding' or 'Azuma', got '{self.concentration_method}'"
+            )
+
+
+def load_skr_config(path: str | Path) -> SKRConfig:
+    """从 YAML 文件加载 BB84 SKR 配置。
+
+    Parameters
+    ----------
+    path : str or Path
+        YAML 文件路径
+
+    Returns
+    -------
+    SKRConfig
+    """
+    with open(path, encoding="utf-8") as f:
+        raw: dict[str, Any] = yaml.safe_load(f)
+    valid_keys = {fld.name for fld in fields(SKRConfig) if fld.init}
+    filtered = {k: v for k, v in raw.items() if k in valid_keys}
+    return SKRConfig(**filtered)
 
 
 def load_simulation_config(

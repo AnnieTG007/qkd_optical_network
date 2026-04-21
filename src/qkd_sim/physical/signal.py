@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import math
 import warnings
 from dataclasses import dataclass, field
 from enum import Enum
@@ -17,9 +18,17 @@ from pathlib import Path
 
 import numpy as np
 from scipy.interpolate import interp1d
+from scipy.optimize import brentq
 
 from qkd_sim.config.schema import WDMConfig
 from qkd_sim.utils.units import power_dBm_to_W
+
+# NRZ-OOK sinc² 谱的 -3dB 截止频率因子（严格计算）
+# 求解 sinc(u) = 1/√2，即 sin(πu)/(πu) = 1/√2，u ∈ (0, 1)
+# f_{3dB} = _NRZ_OOK_3DB_FACTOR × R_b ≈ 0.4430 × R_b
+_NRZ_OOK_3DB_FACTOR: float = brentq(
+    lambda u: np.sinc(u) - 1.0 / np.sqrt(2.0), 1e-9, 0.9999
+)
 
 
 class SpectrumType(Enum):
@@ -149,6 +158,8 @@ class WDMChannel:
     spectrum_type: SpectrumType
     B_s: float
     beta_rolloff: float = 0.0
+    ook_filter_order: int = 1          # Butterworth 滤波器阶数（m=1 退化为 Lorentzian）
+    ook_f3db_hz: float | None = None   # -3dB 截止频率 [Hz]；None = 从 sinc² 严格计算
     osa_f: np.ndarray | None = field(default=None, repr=False)
     osa_psd: np.ndarray | None = field(default=None, repr=False)
 
@@ -234,26 +245,27 @@ class WDMChannel:
     def _psd_nrz_ook(self, f_grid: np.ndarray) -> np.ndarray:
         """NRZ-OOK PSD。公式 3.2 (formulas_signal.md)。
 
-        G_TX(f) = (P_ch / R_b) * sinc^2(pi*f*T_b) / (1 + (f/f_c)^2)
+        G_TX(f) = (P_ch / R_b) * sinc²(π·Δf·T_b) * |H(Δf)|²
 
-        其中 T_b = 1/R_b，f_c = 0.7 * R_b，R_b = B_s（比特速率 = 信号带宽）。
+        |H(Δf)|² = 1 / (1 + (Δf/f_{3dB})^{2m})
+
+        f_{3dB} 默认由 sinc² -3dB 点严格计算（见 _NRZ_OOK_3DB_FACTOR）。
+        功率归一化由 normalize_psd_to_power 保证。
         """
         R_b = self.B_s
         T_b = 1.0 / R_b
-        f_c = 0.7 * R_b
+        f_3dB = self.ook_f3db_hz if self.ook_f3db_hz is not None else _NRZ_OOK_3DB_FACTOR * R_b
+        m = self.ook_filter_order
 
         delta_f = f_grid - self.f_center
 
-        # sinc^2 component: sinc(x) = sin(x)/x, sinc(0) = 1
-        x = np.pi * delta_f * T_b
-        with np.errstate(divide='ignore', invalid='ignore'):
-            sinc_sq = np.where(np.abs(x) < 1e-12, 1.0, np.sin(x) / x)
-            sinc_sq = sinc_sq ** 2
+        # sinc² 分量：np.sinc(u) = sin(πu)/(πu)，即 sinc(Δf/R_b) = sinc²(π·Δf·T_b)
+        sinc_sq = np.sinc(delta_f * T_b) ** 2
 
-        # Lorentzian component
-        lorentzian = 1.0 / (1.0 + (delta_f / f_c) ** 2)
+        # Butterworth 滤波器幅度平方响应
+        butterworth = 1.0 / (1.0 + (delta_f / f_3dB) ** (2 * m))
 
-        return (self.power / R_b) * sinc_sq * lorentzian
+        return (self.power / R_b) * sinc_sq * butterworth
 
     def _psd_osa(self, f_grid: np.ndarray) -> np.ndarray:
         """OSA 实测谱插值。公式 3.3 (formulas_signal.md)。
@@ -385,7 +397,8 @@ def build_wdm_grid(
     osa_rbw : float or None
         OSA 分辨率带宽 [Hz]（OSA_SAMPLED 类型必需）
     classical_channel_indices : list[int] or None
-        显式指定经典信道索引（覆盖默认行为）
+        显式指定经典信道 ITU 信道号（1-based），如 [39, 40, 41] 表示 C39/C40/C41。
+        为 None 时：classical = all_indices - quantum。
     modulation_format : str
         调制格式，"OOK" 或 "16QAM"（默认 "OOK"）
 
@@ -397,7 +410,10 @@ def build_wdm_grid(
         raise ValueError(f"modulation_format must be 'OOK' or '16QAM', got '{modulation_format}'")
 
     num_channels = int(config.num_channels)
-    all_indices_set = set(range(num_channels))
+    # ITU 信道号集合 = [start_channel, end_channel]（支持半整数 interleave）
+    all_indices_set = set(
+        config.start_channel + i for i in range(num_channels)
+    )
     quantum_set = set(config.quantum_channel_indices)
     power_overrides = config.channel_powers_W or {}
 
@@ -416,7 +432,9 @@ def build_wdm_grid(
                 f"Classical and quantum channel sets overlap: {sorted(overlap)}"
             )
 
+    # indices = ITU 信道号数组（1, 2, ..., num_channels）
     indices = np.arange(config.start_channel, config.start_channel + num_channels, dtype=float)
+    # f_channels[itn - 1] = start_freq + (itn - start_channel) * spacing（ITU 频率）
     f_channels = config.start_freq + (indices - config.start_channel) * config.channel_spacing
 
     # 确定调制格式对应的解析谱型
@@ -440,10 +458,12 @@ def build_wdm_grid(
         osa_template_psd = osa_psd_raw
 
     channels: list[WDMChannel] = []
-    for i, f_c in enumerate(f_channels):
-        if i in classical_set:
+    for pos in range(num_channels):
+        itn = float(indices[pos])  # ITU G.694.1 channel number (float to support half-integer interleave)
+        f_c = f_channels[pos]
+        if itn in classical_set:
             ch_type = "classical"
-            power = power_overrides.get(i, config.P0)
+            power = power_overrides.get(itn, config.P0)
             # 解析谱型由调制格式决定（连续模型），但 SINGLE_FREQ 保持不变
             if spectrum_type == SpectrumType.SINGLE_FREQ:
                 ch_stype = SpectrumType.SINGLE_FREQ
@@ -454,7 +474,7 @@ def build_wdm_grid(
             if ch_stype == SpectrumType.OSA_SAMPLED:
                 osa_f_ch = f_c + osa_offsets
                 osa_psd_ch = osa_template_psd
-        elif i in quantum_set:
+        elif itn in quantum_set:
             ch_type = "quantum"
             power = 0.0
             ch_stype = SpectrumType.SINGLE_FREQ
@@ -475,6 +495,8 @@ def build_wdm_grid(
                 spectrum_type=ch_stype,
                 B_s=config.B_s,
                 beta_rolloff=config.beta_rolloff,
+                ook_filter_order=config.ook_filter_order,
+                ook_f3db_hz=config.ook_f3db_hz,
                 osa_f=osa_f_ch,
                 osa_psd=osa_psd_ch,
             )

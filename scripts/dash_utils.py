@@ -41,11 +41,214 @@ def _load_wdm_params() -> dict:
     )
 
 
+# =============================================================================
+# Classical channel strategy resolver
+# =============================================================================
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class ClassicalChannelConstraint:
+    """A reserved region (e.g. sync channel, reference channel) with a protection bandwidth."""
+    name: str           # identifier: "sync", "reference", ...
+    channel: int        # 1-based ITU G.694.1 channel number (e.g. C33 = 33)
+    bandwidth_ghz: float  # protection bandwidth [GHz]; no classical signal passband
+                          # may overlap with (center - bw/2, center + bw/2)
+
+
+@dataclass
+class ClassicalChannelStrategy:
+    """Classical channel placement strategy for plotting scripts."""
+    name: str             # "equal_interval" | "interleave" | <future>
+    reference_channel: int  # 1-based ITU G.694.1 channel number of reference channel (e.g. C35 = 35)
+    num_classical: int   # desired number of classical channels
+    reserved: list[ClassicalChannelConstraint] = field(default_factory=list)
+
+
+def _passband_overlaps_reserved(ch_itn: float, res: ClassicalChannelConstraint) -> bool:
+    """Check whether a classical channel's passband overlaps a reserved region.
+
+    Classical channel passband: (ch_itn*100GHz - 50GHz, ch_itn*100GHz + 50GHz) GHz
+    Reserved region:            (res.channel*100GHz - bw/2, res.channel*100GHz + bw/2) GHz
+    """
+    classic_left = ch_itn * 100e9 - 50e9
+    classic_right = ch_itn * 100e9 + 50e9
+    res_left = res.channel * 100e9 - res.bandwidth_ghz / 2 * 1e9
+    res_right = res.channel * 100e9 + res.bandwidth_ghz / 2 * 1e9
+    return classic_left < res_right and classic_right > res_left
+
+
+def resolve_classical_indices(cfg: ClassicalChannelStrategy) -> list[float]:
+    """Resolve classical channel ITU G.694.1 channel numbers from a placement strategy.
+
+    Returns a list of 1-based ITU channel numbers (may be half-integers like 32.5 for interleave).
+    Automatically excludes any candidate whose passband overlaps a reserved region.
+
+    For equal_interval: searches greedily from ref-1 downward, skipping blocked channels,
+    so a single blocked candidate does not cause an error — the next valid one is used instead.
+    Raises ValueError only when the entire ITU range [1, ref-1] is exhausted before enough
+    valid channels are found.
+
+    For interleave: keeps the original fixed-offset generation; raises immediately if any
+    generated candidate is out of [1, 61], and raises if not enough valid channels remain.
+    """
+    ref = float(cfg.reference_channel)  # ITU channel number (1-based)
+
+    def _is_blocked(ch: float) -> bool:
+        if any(ch == res.channel for res in cfg.reserved):
+            return True
+        if any(_passband_overlaps_reserved(ch, res) for res in cfg.reserved):
+            return True
+        return False
+
+    if cfg.name == "equal_interval":
+        # Greedy search: walk from ref-1 downward, skip blocked channels
+        valid: list[float] = []
+        ch = ref - 1.0
+        while ch >= 1.0 and len(valid) < cfg.num_classical:
+            if not _is_blocked(ch):
+                valid.append(ch)
+            ch -= 1.0
+        if len(valid) < cfg.num_classical:
+            raise ValueError(
+                f"Strategy 'equal_interval' requested {cfg.num_classical} classical channels "
+                f"but only {len(valid)} valid positions found in ITU range "
+                f"[1, {int(ref) - 1}] after skipping reserved channels. Valid: {valid}"
+            )
+        return valid
+
+    elif cfg.name == "interleave":
+        # Fixed symmetric offsets; out-of-range is an immediate error
+        n = cfg.num_classical
+        candidates = [ref + (2 * i - (n - 1)) / 2.0 for i in range(n)]
+        valid = []
+        for ch in candidates:
+            if _is_blocked(ch):
+                continue
+            if ch < 1.0 or ch > 61.0:
+                raise ValueError(
+                    f"Classical channel index {ch} (ITU C{int(ch)}) is outside "
+                    f"the valid range [1, 61] (C01–C61)"
+                )
+            valid.append(ch)
+        if len(valid) < cfg.num_classical:
+            raise ValueError(
+                f"Strategy 'interleave' requested {cfg.num_classical} classical channels "
+                f"but only {len(valid)} valid positions remain after applying reserved "
+                f"constraints. Candidates: {candidates}, Valid: {valid}"
+            )
+        return valid
+
+    else:
+        raise ValueError(f"Unknown classical channel strategy: {cfg.name!r}")
+
+
+def _load_classical_channel_strategy(raw: dict) -> ClassicalChannelStrategy | None:
+    """Parse classical_channel_strategy from YAML dict. Returns None if not present."""
+    strat = raw.get("classical_channel_strategy")
+    if strat is None:
+        return None
+    reserved = [
+        ClassicalChannelConstraint(
+            name=r["name"],
+            channel=int(r["channel"]),
+            bandwidth_ghz=float(r["bandwidth_ghz"]),
+        )
+        for r in strat.get("reserved", [])
+    ]
+    return ClassicalChannelStrategy(
+        name=strat["name"],
+        reference_channel=int(strat["reference_channel"]),
+        num_classical=int(strat["num_classical"]),
+        reserved=reserved,
+    )
+
+
+def _load_classical_indices() -> list[int]:
+    """从 WDM YAML 读取 classical_channel_indices（1-based ITU 信道号）。
+
+    classical_channel_indices 有值时直接返回；否则通过 classical_channel_strategy 策略生成。
+    返回 1-based ITU 信道号列表，如 [39, 40, 41] 表示 C39/C40/C41。
+    """
+    import yaml
+    with open(_YAML_WDM_PATH, encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+
+    raw_val = raw.get("classical_channel_indices")
+    if raw_val is not None:
+        # YAML 解析器将 [38, 39, 40] 解析为 [38.0, 39.0, 40.0]；
+        # 统一转为 int（interleave 半整数保留 float）
+        return [int(ch) if ch == int(ch) else ch for ch in raw_val]
+
+    strat = _load_classical_channel_strategy(raw)
+    if strat is not None:
+        indices = resolve_classical_indices(strat)
+        return [int(ch) if ch == int(ch) else ch for ch in indices]
+
+    return []
+
+
+def add_strategy_cli_args(parser):
+    """给 argparse parser 添加经典信道策略参数。"""
+    parser.add_argument(
+        "--strategy-name",
+        default=None,
+        choices=["equal_interval", "interleave"],
+        help="Classical channel placement strategy",
+    )
+    parser.add_argument(
+        "--num-classical",
+        type=int,
+        default=None,
+        help="Number of classical channels",
+    )
+    parser.add_argument(
+        "--reference-channel",
+        type=int,
+        default=None,
+        help="1-based ITU G.694.1 reference channel number (e.g. 35 = C35)",
+    )
+
+
+def override_strategy_from_cli(strategy_name, num_classical, reference_channel):
+    """用 CLI 参数覆盖 YAML 中的 classical_channel_strategy。
+
+    reserved 列表保持 YAML 原始值，只覆盖 name/num_classical/reference_channel。
+    前提：YAML 中必须已有 classical_channel_strategy 块（含 reserved 定义）。
+    """
+    import yaml
+
+    with open(_YAML_WDM_PATH, encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+
+    strat = raw.get("classical_channel_strategy", {})
+    if not strat:
+        raise ValueError(
+            "YAML 中没有 classical_channel_strategy 配置，无法使用策略 CLI 参数。"
+            "请在 wdm_100ghz.yaml 中添加 classical_channel_strategy 块"
+            "（含 reserved 定义），或使用 classical_channel_indices 配置。"
+        )
+    if strategy_name is not None:
+        strat["name"] = strategy_name
+    if num_classical is not None:
+        strat["num_classical"] = num_classical
+    if reference_channel is not None:
+        strat["reference_channel"] = reference_channel
+
+    cfg = _load_classical_channel_strategy({"classical_channel_strategy": strat})
+    indices = resolve_classical_indices(cfg)
+    return [int(ch) if ch == int(ch) else ch for ch in indices]
+
+
 WDM_PARAMS = _load_wdm_params()
-CLASSICAL_INDICES = [38, 39, 40]
+CLASSICAL_INDICES = _load_classical_indices()
 NOISE_GRID_RESOLUTION_HZ = 5e9
 NOISE_FLOOR_W = 1e-23
 FREQ_GRID_PADDING_FACTOR = 1.5
+
+# 调制格式：由 Dash 脚本 --modulation 参数设置
+MODULATION_FORMAT: str = "16qam"
 def _load_fiber_params() -> dict:
     from qkd_sim.config.schema import load_fiber_config
     cfg = load_fiber_config(_YAML_FIBER_PATH)
@@ -78,14 +281,12 @@ def _build_caption() -> str:
     """
     ch_spacing_ghz = WDM_PARAMS["channel_spacing"] / 1e9
     data_rate_gbaud = WDM_PARAMS["B_s"] / 1e9
+    # CLASSICAL_INDICES 已是 1-based ITU 信道号（如 [39, 40, 41] = C39/C40/C41）
     classical_freqs = [
-        WDM_PARAMS["start_freq"] + idx * WDM_PARAMS["channel_spacing"]
-        for idx in CLASSICAL_INDICES
+        WDM_PARAMS["start_freq"] + (itn - WDM_PARAMS["start_channel"]) * WDM_PARAMS["channel_spacing"]
+        for itn in CLASSICAL_INDICES
     ]
-    classical_labels = [
-        f"C{CLASSICAL_INDICES[i] + int(WDM_PARAMS['start_channel'])}"
-        for i in range(len(CLASSICAL_INDICES))
-    ]
+    classical_labels = [f"C{itn}" for itn in CLASSICAL_INDICES]
     classical_desc = ", ".join(
         f"{lbl} ({freq / 1e12:.3f} THz)"
         for lbl, freq in zip(classical_labels, classical_freqs)
@@ -555,6 +756,21 @@ def _build_wdm_config(quantum_indices: list[int]) -> WDMConfig:
     return WDMConfig(**params, quantum_channel_indices=list(quantum_indices), P0=_get_P0())
 
 
+def _modulation_format_for_model(model_key: str, spec: dict) -> str:
+    """Determine modulation_format parameter for build_wdm_grid based on model and global setting."""
+    from qkd_sim.physical.signal import SpectrumType
+    if spec["spectrum_type"] == SpectrumType.SINGLE_FREQ:
+        return "OOK"  # discrete model — no spectral shape dependency
+    if spec["spectrum_type"] == SpectrumType.NRZ_OOK:
+        return "OOK"
+    if spec["spectrum_type"] == SpectrumType.RAISED_COSINE:
+        return "16QAM"
+    # OSA_SAMPLED: determine by model_key
+    if model_key == "osa_ook":
+        return "OOK"
+    return "16QAM"
+
+
 def _build_model_grid(
     model_key: str,
     spec: dict,
@@ -562,8 +778,18 @@ def _build_model_grid(
     f_grid: np.ndarray,
     osa_csv_path: Path,
 ):
-    _ = model_key
     from qkd_sim.physical.signal import SpectrumType
+
+    # Respect base_config.quantum_channel_indices directly when it is a single
+    # channel (from _build_wdm_config([q_idx]) in the discrete model's
+    # per-channel grid loop — preserves per-channel isolation).
+    # For multi-channel configs (e.g. continuous model), recompute from
+    # current CLASSICAL_INDICES so that CLI overrides take effect.
+    if len(base_config.quantum_channel_indices) == 1:
+        current_quantum_indices = list(base_config.quantum_channel_indices)
+    else:
+        all_itn = list(range(int(base_config.start_channel), int(base_config.end_channel) + 1))
+        current_quantum_indices = sorted(ch for ch in all_itn if ch not in CLASSICAL_INDICES)
 
     if spec["beta_rolloff"] is not None:
         model_config = WDMConfig(
@@ -574,13 +800,25 @@ def _build_model_grid(
             B_s=base_config.B_s,
             P0=_get_P0(),
             beta_rolloff=spec["beta_rolloff"],
-            quantum_channel_indices=base_config.quantum_channel_indices,
+            quantum_channel_indices=current_quantum_indices,
             channel_powers_W=base_config.channel_powers_W,
             num_channels=int(base_config.num_channels),
         )
     else:
-        model_config = base_config
+        model_config = WDMConfig(
+            start_freq=base_config.start_freq,
+            start_channel=base_config.start_channel,
+            end_channel=base_config.end_channel,
+            channel_spacing=base_config.channel_spacing,
+            B_s=base_config.B_s,
+            P0=_get_P0(),
+            beta_rolloff=base_config.beta_rolloff,
+            quantum_channel_indices=current_quantum_indices,
+            channel_powers_W=base_config.channel_powers_W,
+            num_channels=int(base_config.num_channels),
+        )
 
+    mod_fmt = _modulation_format_for_model(model_key, spec)
     if spec["spectrum_type"] == SpectrumType.OSA_SAMPLED:
         return build_wdm_grid(
             config=model_config,
@@ -589,19 +827,26 @@ def _build_model_grid(
             osa_csv_path=osa_csv_path,
             osa_rbw=OSA_RBW_HZ,
             classical_channel_indices=CLASSICAL_INDICES,
-            modulation_format="16QAM",
+            modulation_format=mod_fmt,
         )
     return build_wdm_grid(
         config=model_config,
         spectrum_type=spec["spectrum_type"],
         f_grid=f_grid,
         classical_channel_indices=CLASSICAL_INDICES,
-        modulation_format="16QAM" if spec["spectrum_type"] == SpectrumType.RAISED_COSINE else "OOK",
+        modulation_format=mod_fmt,
     )
 
 
-def _display_channel_label(channel_index: int) -> str:
-    return f"C{channel_index + WDM_PARAMS['start_channel']}"
+def _display_channel_label(itn: int) -> str:
+    """Convert ITU channel number to display label.
+
+    Parameters
+    ----------
+    itn : int
+        1-based ITU G.694.1 channel number (e.g. 39 = C39)
+    """
+    return f"C{itn}"
 
 
 def adaptive_log_ticks(
@@ -626,6 +871,7 @@ def adaptive_linear_ticks(
 
 
 def _build_all_classical_grid(
+    model_key: str,
     spec: dict,
     base_config: WDMConfig,
     f_grid: np.ndarray,
@@ -645,8 +891,8 @@ def _build_all_classical_grid(
         channel_powers_W=base_config.channel_powers_W,
         num_channels=int(base_config.num_channels),
     )
+    mod_fmt = _modulation_format_for_model(model_key, spec)
     # Do NOT pass classical_channel_indices — derive it as complement of quantum_channel_indices
-    # (avoids explicit overlap validation)
     if spec["spectrum_type"] == SpectrumType.OSA_SAMPLED:
         return build_wdm_grid(
             config=model_config,
@@ -654,13 +900,13 @@ def _build_all_classical_grid(
             f_grid=f_grid,
             osa_csv_path=osa_csv_path,
             osa_rbw=OSA_RBW_HZ,
-            modulation_format="16QAM",
+            modulation_format=mod_fmt,
         )
     return build_wdm_grid(
         config=model_config,
         spectrum_type=spec["spectrum_type"],
         f_grid=f_grid,
-        modulation_format="16QAM" if spec["spectrum_type"] == SpectrumType.RAISED_COSINE else "OOK",
+        modulation_format=mod_fmt,
     )
 
 
@@ -881,9 +1127,11 @@ def precompute_by_length(
 
     Returns (ALL_BY_LEN, VALID_Q_INDICES)
     ALL_BY_LEN[q_idx][model_key] = {"fwd": np.array(N_L), "bwd": np.array(N_L)}
-    VALID_Q_INDICES: list of q_idx that have non-zero noise for at least one model
+VALID_Q_INDICES: list of q_idx that have non-zero noise for at least one model
     """
     model_keys = get_noise_model_keys(noise_type)
+    # Filter specs to only keys that are in model_keys (handles modulation format mismatch)
+    specs = {k: specs[k] for k in model_keys if k in specs}
     quantum_indices = list(base_config.quantum_channel_indices)
     n_q = len(quantum_indices)
     n_l = len(LENGTHS_KM)
@@ -905,7 +1153,7 @@ def precompute_by_length(
             ch_idx: {mk: {"fwd": np.zeros(n_l), "bwd": np.zeros(n_l)} for mk in model_keys}
             for ch_idx in range(n_ch)
         }
-        # Classical set: only C39/C40/C41 (zero-based indices [38, 39, 40])
+        # Classical set: ITU G.694.1 channel numbers (e.g. {39, 40, 41} = C39/C40/C41)
         classical_set = set(CLASSICAL_INDICES)
         L_arr = np.array(LENGTHS_KM, dtype=np.float64) * 1e3  # km → m
         fiber_base = _make_fiber(fiber_params, LENGTHS_KM[0])
@@ -939,7 +1187,8 @@ def precompute_by_length(
         # Signal PSD: sum ONLY over classical channels (C39/C40/C41) — computed once, shared by all model_keys
         signal_psd = np.zeros(len(noise_f_grid), dtype=np.float64)
         for idx, ch in enumerate(grid_noise.channels):
-            if idx in classical_set:
+            # idx is zero-based position; ITU channel number = idx+1
+            if (idx + 1) in classical_set:
                 signal_psd += ch.get_psd(noise_f_grid)
         for model_key in model_keys:
             spec = specs[model_key]
@@ -971,7 +1220,7 @@ def precompute_by_length(
         }
         for model_key in model_keys:
             spec = specs[model_key]
-            grid_all = _build_all_classical_grid(spec, base_config, noise_f_grid, osa_csv_path)
+            grid_all = _build_all_classical_grid(model_key, spec, base_config, noise_f_grid, osa_csv_path)
             signal = _integrate_signal_per_channel(grid_all, grid_all.f_grid)
             classical_mask = np.array([ch.channel_type == "classical" for ch in grid_all.channels], dtype=bool)
 
@@ -1031,8 +1280,8 @@ def precompute_by_length(
                     continuous=bool(spec["continuous"]),
                 )
                 if len(fwd) > 0:
-                    all_by_len[q_local_idx][model_key]["fwd"][li] = float(fwd[0])
-                    all_by_len[q_local_idx][model_key]["bwd"][li] = float(bwd[0])
+                    all_by_len[q_local_idx][model_key]["fwd"][li] = float(fwd[q_local_idx])
+                    all_by_len[q_local_idx][model_key]["bwd"][li] = float(bwd[q_local_idx])
 
     valid_q_indices = [
         q_local_idx
@@ -1069,6 +1318,8 @@ def precompute_by_channel(
     VALID_L_INDICES: list of L indices with non-zero noise
     """
     model_keys = get_noise_model_keys(noise_type)
+    # Filter specs to only keys that are in model_keys (handles modulation format mismatch)
+    specs = {k: specs[k] for k in model_keys if k in specs}
     quantum_indices = list(base_config.quantum_channel_indices)
     n_q = len(quantum_indices)
     n_l = len(LENGTHS_KM)
@@ -1089,11 +1340,11 @@ def precompute_by_channel(
             } for mk in model_keys}
             for li in range(n_l)
         }
-        # Classical set: only C39/C40/C41 (zero-based indices [38, 39, 40])
+        # Classical set: ITU G.694.1 channel numbers (e.g. {39, 40, 41})
         classical_set = set(CLASSICAL_INDICES)
         for li, length_km in enumerate(LENGTHS_KM):
             fiber = _make_fiber(fiber_params, length_km)
-            # Noise spectrum: use REAL quantum/classical split (only C39/C40/C41 are pumps)
+            # Noise spectrum: use REAL quantum/classical split (only classical channels are pumps)
             model_config_noise = WDMConfig(
                 start_freq=base_config.start_freq,
                 start_channel=base_config.start_channel,
@@ -1119,7 +1370,7 @@ def precompute_by_channel(
             # Signal PSD: sum ONLY over classical channels (C39/C40/C41) — computed once, shared by all model_keys
             signal_psd = np.zeros_like(noise_f_grid, dtype=np.float64)
             for idx, ch in enumerate(grid_noise.channels):
-                if idx in classical_set:
+                if (idx + 1) in classical_set:
                     signal_psd += ch.get_psd(noise_f_grid)
             for model_key in model_keys:
                 spec = specs[model_key]
@@ -1146,7 +1397,7 @@ def precompute_by_channel(
         df = float(np.mean(np.diff(noise_f_grid)))
         for model_key in model_keys:
             spec = specs[model_key]
-            grid_all = _build_all_classical_grid(spec, base_config, noise_f_grid, osa_csv_path)
+            grid_all = _build_all_classical_grid(model_key, spec, base_config, noise_f_grid, osa_csv_path)
             classical_mask = np.array(
                 [ch.channel_type == "classical" for ch in grid_all.channels], dtype=bool
             )
@@ -1154,7 +1405,7 @@ def precompute_by_channel(
             if spec["continuous"]:
                 # Continuous model: full f_grid + PSD → waveform line
                 psd_total = grid_all.get_total_psd()  # shape (N_f,)
-                fwd_arr = np.asarray(psd_total, dtype=np.float64)
+                fwd_arr = np.asarray(psd_total * df, dtype=np.float64)
                 bwd_arr = np.zeros(len(psd_total), dtype=np.float64)
                 x_arr = np.asarray(noise_f_grid, dtype=np.float64)
                 x_kind = "frequency_grid"
@@ -1414,13 +1665,16 @@ def precompute_by_channel(
 
 
 def get_noise_model_keys(noise_type: str) -> list[str]:
-    """Return model keys for the given noise_type."""
+    """Return model keys for the given noise_type, respecting MODULATION_FORMAT."""
     _ = noise_type
     try:
         from qkd_sim.config.plot_config import load_model_specs
 
-        return list(load_model_specs("fwm_noise").keys())
+        group = f"fwm_noise_{MODULATION_FORMAT}"
+        return list(load_model_specs(group).keys())
     except Exception:
+        if MODULATION_FORMAT == "ook":
+            return ["discrete", "nrz_ook", "osa_ook"]
         return ["discrete", "osa"]
 
 
@@ -1646,7 +1900,192 @@ def precompute_by_length_all_powers(
     # Extract 0 dBm result
     result_all, result_valid = results[0.0]
 
-    # Restore 0 dBm in memory cache and power override
+# Restore 0 dBm in memory cache and power override
     set_power_override(0.0)
     _POWER_CACHE[("len", 0.0)] = result_all
     return result_all, result_valid
+
+
+# =============================================================================
+# Excel / simulation report export
+# =============================================================================
+
+def _interp_discrete_to_freq_grid(
+    discrete_x: np.ndarray,  # channel center freqs (Hz), shape (N_q,)
+    discrete_vals: np.ndarray,  # channel powers (W), shape (N_q,)
+    freq_grid: np.ndarray,  # full frequency grid (Hz), shape (N_f,)
+) -> np.ndarray:
+    """Interpolate discrete channel-power data to full frequency grid.
+
+    Returns array of same shape as freq_grid, with power at channel center
+    frequencies and 0 elsewhere (boxcar interpolation).
+    """
+    out = np.zeros(len(freq_grid), dtype=np.float64)
+    for x, v in zip(discrete_x, discrete_vals):
+        idx = np.argmin(np.abs(freq_grid - x))
+        out[idx] = v
+    return out
+
+
+def export_noise_vs_frequency_xlsx(
+    all_by_ch: dict,
+    model_keys: list[str],
+    noise_f_grid: np.ndarray,
+    LENGTHS_KM: np.ndarray,
+    output_path: Path,
+) -> None:
+    """Export noise vs frequency data to noise_vs_frequency.xlsx.
+
+    Each sheet = one fiber length.  Continuous models share full-frequency-grid
+    columns; discrete model is interpolated to that grid (0 elsewhere).
+    Only 0 dBm power is exported.
+    """
+    try:
+        import openpyxl
+    except ImportError:
+        print("[export] openpyxl not available, skipping xlsx export")
+        return
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)  # remove default empty sheet
+
+    for li in range(len(LENGTHS_KM)):
+        length_km = float(LENGTHS_KM[li])
+        sweep = all_by_ch.get(li, {})
+        if not sweep:
+            continue
+        ws = wb.create_sheet(title=f"L={length_km:.0f}km")
+
+        # Build header row: frequency + (fwd/bwd pairs per model)
+        headers = ["frequency_THz"]
+        for mk in model_keys:
+            headers.append(f"{mk}_fwd_W")
+            headers.append(f"{mk}_bwd_W")
+        ws.append(headers)
+
+        freq_thz = noise_f_grid / 1e12
+        n_f = len(freq_thz)
+
+        for fi in range(n_f):
+            row = [freq_thz[fi]]
+            for mk in model_keys:
+                entry = sweep.get(mk, {})
+                fwd = entry.get("fwd", np.array([]))
+                bwd = entry.get("bwd", np.array([]))
+                # Continuous: index directly into fwd/bwd arrays
+                # Discrete: use channel_center x_kind
+                y_kind = entry.get("y_kind", "")
+                x_kind = entry.get("x_kind", "")
+                if len(fwd) == n_f:
+                    row.append(float(fwd[fi]) if fi < len(fwd) else 0.0)
+                    row.append(float(bwd[fi]) if fi < len(bwd) else 0.0)
+                else:
+                    # Discrete model: only valid at channel center
+                    x_data = np.asarray(entry.get("x", []), dtype=np.float64)
+                    if y_kind == "channel_power" and len(x_data) == len(fwd):
+                        # find closest channel center
+                        target_f = noise_f_grid[fi]
+                        idx = np.argmin(np.abs(x_data - target_f))
+                        if np.abs(x_data[idx] - target_f) < 1e9:  # within 1 GHz
+                            row.append(float(fwd[idx]))
+                            row.append(float(bwd[idx]))
+                        else:
+                            row.append(0.0)
+                            row.append(0.0)
+                    else:
+                        row.append(0.0)
+                        row.append(0.0)
+            ws.append(row)
+
+    wb.save(output_path)
+    print(f"[export] wrote {output_path}")
+
+
+def export_noise_vs_length_xlsx(
+    all_by_len: dict,
+    model_keys: list[str],
+    LENGTHS_KM: np.ndarray,
+    quantum_center_freqs: np.ndarray,
+    output_path: Path,
+) -> None:
+    """Export noise vs length data to noise_vs_length.xlsx.
+
+    Each sheet = one quantum channel.  Only 0 dBm power is exported.
+    """
+    try:
+        import openpyxl
+    except ImportError:
+        print("[export] openpyxl not available, skipping xlsx export")
+        return
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+
+    for qi, qfreq in enumerate(quantum_center_freqs):
+        ws = wb.create_sheet(title=f"C{qi + WDM_PARAMS['start_channel']}")
+
+        headers = ["length_km"] + [f"{mk}_fwd_W" for mk in model_keys] + [f"{mk}_bwd_W" for mk in model_keys]
+        ws.append(headers)
+
+        for li, length_km in enumerate(LENGTHS_KM):
+            row = [float(length_km)]
+            for mk in model_keys:
+                entry = all_by_len.get(qi, {}).get(mk, {})
+                fwd = np.asarray(entry.get("fwd", []), dtype=np.float64)
+                bwd = np.asarray(entry.get("bwd", []), dtype=np.float64)
+                row.append(float(fwd[li]) if li < len(fwd) else 0.0)
+                row.append(float(bwd[li]) if li < len(bwd) else 0.0)
+            ws.append(row)
+
+    wb.save(output_path)
+    print(f"[export] wrote {output_path}")
+
+
+def export_simulation_report(
+    fiber_params: dict,
+    noise_f_grid: np.ndarray,
+    model_keys: list[str],
+    noise_type: str,
+    modulation_format: str,
+    output_path: Path,
+) -> None:
+    """Write simulation parameters to simulation_report.txt."""
+    lines = [
+        "=== QKD Optical Network Simulation Report ===",
+        f"Timestamp: 2026-04-17",
+        f"Noise type: {noise_type}",
+        f"Modulation format: {modulation_format}",
+        "",
+        "--- WDM Parameters ---",
+        f"  start_freq: {WDM_PARAMS['start_freq']:.3e} Hz ({WDM_PARAMS['start_freq']/1e12:.1f} THz)",
+        f"  end_channel: {WDM_PARAMS['end_channel']}",
+        f"  channel_spacing: {WDM_PARAMS['channel_spacing']:.3e} Hz ({WDM_PARAMS['channel_spacing']/1e9:.0f} GHz)",
+        f"  B_s: {WDM_PARAMS['B_s']:.3e} Hz ({WDM_PARAMS['B_s']/1e9:.1f} GBaud)",
+        f"  P0: {WDM_PARAMS['P0']:.3e} W ({10*np.log10(WDM_PARAMS['P0']/1e-3):.1f} dBm)",
+        f"  beta_rolloff: {WDM_PARAMS['beta_rolloff']}",
+        f"  classical_channel_indices: {CLASSICAL_INDICES}",
+        f"  classical_channel_ITU: {[f'C{ch}' for ch in CLASSICAL_INDICES]}",
+        f"  classical_channel_freqs_THz: {[round(WDM_PARAMS['start_freq']/1e12 + (ch - WDM_PARAMS['start_channel']) * WDM_PARAMS['channel_spacing']/1e12, 4) for ch in CLASSICAL_INDICES]}",
+        "",
+        "--- Fiber Parameters ---",
+        f"  alpha_dB_per_km: {fiber_params.get('alpha_dB_per_km', 'N/A')}",
+        f"  gamma_per_W_km: {fiber_params.get('gamma_per_W_km', 'N/A')}",
+        f"  D_ps_nm_km: {fiber_params.get('D_ps_nm_km', 'N/A')}",
+        f"  D_slope_ps_nm2_km: {fiber_params.get('D_slope_ps_nm2_km', 'N/A')}",
+        f"  A_eff: {fiber_params.get('A_eff', 'N/A')} m^2",
+        f"  rayleigh_coeff: {fiber_params.get('rayleigh_coeff', 'N/A')}",
+        f"  T_kelvin: {fiber_params.get('T_kelvin', 'N/A')} K",
+        f"  length_km_samples: {list(fiber_params.get('length_km_samples', LENGTHS_KM))}",
+        "",
+        "--- Model Keys ---",
+        f"  {model_keys}",
+        "",
+        "--- Frequency Grid ---",
+        f"  noise_f_grid points: {len(noise_f_grid)}",
+        f"  noise_f_grid range: {noise_f_grid[0]/1e12:.4f}  --  {noise_f_grid[-1]/1e12:.4f} THz",
+        f"  NOISE_GRID_RESOLUTION_HZ: {NOISE_GRID_RESOLUTION_HZ:.3e}",
+        f"  NOISE_FLOOR_W: {NOISE_FLOOR_W:.3e}",
+    ]
+
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"[export] wrote {output_path}")

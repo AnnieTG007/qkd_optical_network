@@ -51,9 +51,22 @@ models:
     continuous: true
     beta_rolloff: 1.0
 
+  # ---- NRZ-OOK 模型（OOK 调制） ----
+  nrz_ook:
+    label: "NRZ-OOK"
+    spectrum_type: NRZ_OOK
+    continuous: true
+    beta_rolloff: null
+
   # ---- OSA 模型 ----
   osa:
-    label: "OSA"
+    label: "OSA (16QAM)"
+    spectrum_type: OSA_SAMPLED
+    continuous: true
+    beta_rolloff: null
+
+  osa_ook:
+    label: "OSA (OOK)"
     spectrum_type: OSA_SAMPLED
     continuous: true
     beta_rolloff: null
@@ -69,7 +82,9 @@ colors:
   rc_beta02:      "#ff7f0e"
   rc_beta05:      "#ff7f0e"
   rc_beta1:       "#d95f02"
+  nrz_ook:        "#e377c2"
   osa:            "#2ca02c"
+  osa_ook:        "#2ca02c"
 
 # =============================================================================
 # 模型分组（不同绘图场景使用的模型列表）
@@ -83,12 +98,25 @@ model_groups:
     - rc_beta05
     - osa
 
-  # FWM Noise PSD 对比
-  fwm_noise:
+  # ---- 16QAM 调制场景 ----
+  fwm_noise_16qam:
     - discrete
     - rc_beta001
     - rc_beta05
     - osa
+
+  # 向后兼容别名
+  fwm_noise: &fwm_noise_default
+    - discrete
+    - rc_beta001
+    - rc_beta05
+    - osa
+
+  # ---- OOK 调制场景 ----
+  fwm_noise_ook:
+    - discrete
+    - nrz_ook
+    - osa_ook
 
   # Phase 4 噪声谱综合对比
   noise_spectrum:

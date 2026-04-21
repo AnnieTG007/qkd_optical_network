@@ -819,7 +819,8 @@ class DiscreteFWMSolver(NoiseSolver):
         G_tx = self._build_total_classical_psd(wdm_grid, f_grid, df)
         alpha_grid = np.asarray(fiber.get_loss_at_freq(f_grid), dtype=np.float64)
 
-        active = G_tx > 0.0
+        G_min = G_tx.max() * 1e-5  # -50 dB relative threshold
+        active = G_tx > G_min
         if not np.any(active):
             return np.zeros(len(q_chs), dtype=np.float64)
 
@@ -888,7 +889,8 @@ class DiscreteFWMSolver(NoiseSolver):
         G_tx = self._build_total_classical_psd(wdm_grid, f_grid, df)
         alpha_grid = np.asarray(fiber.get_loss_at_freq(f_grid), dtype=np.float64)
 
-        active = G_tx > 0.0
+        G_min = G_tx.max() * 1e-5  # -50 dB relative threshold
+        active = G_tx > G_min
         if not np.any(active):
             return np.zeros(len(q_chs), dtype=np.float64)
 
@@ -996,7 +998,8 @@ class DiscreteFWMSolver(NoiseSolver):
         G_tx = self._build_total_classical_psd(wdm_grid, f_grid, df)
         alpha_grid = np.asarray(fiber.get_loss_at_freq(f_grid), dtype=np.float64)
 
-        active = G_tx > 0.0
+        G_min = G_tx.max() * 1e-5  # -50 dB relative threshold
+        active = G_tx > G_min
         if not np.any(active):
             if L_arr is None:
                 return np.zeros_like(f_grid, dtype=np.float64)
@@ -1280,7 +1283,8 @@ class DiscreteFWMSolver(NoiseSolver):
         G_tx_cpu = self._build_total_classical_psd(wdm_grid, f_grid_cpu, df)
         alpha_grid_cpu = np.asarray(fiber.get_loss_at_freq(f_grid_cpu), dtype=np.float64)
 
-        active_cpu = G_tx_cpu > 0.0
+        G_min_cpu = G_tx_cpu.max() * 1e-5  # -50 dB relative threshold
+        active_cpu = G_tx_cpu > G_min_cpu
         n_f = f_grid_cpu.size
         if not np.any(active_cpu):
             if L_arr is None:

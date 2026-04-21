@@ -36,7 +36,7 @@ def _phonon_occupation(delta_f: np.ndarray, T: float) -> np.ndarray:
     T : float
         温度 [K]
 
-    Returns
+Returns
     -------
     ndarray
         声子占据因子（无量纲），形状与 delta_f 相同

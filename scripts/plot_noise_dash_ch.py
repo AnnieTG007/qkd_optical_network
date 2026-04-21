@@ -36,7 +36,11 @@ from scripts.dash_utils import (
     _resolve_osa_csv,
     adaptive_linear_ticks,
     adaptive_log_ticks,
+    add_strategy_cli_args,
+    export_noise_vs_frequency_xlsx,
+    export_simulation_report,
     get_noise_model_keys,
+    override_strategy_from_cli,
     precompute_by_channel_all_powers,
     print_compute_device,
     profile_scope,
@@ -67,7 +71,7 @@ def _global_ranges(all_data: dict, model_keys: list[str]) -> tuple[tuple[float, 
             fwd = np.asarray(entry.get("fwd", []), dtype=np.float64)
             bwd = np.asarray(entry.get("bwd", []), dtype=np.float64)
             y_kind = entry.get("y_kind", "")
-            if y_kind == "power_per_bin":
+            if y_kind == "power_per_bin" and NOISE_TYPE != "only_signal":
                 # Integrate PSD over reference bandwidth to get equivalent power [W]
                 fwd = fwd * OSA_RBW_HZ
                 bwd = bwd * OSA_RBW_HZ
@@ -97,6 +101,7 @@ def _select_profile_lengths(lengths_km: np.ndarray, count: int | None) -> np.nda
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--type", default="fwm", choices=["fwm", "sprs", "both", "only_signal", "with_signal"])
+parser.add_argument("--modulation", default="16qam", choices=["ook", "16qam"])
 parser.add_argument(
     "--profile-only",
     action="store_true",
@@ -108,8 +113,32 @@ parser.add_argument(
     default=3,
     help="Number of evenly spaced fiber lengths used with --profile-only.",
 )
+parser.add_argument(
+    "--export-excel",
+    action="store_true",
+    help="After precomputation, export Excel files and exit (do not start Dash server).",
+)
+parser.add_argument(
+    "--export-only",
+    action="store_true",
+    help="Shorthand for --export-excel.",
+)
+add_strategy_cli_args(parser)
 ARGS = parser.parse_args()
 NOISE_TYPE = ARGS.type
+import scripts.dash_utils as _du
+_du.MODULATION_FORMAT = ARGS.modulation
+
+# 策略参数覆盖：在预计算之前用 CLI 参数替换 CLASSICAL_INDICES
+if ARGS.strategy_name or ARGS.num_classical or ARGS.reference_channel:
+    _du.CLASSICAL_INDICES = override_strategy_from_cli(
+        ARGS.strategy_name, ARGS.num_classical, ARGS.reference_channel
+    )
+    print(
+        f"Strategy override: CLASSICAL_INDICES = {_du.CLASSICAL_INDICES} "
+        f"(name={ARGS.strategy_name}, N={ARGS.num_classical}, ref={ARGS.reference_channel})"
+    )
+
 ACTIVE_LENGTHS_KM = _select_profile_lengths(
     LENGTHS_KM,
     ARGS.profile_length_count if ARGS.profile_only else None,
@@ -131,22 +160,23 @@ t0 = time.perf_counter()
 
 with profile_scope("startup: build config, frequency grid, model specs"):
     osa_csv_path = _resolve_osa_csv()
+    # base_quantum_indices: ITU G.694.1 channel numbers (1-based)
     base_quantum_indices = [
-        i
-        for i in range(int(WDM_PARAMS["end_channel"] - WDM_PARAMS["start_channel"] + 1))
-        if i not in CLASSICAL_INDICES
+        itn
+        for itn in range(1, int(WDM_PARAMS["end_channel"] - WDM_PARAMS["start_channel"] + 2))
+        if itn not in CLASSICAL_INDICES
     ]
     # Quantum channel center frequencies for discrete model x-axis
     quantum_center_freqs = np.array(
         [
-            WDM_PARAMS["start_freq"] + idx * WDM_PARAMS["channel_spacing"]
-            for idx in base_quantum_indices
+            WDM_PARAMS["start_freq"] + (itn - WDM_PARAMS["start_channel"]) * WDM_PARAMS["channel_spacing"]
+            for itn in base_quantum_indices
         ],
         dtype=np.float64,
     )
     base_config = _build_wdm_config(base_quantum_indices)
     noise_f_grid = _build_noise_frequency_grid(base_config)
-    specs = load_model_specs("fwm_noise")
+    specs = load_model_specs(f"fwm_noise_{ARGS.modulation}")
     model_keys = get_noise_model_keys(NOISE_TYPE)
 
 # Precompute ALL power levels at startup
@@ -186,7 +216,28 @@ for mk in model_keys:
     y_kind = entry.get("y_kind", "N/A")
     print(f"  {mk}: x.shape={x.shape}, fwd.shape={fwd.shape}, x_kind={x_kind}, y_kind={y_kind}")
 
-if ARGS.profile_only:
+if ARGS.profile_only or ARGS.export_only:
+    # Export Excel files then exit (--export-only implies --export-excel)
+    if ARGS.export_only or ARGS.export_excel:
+        out_dir = _PROJECT_ROOT / "data" / "precomputed"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        xlsx_path = out_dir / "noise_vs_frequency.xlsx"
+        export_noise_vs_frequency_xlsx(
+            all_by_ch=_POWER_CACHE.get(("ch", 0.0), {}),
+            model_keys=model_keys,
+            noise_f_grid=noise_f_grid,
+            LENGTHS_KM=ACTIVE_LENGTHS_KM,
+            output_path=xlsx_path,
+        )
+        report_path = out_dir / "simulation_report.txt"
+        export_simulation_report(
+            fiber_params=FIBER_PARAMS,
+            noise_f_grid=noise_f_grid,
+            model_keys=model_keys,
+            noise_type=NOISE_TYPE,
+            modulation_format=ARGS.modulation,
+            output_path=report_path,
+        )
     sys.exit(0)
 
 app = Dash(__name__)
@@ -309,11 +360,20 @@ def _make_figure(sweep: dict, l_idx: int) -> go.Figure:
         x_data = np.asarray(entry.get("x", []), dtype=np.float64)
         x_thz = x_data / 1e12
 
-        for direction, dash_style in (("fwd", "solid"), ("bwd", "dot")):
+        _directions = (
+            [("fwd", "solid")]
+            if NOISE_TYPE == "only_signal"
+            else [("fwd", "solid"), ("bwd", "dot")]
+        )
+        for direction, dash_style in _directions:
             arr_w = np.asarray(entry.get(direction, []), dtype=np.float64)
 
-            name = f"{spec['label']} ({direction})"
-            legendgroup = f"{model_key}-{direction}"
+            if NOISE_TYPE == "only_signal":
+                name = spec["label"]
+                legendgroup = model_key
+            else:
+                name = f"{spec['label']} ({direction})"
+                legendgroup = f"{model_key}-{direction}"
 
             if spec["continuous"] or NOISE_TYPE == "with_signal":
                 # Continuous model or with_signal: lines on full f_grid

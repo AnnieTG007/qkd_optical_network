@@ -15,3 +15,17 @@ B_s: 3.2e+10                  # 信号带宽/符号速率 [Hz]（32 GBaud）
 P0: 1.0e-3                    # 单信道发射功率 [W]（0 dBm）
 beta_rolloff: 0.0             # 升余弦滚降因子（0=矩形谱）
 quantum_channel_indices: []     # 量子信道索引（空=全部为经典）
+# 经典泵浦信道 — strategy 与 indices 二选一，indices 有值时忽略 strategy
+classical_channel_indices:   # null = 使用 strategy；直接指定如 [38, 39, 40] 则忽略 strategy
+
+classical_channel_strategy:
+  name: "equal_interval"
+  reference_channel: 35   # ITU G.694.1 C35 = 193.5 THz（量子信道参考点，自身不算经典泵浦）
+  num_classical: 3        # 低频侧取 3 个连续 ITU 信道
+  reserved:
+    - name: "sync"
+      channel: 33         # ITU C33 保留（保护带宽 100 GHz，下方经典信道不与其冲突则可用）
+      bandwidth_ghz: 100
+    - name: "reference"
+      channel: 35         # ITU C35 保留（与参考信道重合，实际上不起作用）
+      bandwidth_ghz: 20

@@ -63,7 +63,7 @@ def mp_worker_single_length(
 
     cfg = WDMConfig(**wdm_cfg)
     p0 = _P0(power_override_dbm)
-    classical_set = set(classical_indices)
+    classical_set = set(classical_indices)  # ITU channel numbers (1-based)
     df = float(np.mean(np.diff(noise_f_grid)))
 
     results: list[dict] = []
@@ -93,7 +93,8 @@ def mp_worker_single_length(
         for mk in model_keys:
             sig_psd = np.zeros(n_f, dtype=np.float64)
             for idx, ch in enumerate(grid_noise.channels):
-                if idx in classical_set:
+                # idx is zero-based position; ITU channel number = idx+1
+                if (idx + 1) in classical_set:
                     sig_psd += ch.get_psd(noise_f_grid)
             fwd = (n_fwd + sig_psd) * df
             bwd = (n_bwd + sig_psd) * df
@@ -106,12 +107,13 @@ def mp_worker_single_length(
 
     elif noise_type == "only_signal":
         classical_set = set(classical_indices)
-        all_idx = list(range(int(cfg.num_channels)))
+        # all_idx: ITU G.694.1 channel numbers (1-based)
+        all_idx = list(range(1, int(cfg.num_channels) + 1))
         # x-axis: all channel center frequencies
         all_ch_freqs = np.array(
             [
-                cfg.start_freq + idx * cfg.channel_spacing
-                for idx in all_idx
+                cfg.start_freq + (itn - cfg.start_channel) * cfg.channel_spacing
+                for itn in all_idx
             ],
             dtype=np.float64,
         )
@@ -138,7 +140,7 @@ def mp_worker_single_length(
         for mk in model_keys:
             sig_psd = np.zeros(n_f, dtype=np.float64)
             for idx, ch in enumerate(grid_all.channels):
-                if idx in classical_set:
+                if (idx + 1) in classical_set:
                     sig_psd += ch.get_psd(noise_f_grid)
             fwd = sig_psd * df
             bwd = np.zeros(n_f, dtype=np.float64)
@@ -185,11 +187,11 @@ def mp_worker_single_length(
                 })
             else:
                 n_q = len(cfg.quantum_channel_indices)
-                # Quantum channel center frequencies for x-axis
+                # Quantum channel center frequencies for x-axis (quantum_channel_indices are ITU channel numbers)
                 q_center_freqs = np.array(
                     [
-                        cfg.start_freq + idx * cfg.channel_spacing
-                        for idx in cfg.quantum_channel_indices
+                        cfg.start_freq + (itn - cfg.start_channel) * cfg.channel_spacing
+                        for itn in cfg.quantum_channel_indices
                     ],
                     dtype=np.float64,
                 )

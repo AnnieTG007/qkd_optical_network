@@ -37,7 +37,11 @@ from scripts.dash_utils import (
     _resolve_osa_csv,
     adaptive_linear_ticks,
     adaptive_log_ticks,
+    add_strategy_cli_args,
+    export_noise_vs_length_xlsx,
+    export_simulation_report,
     get_noise_model_keys,
+    override_strategy_from_cli,
     precompute_by_length_all_powers,
     print_compute_device,
     set_power_override,
@@ -70,8 +74,32 @@ def _global_ranges(all_data: dict, model_keys: list[str]) -> tuple[tuple[float, 
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--type", default="fwm", choices=["fwm", "sprs", "both", "only_signal", "with_signal"])
+parser.add_argument("--modulation", default="16qam", choices=["ook", "16qam"])
+parser.add_argument(
+    "--export-excel",
+    action="store_true",
+    help="After precomputation, export Excel files and exit (do not start Dash server).",
+)
+parser.add_argument(
+    "--export-only",
+    action="store_true",
+    help="Shorthand for --export-excel.",
+)
+add_strategy_cli_args(parser)
 ARGS = parser.parse_args()
 NOISE_TYPE = ARGS.type
+import scripts.dash_utils as _du
+_du.MODULATION_FORMAT = ARGS.modulation
+
+# 策略参数覆盖：在预计算之前用 CLI 参数替换 CLASSICAL_INDICES
+if ARGS.strategy_name or ARGS.num_classical or ARGS.reference_channel:
+    _du.CLASSICAL_INDICES = override_strategy_from_cli(
+        ARGS.strategy_name, ARGS.num_classical, ARGS.reference_channel
+    )
+    print(
+        f"Strategy override: CLASSICAL_INDICES = {_du.CLASSICAL_INDICES} "
+        f"(name={ARGS.strategy_name}, N={ARGS.num_classical}, ref={ARGS.reference_channel})"
+    )
 
 print("=" * 60)
 print_compute_device()
@@ -79,14 +107,15 @@ print(f"Precomputing ALL power levels for type={NOISE_TYPE}")
 t0 = time.time()
 
 osa_csv_path = _resolve_osa_csv()
+# base_quantum_indices_list: ITU G.694.1 channel numbers (1-based), e.g. [1, 2, ..., 61]
 base_quantum_indices_list = [
-    i
-    for i in range(int(WDM_PARAMS["end_channel"] - WDM_PARAMS["start_channel"] + 1))
-    if i not in CLASSICAL_INDICES
+    itn
+    for itn in range(1, int(WDM_PARAMS["end_channel"] - WDM_PARAMS["start_channel"] + 2))
+    if itn not in CLASSICAL_INDICES
 ]
 base_config = _build_wdm_config(base_quantum_indices_list)
 noise_f_grid = _build_noise_frequency_grid(base_config)
-specs = load_model_specs("fwm_noise")
+specs = load_model_specs(f"fwm_noise_{ARGS.modulation}")
 model_keys = get_noise_model_keys(NOISE_TYPE)
 
 # Precompute ALL power levels at startup
@@ -105,6 +134,36 @@ if not VALID_INDICES:
 Y_LOG_RANGE, Y_DBM_RANGE = _global_ranges(ALL_BY_LEN, model_keys)
 elapsed = time.time() - t0
 print(f"Precompute done in {elapsed:.1f}s. Valid selections: {len(VALID_INDICES)}")
+
+if ARGS.export_only or ARGS.export_excel:
+    out_dir = _PROJECT_ROOT / "data" / "precomputed"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # quantum_center_freqs: same as used for base_config
+    quantum_center_freqs = np.array(
+        [
+            WDM_PARAMS["start_freq"] + (itn - WDM_PARAMS["start_channel"]) * WDM_PARAMS["channel_spacing"]
+            for itn in base_quantum_indices_list
+        ],
+        dtype=np.float64,
+    )
+    xlsx_path = out_dir / "noise_vs_length.xlsx"
+    export_noise_vs_length_xlsx(
+        all_by_len=_POWER_CACHE.get(("len", 0.0), {}),
+        model_keys=model_keys,
+        LENGTHS_KM=LENGTHS_KM,
+        quantum_center_freqs=quantum_center_freqs,
+        output_path=xlsx_path,
+    )
+    report_path = out_dir / "simulation_report.txt"
+    export_simulation_report(
+        fiber_params=FIBER_PARAMS,
+        noise_f_grid=noise_f_grid,
+        model_keys=model_keys,
+        noise_type=NOISE_TYPE,
+        modulation_format=ARGS.modulation,
+        output_path=report_path,
+    )
+    sys.exit(0)
 
 app = Dash(__name__)
 app.index_string = app.index_string.replace("</body>", "<script>" + _LEGEND_SYNC_JS + "</script></body>")
@@ -173,7 +232,7 @@ def update_display(selection_idx: int) -> str:
     else:
         q_local = VALID_INDICES[selection_idx]
         ch_idx = base_quantum_indices_list[q_local]  # 全局信道索引用于显示
-    freq_hz = WDM_PARAMS["start_freq"] + ch_idx * WDM_PARAMS["channel_spacing"]
+    freq_hz = WDM_PARAMS["start_freq"] + (ch_idx - WDM_PARAMS["start_channel"]) * WDM_PARAMS["channel_spacing"]
     wl_nm = 299792458.0 / freq_hz * 1e9
     return f"Selected: {_display_channel_label(ch_idx)} | f = {freq_hz / 1e12:.4f} THz | lambda ~ {wl_nm:.2f} nm"
 

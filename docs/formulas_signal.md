@@ -89,19 +89,42 @@ $$
 
 ### 3.2 NRZ-OOK 信号建模（公式 3.2）
 
-NRZ-OOK 信号的功率谱密度为：
+NRZ-OOK 信号的功率谱密度写为通用形式：
 
 $$
-G_{\text{TX}}(f) = \frac{P_{\text{ch}}}{R_b} \cdot \text{sinc}^2(\pi f T_b) \cdot \frac{1}{1 + \left(\frac{f}{f_c}\right)^2}
+G_{\text{TX}}(f) = \frac{P_{\text{ch}}}{R_b} \cdot \text{sinc}^2(\pi \Delta f \cdot T_b) \cdot |H(\Delta f)|^2
 $$
 
-其中：
-- $T_b = 1 / R_b$：比特周期 [s]（$R_b$ 为比特速率，通常 $R_b = B_s$）
-- $f_c = 0.7 R_b$：截止频率 [Hz]
+其中 $\Delta f = f - f_n$，$T_b = 1/R_b$，$R_b = B_s$。
 
-**峰值高度**：NRZ-OOK 谱在 f=0 处取得峰值，高于同等功率的矩形谱峰值。
+#### 接收滤波器：Butterworth 滤波器
 
-注意：功率归一化条件 $\int G_{\text{TX}}(f) df = P_{\text{ch}}$ 由 `normalize_psd_to_power` 在计算时强制满足。
+$$
+|H(\Delta f)|^2 = \frac{1}{1 + \left(\dfrac{\Delta f}{f_{3\text{dB}}}\right)^{2m}}
+$$
+
+- $m$：滤波器阶数（可通过配置文件设置，默认 $m=1$，退化为 Lorentzian）
+- $f_{3\text{dB}}$：滤波器 -3 dB 截止频率 [Hz]
+
+#### $f_{3\text{dB}}$ 的严格计算
+
+$f_{3\text{dB}}$ 默认取 NRZ-OOK 基带 sinc² 谱的 -3 dB 截止频率，即满足以下方程的最小正频率点：
+
+$$
+\text{sinc}^2\!\left(\frac{f_{3\text{dB}}}{R_b}\right) = \frac{1}{2}
+\quad \Longleftrightarrow \quad
+\frac{\sin(\pi f_{3\text{dB}} T_b)}{\pi f_{3\text{dB}} T_b} = \frac{1}{\sqrt{2}}
+$$
+
+**计算方法**：令 $u = f_{3\text{dB}} / R_b$，在 $(0, 1)$ 区间内对 $\text{sinc}(u) - 1/\sqrt{2} = 0$ 进行数值求根（`scipy.optimize.brentq`），得 $u \approx 0.4430$，即 $f_{3\text{dB}} \approx 0.4430 \, R_b$。
+
+代码中通过模块级常量 `_NRZ_OOK_3DB_FACTOR` 在导入时一次性计算，运行时直接使用。
+
+$f_{3\text{dB}}$ 可通过 YAML 配置字段 `ook_f3db_hz` 直接指定（单位 Hz），覆盖默认计算值。
+
+**峰值高度**：NRZ-OOK 谱在 $\Delta f=0$ 处取得峰值，高于同等功率的矩形谱峰值。
+
+注意：功率归一化条件 $\int G_{\text{TX}}(f) \, df = P_{\text{ch}}$ 由 `normalize_psd_to_power` 在计算时强制满足。
 
 ### 3.3 OSA真实采样
 

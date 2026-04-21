@@ -12,24 +12,19 @@
 
 ## 环境搭建
 
-### 依赖环境
+### 方式一：conda（推荐）
 
 ```bash
-conda create -n qkd_env python>=3.10
+conda env create -f environment.yml
 conda activate qkd_env
+```
 
-# 核心依赖
-pip install numpy scipy matplotlib networkx pyyaml dash plotly
+### 方式二：pip
 
-# 可选：GPU 加速（需要 CUDA）
-pip install cupy
-
-# 可选：ILP 求解器 / 强化学习
-pip install pulp
-pip install gymnasium
-
-# 安装本项目
-pip install -e .
+```bash
+pip install -e ".[plot]"      # 核心 + 绘图依赖（dash, plotly, openpyxl）
+pip install -e ".[all]"        # 全部依赖（含 ILP / 强化学习）
+pip install -e ".[gpu]"        # 额外安装 GPU 加速（需 CUDA）
 ```
 
 ## 快速开始
@@ -75,20 +70,32 @@ print("SpRS 前向噪声:", noise["sprs_fwd"])
 
 ### 2. 绘图脚本
 
-所有 Dash 脚本使用统一的 `--type` 参数：
+所有 Dash 脚本支持以下参数：
+
+| 参数 | 说明 |
+|------|------|
+| `--type` | 噪声类型：`fwm`, `sprs`, `both`, `only_signal`, `with_signal` |
+| `--modulation` | 调制格式：`16qam`（默认，Raised Cosine + OSA 16QAM），`ook`（NRZ-OOK + OSA OOK）|
+| `--export-excel` | 预计算后导出 Excel 文件并退出（不启动 Dash 服务器） |
+| `--export-only` | `--export-excel` 的简写 |
 
 ```bash
 # App 1: 噪声 vs 光纤长度（端口 8050）
-python scripts/plot_noise_dash_len.py --type=fwm
-python scripts/plot_noise_dash_len.py --type=sprs
-python scripts/plot_noise_dash_len.py --type=both       # FWM + SpRS 功率叠加
-python scripts/plot_noise_dash_len.py --type=with_signal  # 包含信号 TX
+python scripts/plot_noise_dash_len.py --type=fwm --modulation=16qam
+python scripts/plot_noise_dash_len.py --type=fwm --modulation=ook
 
 # App 2: 噪声 vs 量子信道频率（端口 8051）
-python scripts/plot_noise_dash_ch.py --type=fwm
-python scripts/plot_noise_dash_ch.py --type=sprs
-python scripts/plot_noise_dash_ch.py --type=both
-python scripts/plot_noise_dash_ch.py --type=with_signal
+python scripts/plot_noise_dash_ch.py --type=fwm --modulation=16qam
+python scripts/plot_noise_dash_ch.py --type=both --modulation=ook
+
+# 导出 Excel 后直接退出
+python scripts/plot_noise_dash_ch.py --type=fwm --export-only
+# 生成: data/precomputed/noise_vs_frequency.xlsx  (每个 sheet = 一个光纤长度)
+#       data/precomputed/simulation_report.txt  (仿真参数记录)
+
+python scripts/plot_noise_dash_len.py --type=fwm --export-only
+# 生成: data/precomputed/noise_vs_length.xlsx     (每个 sheet = 一个量子信道)
+#       data/precomputed/simulation_report.txt
 
 # 信号功率谱
 python scripts/plot_signal_tx.py
@@ -109,6 +116,66 @@ python scripts/plot_signal_tx.py
 | `fiber_para/fiber_smf.yaml` | 标准单模光纤参数 |
 | `wdm_para/wdm_100ghz.yaml` | ITU-T G.694.1 C-band 100 GHz 间隔 |
 | `plot_para/model_comparison.yaml` | 绘图颜色/标签模型配置 |
+
+### 4. 参数配置说明
+
+#### 经典信道功率（统一功率）
+
+修改 `wdm_para/wdm_100ghz.yaml` 中的 `P0`：
+```yaml
+P0: 1.0e-3   # 0 dBm = 1 mW/信道
+P0: 2.0e-3   # 3 dBm = 2 mW/信道
+```
+
+#### 经典信道功率（逐信道不同）
+
+通过代码在创建 `WDMConfig` 时传入 `channel_powers_W` 字典（单位：瓦特）：
+```python
+wdm_cfg = WDMConfig(
+    ...,
+    P0=1e-3,  # 默认功率
+    channel_powers_W={38: 1.5e-3, 39: 2.0e-3, 40: 1.0e-3},  # 逐信道覆盖
+)
+```
+
+#### 经典信道位置
+
+修改 `wdm_para/wdm_100ghz.yaml` 中的 `classical_channel_indices`（zero-based 索引）：
+```yaml
+classical_channel_indices: [38, 39, 40]   # 默认：C39/C40/C41（193.9–194.1 THz）
+classical_channel_indices: [30, 31, 32]    # C31/C32/C33（193.1–193.3 THz）
+```
+
+#### 调制格式
+
+通过 `--modulation ook|16qam` 参数选择，不修改 YAML：
+```bash
+python scripts/plot_noise_dash_ch.py --type=fwm --modulation=ook    # OOK 场景
+python scripts/plot_noise_dash_ch.py --type=fwm --modulation=16qam  # 16QAM 场景（默认）
+```
+
+#### 经典信道策略配置
+
+默认使用 YAML 中的 `classical_channel_indices`（如 `[38, 39, 40]`），也可通过策略自动计算：
+
+```bash
+python scripts/plot_noise_dash_ch.py \
+    --strategy-name=interleave \
+    --num-classical=4 \
+    --reference-channel=34
+```
+
+| 参数 | 说明 |
+|------|------|
+| `--strategy-name` | `equal_interval`（低频侧连续）或 `interleave`（半频间隔） |
+| `--num-classical` | 经典信道数量 |
+| `--reference-channel` | zero-based 参考信道索引（C35 = 34） |
+
+保留约束（sync/reference 信道及其保护带宽）在 `wdm_100ghz.yaml` 的 `classical_channel_strategy.reserved` 中配置。
+
+#### 光纤参数
+
+修改 `fiber_para/fiber_smf.yaml` 中的任意字段（衰减系数 $\alpha$、非线性系数 $\gamma$、色散参数 $D$ 等）。
 
 ## 项目结构
 

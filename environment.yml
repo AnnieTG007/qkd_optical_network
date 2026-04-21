@@ -1,0 +1,16 @@
+# Thin conda environment definition.
+# All dependencies are managed in pyproject.toml — this file only
+# creates the conda env and installs the package via pip.
+#
+# Usage:
+#   conda env create -f environment.yml
+#   conda activate qkd_env
+
+name: qkd_env
+channels:
+  - defaults
+dependencies:
+  - python>=3.10
+  - pip
+  - pip:
+    - -e ".[plot]"
