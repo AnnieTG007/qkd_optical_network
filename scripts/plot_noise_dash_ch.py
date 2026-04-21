@@ -33,6 +33,7 @@ from scripts.dash_utils import (
     _build_noise_frequency_grid,
     _build_wdm_config,
     _display_channel_label,
+    _get_osa_rbw,
     _resolve_osa_csv,
     adaptive_linear_ticks,
     adaptive_log_ticks,
@@ -61,9 +62,9 @@ def _global_ranges(all_data: dict, model_keys: list[str]) -> tuple[tuple[float, 
     """Compute y-axis ranges for the plot.
 
     Returns (y_log, y_dbm). All data is in [W] (power per bin or channel power).
-    For power_per_bin entries, integrates over OSA_RBW_HZ (1 GHz) before dBm conversion.
+    For power_per_bin entries, integrates over OSA RBW before dBm conversion.
     """
-    OSA_RBW_HZ = 1e9  # OSA reference bandwidth, Hz (same as dash_utils.OSA_RBW_HZ)
+    OSA_RBW_HZ = _get_osa_rbw()
     positives: list[float] = []
     for curve_data in all_data.values():
         for model_key in model_keys:
@@ -159,7 +160,7 @@ else:
 t0 = time.perf_counter()
 
 with profile_scope("startup: build config, frequency grid, model specs"):
-    osa_csv_path = _resolve_osa_csv()
+    osa_csv_path = _resolve_osa_csv(ARGS.modulation)
     # base_quantum_indices: ITU G.694.1 channel numbers (1-based)
     base_quantum_indices = [
         itn

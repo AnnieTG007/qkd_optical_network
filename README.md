@@ -177,6 +177,59 @@ python scripts/plot_noise_dash_ch.py \
 
 修改 `fiber_para/fiber_smf.yaml` 中的任意字段（衰减系数 $\alpha$、非线性系数 $\gamma$、色散参数 $D$ 等）。
 
+### 5. BB84 SKR 参数
+
+BB84 安全码率配置统一管理于 `skr_para/bb84_config.yaml`，支持两种预设：
+
+```bash
+# 加载方式: load_skr_config(path, profile="custom")  # 默认
+#           load_skr_config(path, profile="reference") # 文献参考值
+```
+
+| 分区 | 用途 | 主要差异 |
+|------|------|---------|
+| `custom` | 实际系统仿真（默认） | η_spd=0.1, IL=8dB, 非对称诱饵态/基矢 |
+| `reference` | 复现文献结果 | η_spd=1.0, IL=0dB, 对称 BB84（Wiesemann et al.） |
+
+#### SKR 绘图脚本
+
+```bash
+# SKR vs 距离（App 3）
+python scripts/plot_skr_vs_distance.py --profile=custom      # 默认，实际系统参数
+python scripts/plot_skr_vs_distance.py --profile=reference   # 文献参考值
+
+# SKR 优化 vs 距离（App 4）
+python scripts/plot_skr_optimization_vs_distance.py --profile=custom
+python scripts/plot_skr_optimization_vs_distance.py --profile=reference
+
+# 指定自定义 YAML（覆盖 --profile 默认路径）
+python scripts/plot_skr_vs_distance.py --skr-config=/path/to/my_config.yaml --profile=custom
+```
+
+#### 块长模式（Block Length）
+
+SKR 计算支持两种块长指定方式，通过 `block_length` 字段配置：
+
+```yaml
+# 方式 A: 固定 Alice 发送脉冲数（默认）
+block_length:
+  mode: "alice"
+  N_alice: 1.0e+7     # Alice 发送 10M 脉冲
+  N_bob: ~
+
+# 方式 B: 固定 Bob 检测事件数
+block_length:
+  mode: "bob"
+  N_alice: ~            # mode=bob 时不使用
+  N_bob: 1.0e+6        # Bob 目标检测 1M 事件
+```
+
+mode=alice 和 mode=bob **互斥**，不能同时指定。`mode=alice` 时 `N_bob` 必须为 `~`（null），反之亦然。
+
+**物理含义**：
+- `mode=alice`：Alice 固定发送 N_alice 个脉冲，Bob 检测数为随机变量，积分时间 t = N_alice / R_0
+- `mode=bob`：Bob 固定检测 N_bob 个事件，Alice 发送脉冲数为随机变量，积分时间 t = N_bob / (R_0 · P_X_alice · P_X_bob · P_det)
+
 ## 项目结构
 
 ```

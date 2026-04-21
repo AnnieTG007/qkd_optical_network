@@ -106,7 +106,7 @@ print_compute_device()
 print(f"Precomputing ALL power levels for type={NOISE_TYPE}")
 t0 = time.time()
 
-osa_csv_path = _resolve_osa_csv()
+osa_csv_path = _resolve_osa_csv(ARGS.modulation)
 # base_quantum_indices_list: ITU G.694.1 channel numbers (1-based), e.g. [1, 2, ..., 61]
 base_quantum_indices_list = [
     itn

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -267,8 +268,33 @@ def _load_fiber_params() -> dict:
 _FIBER_CFG = _load_fiber_params()
 FIBER_PARAMS = {k: v for k, v in _FIBER_CFG.items() if k != 'length_km_samples'}
 LENGTHS_KM = np.array(_FIBER_CFG['length_km_samples'])
-OSA_RBW_HZ = 1.0e9
 OSA_CSV_PATH = _PROJECT_ROOT / "data" / "osa"
+_osa_rbw_hz: float | None = None
+
+
+def _infer_rbw_from_csv(csv_path: Path) -> float:
+    """Infer OSA RBW from CSV frequency step, rounded to 1 significant figure."""
+    frequencies = []
+    with open(csv_path, encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            frequencies.append(float(row["frequency_THz"]))
+    f_steps = np.diff(frequencies) * 1e12  # THz -> Hz
+    mean_step = float(np.mean(np.abs(f_steps)))
+    if mean_step <= 0:
+        raise ValueError(f"Invalid frequency step {mean_step} in {csv_path}")
+    magnitude = 10 ** np.floor(np.log10(mean_step))
+    rbw = magnitude * np.round(mean_step / magnitude)
+    return float(rbw)
+
+
+def _get_osa_rbw() -> float:
+    """Get OSA RBW, inferring from CSV if not yet set."""
+    global _osa_rbw_hz
+    if _osa_rbw_hz is None:
+        csv_path = OSA_CSV_PATH / "spectrum_OOK.csv"
+        _osa_rbw_hz = _infer_rbw_from_csv(csv_path)
+    return _osa_rbw_hz
 
 
 def _build_caption() -> str:
@@ -294,7 +320,7 @@ def _build_caption() -> str:
     return (
         f"Channel spacing: {ch_spacing_ghz:.0f} GHz | "
         f"Data rate: {data_rate_gbaud:.0f} GBaud | "
-        f"OSA RBW: {OSA_RBW_HZ / 1e9:.0f} GHz | "
+        f"OSA RBW: {_get_osa_rbw() / 1e9:.0f} GHz | "
         f"Classical channels: {classical_desc}"
     )
 
@@ -734,11 +760,23 @@ _LEGEND_SYNC_JS = """
 """
 
 
-def _resolve_osa_csv() -> Path:
-    csv_files = sorted(OSA_CSV_PATH.glob("*.csv"))
-    if not csv_files:
-        raise FileNotFoundError(f"No OSA CSV in {OSA_CSV_PATH}")
-    return csv_files[0]
+def _resolve_osa_csv(modulation_format: str = "16QAM") -> Path:
+    """Resolve OSA CSV path based on modulation format.
+
+    Parameters
+    ----------
+    modulation_format : str
+        "OOK" or "16QAM" (case-insensitive)
+    """
+    fmt_lower = modulation_format.lower()
+    if fmt_lower == "ook":
+        filename = "spectrum_OOK.csv"
+    else:  # 16qam or default
+        filename = "spectrum_16QAM.csv"
+    csv_path = OSA_CSV_PATH / filename
+    if not csv_path.exists():
+        raise FileNotFoundError(f"OSA CSV not found: {csv_path}")
+    return csv_path
 
 
 def _build_noise_frequency_grid(config: WDMConfig) -> np.ndarray:
@@ -825,7 +863,7 @@ def _build_model_grid(
             spectrum_type=spec["spectrum_type"],
             f_grid=f_grid,
             osa_csv_path=osa_csv_path,
-            osa_rbw=OSA_RBW_HZ,
+            osa_rbw=_get_osa_rbw(),
             classical_channel_indices=CLASSICAL_INDICES,
             modulation_format=mod_fmt,
         )
@@ -899,7 +937,7 @@ def _build_all_classical_grid(
             spectrum_type=spec["spectrum_type"],
             f_grid=f_grid,
             osa_csv_path=osa_csv_path,
-            osa_rbw=OSA_RBW_HZ,
+            osa_rbw=_get_osa_rbw(),
             modulation_format=mod_fmt,
         )
     return build_wdm_grid(
@@ -1666,16 +1704,17 @@ def precompute_by_channel(
 
 def get_noise_model_keys(noise_type: str) -> list[str]:
     """Return model keys for the given noise_type, respecting MODULATION_FORMAT."""
-    _ = noise_type
-    try:
-        from qkd_sim.config.plot_config import load_model_specs
+    from qkd_sim.config.plot_config import load_model_specs
 
+    # FWM and SpRS share the same model group (same spectral models, different solvers)
+    if noise_type in ("fwm", "sprs"):
         group = f"fwm_noise_{MODULATION_FORMAT}"
         return list(load_model_specs(group).keys())
-    except Exception:
-        if MODULATION_FORMAT == "ook":
-            return ["discrete", "nrz_ook", "osa_ook"]
-        return ["discrete", "osa"]
+
+    # only_signal / with_signal / both: same models as fwm (signal + noise combined differently)
+    # Return the fwm model keys (same spectral models, different computation path)
+    group = f"fwm_noise_{MODULATION_FORMAT}"
+    return list(load_model_specs(group).keys())
 
 
 # --- Startup precomputation of ALL power levels (step=5 dBm, 7 values) ---

@@ -118,6 +118,18 @@ model_groups:
     - nrz_ook
     - osa_ook
 
+  # ---- SpRS 噪声场景（与 FWM 共享相同模型规格） ----
+  sprs_noise_16qam:
+    - discrete
+    - rc_beta001
+    - rc_beta05
+    - osa
+
+  sprs_noise_ook:
+    - discrete
+    - nrz_ook
+    - osa_ook
+
   # Phase 4 噪声谱综合对比
   noise_spectrum:
     - discrete

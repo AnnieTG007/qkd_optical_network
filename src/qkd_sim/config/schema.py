@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 
@@ -250,6 +250,40 @@ def load_wdm_config(path: str | Path) -> WDMConfig:
 
 
 @dataclass
+class BlockLength:
+    """互斥指定块长：N_alice（Alice发送脉冲数）或 N_bob（Bob检测事件数）。
+
+    YAML 配置示例:
+        block_length:
+          mode: "alice"       # "alice" 或 "bob"，二选一
+          N_alice: 1e7       # 仅 mode=alice 时使用
+          N_bob: ~            # 仅 mode=bob 时使用，null
+
+    物理含义:
+        - mode=alice: Alice 固定发送 N_alice 个脉冲，Bob 检测数为随机变量
+          积分时间 t = N_alice / R_0
+        - mode=bob:   Bob 固定检测 N_bob 个事件，Alice 发送脉冲数为随机变量
+          积分时间 t = N_bob / (R_0 * P_X_alice * P_X_bob * P_det)
+    """
+
+    mode: Literal["alice", "bob"] = "alice"
+    N_alice: float | None = None
+    N_bob: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.mode == "alice" and self.N_alice is None:
+            raise ValueError("mode=alice 时必须指定 N_alice")
+        if self.mode == "bob" and self.N_bob is None:
+            raise ValueError("mode=bob 时必须指定 N_bob")
+        if self.N_alice is not None and self.N_bob is not None:
+            raise ValueError("N_alice 和 N_bob 不能同时指定")
+        if self.N_alice is not None and self.N_alice <= 0:
+            raise ValueError("N_alice 必须为正数")
+        if self.N_bob is not None and self.N_bob <= 0:
+            raise ValueError("N_bob 必须为正数")
+
+
+@dataclass
 class SKRConfig:
     """BB84 QKD 安全码率配置。
 
@@ -269,7 +303,7 @@ class SKRConfig:
         mu_decoy           : float  诱骗态平均光子数 (ν)
         p_signal           : float  信号态发送概率 (p_μ)
         p_decoy            : float  诱骗态发送概率 (p_ν)
-        N_pulse            : float  总脉冲数
+        block_length       : BlockLength  块长配置（mode + N_alice/N_bob 二选一）
         gamma_ks           : float  Gaussian 置信倍数 (γ_ks)，近似有限长用
         P_X_alice          : float  Alice X 基矢选取概率
         P_X_bob            : float  Bob X 基矢选取概率
@@ -300,7 +334,7 @@ class SKRConfig:
     mu_decoy: float
     p_signal: float
     p_decoy: float
-    N_pulse: float
+    block_length: BlockLength
     gamma_ks: float
 
     # 严格有限长
@@ -328,13 +362,19 @@ class SKRConfig:
             )
 
 
-def load_skr_config(path: str | Path) -> SKRConfig:
+def load_skr_config(path: str | Path, profile: str = "custom") -> SKRConfig:
     """从 YAML 文件加载 BB84 SKR 配置。
+
+    支持两种分区模式:
+        - "reference": 文献参考值（Wiesemann et al. arXiv:2405.16578）
+        - "custom":     自定义参数（实际系统仿真，默认）
 
     Parameters
     ----------
     path : str or Path
         YAML 文件路径
+    profile : str
+        分区名称，"reference" 或 "custom"（默认 "custom"）
 
     Returns
     -------
@@ -342,8 +382,18 @@ def load_skr_config(path: str | Path) -> SKRConfig:
     """
     with open(path, encoding="utf-8") as f:
         raw: dict[str, Any] = yaml.safe_load(f)
+
+    # 优先从分区加载，分区不存在则回退到根级
+    if profile in raw and isinstance(raw[profile], dict):
+        section = raw[profile]
+    else:
+        section = raw
+
     valid_keys = {fld.name for fld in fields(SKRConfig) if fld.init}
-    filtered = {k: v for k, v in raw.items() if k in valid_keys}
+    filtered = {k: v for k, v in section.items() if k in valid_keys}
+    # Handle nested BlockLength dataclass
+    if "block_length" in filtered and isinstance(filtered["block_length"], dict):
+        filtered["block_length"] = BlockLength(**filtered["block_length"])
     return SKRConfig(**filtered)
 
 
