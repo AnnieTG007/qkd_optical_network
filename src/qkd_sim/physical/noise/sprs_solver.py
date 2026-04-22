@@ -645,7 +645,19 @@ class DiscreteSPRSSolver(NoiseSolver):
         if not np.any(G_pump > 0.0):
             return np.zeros_like(f_grid, dtype=np.float64)
 
-        # 向量化路径：一次 O(N_f²) 计算，无 Python for 循环
+        # GPU dispatch: offload O(N_f²) propagation matrix to GPU when available
+        try:
+            from qkd_sim.utils.gpu_utils import _get_gpu_module
+            _, is_gpu = _get_gpu_module()
+            if is_gpu:
+                return self._compute_sprs_psd_batch_gpu(
+                    fiber=fiber, f_grid=f_grid, G_pump=G_pump,
+                    direction=direction, df=df,
+                )
+        except Exception:
+            pass
+
+        # CPU vectorized path: one O(N_f²) operation, no Python for loops
         return self._compute_sprs_psd_batch(
             fiber=fiber,
             f_grid=f_grid,
@@ -653,6 +665,64 @@ class DiscreteSPRSSolver(NoiseSolver):
             direction=direction,
             df=df,
         )
+
+    def _compute_sprs_psd_batch_gpu(
+        self,
+        fiber: Fiber,
+        f_grid: np.ndarray,
+        G_pump: np.ndarray,
+        direction: str,
+        df: float,
+    ) -> np.ndarray:
+        """GPU-accelerated SpRS PSD batch computation.
+
+        Mirrors _compute_sprs_psd_batch but moves the (N_f, N_f) propagation
+        integral to GPU. Raman gain / phonon / cross-section computed on CPU
+        (scipy.interpolate doesn't support CuPy), then sigma_2d is transferred
+        to GPU for the matrix multiply and propagation integral.
+        """
+        from qkd_sim.utils.gpu_utils import _get_gpu_module
+        xp, _ = _get_gpu_module()
+
+        # CPU: build Raman cross-section matrix (scipy-based, must stay on CPU)
+        f1_2d = f_grid.reshape(-1, 1)
+        f2_2d = f_grid.reshape(1, -1)
+        delta_f_2d = np.abs(f1_2d - f2_2d)
+        g_R_2d = get_raman_gain(delta_f=delta_f_2d, f_pump=f2_2d, A_eff=fiber.A_eff)
+        n_th_2d = _phonon_occupation(delta_f_2d, fiber.T_kelvin)
+        sigma_2d = _raman_cross_section(
+            f_q=f1_2d, f_c=f2_2d,
+            g_R=g_R_2d, n_th=n_th_2d,
+            delta_f=delta_f_2d, noise_bandwidth=df,
+        )  # (N_f, N_f) numpy
+
+        # GPU: transfer and run propagation integral
+        sigma_gpu = xp.asarray(sigma_2d)
+        G_pump_gpu = xp.asarray(G_pump, dtype=xp.float64).reshape(1, -1)
+        alpha_np = np.asarray(fiber.get_loss_at_freq(f_grid), dtype=np.float64)
+        alpha1_gpu = xp.asarray(alpha_np).reshape(-1, 1)
+        alpha2_gpu = xp.asarray(alpha_np).reshape(1, -1)
+
+        if direction == "forward":
+            d_alpha = alpha2_gpu - alpha1_gpu
+            exp_m_alpha1_L = xp.exp(-alpha1_gpu * fiber.L)
+            equal_mask = xp.abs(d_alpha) < _ALPHA_EPS
+            safe_d_alpha = xp.where(equal_mask, xp.ones_like(d_alpha), d_alpha)
+            integral = xp.where(
+                equal_mask,
+                float(fiber.L),
+                (1.0 - xp.exp(-d_alpha * fiber.L)) / safe_d_alpha,
+            )
+            integrand = G_pump_gpu * sigma_gpu * exp_m_alpha1_L * integral
+        elif direction == "backward":
+            sum_alpha = alpha1_gpu + alpha2_gpu
+            integrand = G_pump_gpu * sigma_gpu * (1.0 - xp.exp(-sum_alpha * fiber.L)) / sum_alpha
+        else:
+            raise ValueError(f"Unsupported direction: {direction!r}")
+
+        out_bin_power = xp.sum(integrand, axis=1) * df  # (N_f,) [W]
+        result = out_bin_power / df                      # (N_f,) [W/Hz]
+        return np.asarray(result.get())
 
     def compute_sprs_spectrum_conti_l_array(
         self,

@@ -10,6 +10,7 @@ from typing import Iterator
 from typing import Optional
 
 import numpy as np
+from scipy.constants import h as _PLANCK_H
 
 from qkd_sim.config.schema import WDMConfig
 from qkd_sim.physical.signal import build_wdm_grid
@@ -37,6 +38,7 @@ def _load_wdm_params() -> dict:
         B_s=cfg.B_s,
         P0=cfg.P0,
         beta_rolloff=cfg.beta_rolloff,
+        ook_filter_order=cfg.ook_filter_order,
         num_channels=num_ch,
         # quantum_channel_indices 由 _build_wdm_config 单独传入，不加入此 dict
     )
@@ -248,6 +250,46 @@ NOISE_GRID_RESOLUTION_HZ = 5e9
 NOISE_FLOOR_W = 1e-23
 FREQ_GRID_PADDING_FACTOR = 1.5
 
+# --- SKR constants and model registry ---
+_SKR_YAML_PATH = _CONFIG_DIR / "defaults" / "skr_para" / "bb84_config.yaml"
+_SKR_MODEL_FNS: dict[str, tuple[callable, str]] = {}
+
+
+def _init_skr_model_registry() -> dict[str, tuple[callable, str]]:
+    """Lazy-init the SKR model function registry to avoid circular imports at module level."""
+    global _SKR_MODEL_FNS
+    if not _SKR_MODEL_FNS:
+        from qkd_sim.physical.skr.skr_decoy_bb84 import (
+            infinite_key_rate,
+            approx_finite_key_rate,
+            strict_finite_key_rate,
+        )
+        _SKR_MODEL_FNS = {
+            "infinite": (
+                lambda d, f, s, p, optimize_params=False: infinite_key_rate(d, f, s, p),
+                "无限长密钥",
+            ),
+            "approx_finite": (
+                lambda d, f, s, p, optimize_params=False: approx_finite_key_rate(d, f, s, p),
+                "近似有限长",
+            ),
+            "strict_finite": (strict_finite_key_rate,  "严格有限长"),
+        }
+    return _SKR_MODEL_FNS
+
+# --- Default SKR model key ---
+# Loaded from model_comparison.yaml; fallback to "approx_finite" if not configured.
+DEFAULT_SKR_MODEL_KEY: str = "approx_finite"
+
+def _init_default_skr_model() -> str:
+    """Load default SKR model from plot config YAML."""
+    global DEFAULT_SKR_MODEL_KEY
+    from qkd_sim.config.plot_config import load_default_skr_model
+    DEFAULT_SKR_MODEL_KEY = load_default_skr_model()
+    return DEFAULT_SKR_MODEL_KEY
+
+_init_default_skr_model()
+
 # 调制格式：由 Dash 脚本 --modulation 参数设置
 MODULATION_FORMAT: str = "16qam"
 def _load_fiber_params() -> dict:
@@ -324,6 +366,170 @@ def _build_caption() -> str:
         f"Classical channels: {classical_desc}"
     )
 
+
+# =============================================================================
+# SKR utility functions
+# =============================================================================
+
+def load_skr_config_for_dash(profile: str = "custom"):
+    """Load SKRConfig and FiberConfig for Dash SKR calculations."""
+    from qkd_sim.config.schema import load_fiber_config, load_skr_config
+    fiber_cfg = load_fiber_config(_YAML_FIBER_PATH)
+    skr_cfg = load_skr_config(_SKR_YAML_PATH, profile=profile)
+    return fiber_cfg, skr_cfg
+
+
+def noise_power_to_p_noise(P_w: float, f_hz: float, R_rep: float) -> float:
+    """Convert noise power [W] to per-pulse noise photon count probability.
+
+    Uses Poisson model: p_noise = 1 - exp(-mu), where
+    mu = P / (h * f * R_rep) is the average noise photons per pulse.
+    """
+    if P_w <= 0.0 or R_rep <= 0.0:
+        return 0.0
+    mu = P_w / (_PLANCK_H * f_hz * R_rep)
+    return float(1.0 - np.exp(-mu))
+
+
+def compute_skr_point(noise_w: float, distance_m: float, f_hz: float, fiber_cfg, skr_cfg, optimize: bool = False) -> dict:
+    """Compute SKR for all 3 models at a single (noise, distance, frequency) point.
+
+    Returns dict: {model_key: (skr_bps, skr_bit_per_pulse, qber)}
+    """
+    p_noise = noise_power_to_p_noise(noise_w, f_hz, skr_cfg.R_rep)
+    skr_fns = _init_skr_model_registry()
+    results: dict = {}
+    for mkey, (fn, _) in skr_fns.items():
+        try:
+            results[mkey] = fn(distance_m, fiber_cfg, skr_cfg, p_noise, optimize_params=optimize)
+        except Exception:
+            results[mkey] = (0.0, 0.0, float("nan"))
+    return results
+
+
+def compute_skr_vs_channel(
+    sweep: dict,
+    dist_m: float,
+    quantum_center_freqs_hz: np.ndarray,
+    fiber_cfg,
+    skr_cfg,
+    optimize: bool = False,
+) -> dict:
+    """Compute SKR vs quantum channel for a single fiber length.
+
+    sweep: dict[model_key] = {fwd, bwd, x, x_kind, y_kind}
+    quantum_center_freqs_hz: array of quantum channel center frequencies [Hz]
+
+    Returns: dict[model_key][skr_model][direction] = (np.array(bps), np.array(bpp), np.array(qber))
+    """
+    skr_fns = _init_skr_model_registry()
+    n_ch = len(quantum_center_freqs_hz)
+
+    # Initialize result structure
+    skr_result: dict = {}
+    for model_key in sweep:
+        skr_result[model_key] = {}
+        for mkey in skr_fns:
+            skr_result[model_key][mkey] = {
+                "fwd": ([], [], []),  # bps, bpp, qber
+                "bwd": ([], [], []),
+            }
+
+    for model_key, entry in sweep.items():
+        # Prefer noise_only_* (pure FWM+SpRS, no classical signal) for SKR computation.
+        # with_signal stores these separately; other noise types fall back to fwd/bwd.
+        fwd_w = np.asarray(entry.get("noise_only_fwd", entry.get("fwd", [])), dtype=np.float64)
+        bwd_w = np.asarray(entry.get("noise_only_bwd", entry.get("bwd", [])), dtype=np.float64)
+        x_data = np.asarray(entry.get("x", []), dtype=np.float64)
+        x_kind = entry.get("x_kind", "")
+
+        if len(x_data) == 0 or len(fwd_w) == 0:
+            continue
+
+        # Interpolate noise power at each quantum channel center frequency
+        if x_kind == "frequency_grid" and len(x_data) > 1:
+            fwd_interp = np.interp(quantum_center_freqs_hz, x_data, fwd_w)
+            bwd_interp = np.interp(quantum_center_freqs_hz, x_data, bwd_w)
+        elif len(x_data) == n_ch:
+            fwd_interp = fwd_w.copy()
+            bwd_interp = bwd_w.copy()
+        else:
+            continue
+
+        for direction, noise_arr in [("fwd", fwd_interp), ("bwd", bwd_interp)]:
+            for ch_i in range(n_ch):
+                skr_d = compute_skr_point(
+                    float(noise_arr[ch_i]), dist_m,
+                    float(quantum_center_freqs_hz[ch_i]), fiber_cfg, skr_cfg, optimize,
+                )
+                for mkey in skr_fns:
+                    bps, bpp, qber = skr_d.get(mkey, (0.0, 0.0, float("nan")))
+                    lists = skr_result[model_key][mkey][direction]
+                    lists[0].append(bps)
+                    lists[1].append(bpp)
+                    lists[2].append(qber)
+
+    # Convert lists to arrays
+    for model_key in skr_result:
+        for mkey in skr_result[model_key]:
+            for direction in ("fwd", "bwd"):
+                lists = skr_result[model_key][mkey][direction]
+                skr_result[model_key][mkey][direction] = (
+                    np.array(lists[0]), np.array(lists[1]), np.array(lists[2]),
+                )
+
+    return skr_result
+
+
+def compute_skr_vs_length(
+    sweep: dict,
+    ch_idx: int,
+    lengths_km: np.ndarray,
+    fiber_cfg,
+    skr_cfg,
+    optimize: bool = False,
+) -> dict:
+    """Compute SKR vs fiber length for a single quantum channel.
+
+    sweep: dict[model_key] = {fwd, bwd, x, x_kind, y_kind} where y is per-length
+    ch_idx: ITU G.694.1 channel index
+
+    Returns: dict[model_key][skr_model][direction] = (np.array(bps), np.array(bpp), np.array(qber)) per length
+    """
+    skr_fns = _init_skr_model_registry()
+    skr_result: dict = {}
+
+    # Get channel center frequency
+    f_q_hz = WDM_PARAMS["start_freq"] + (ch_idx - WDM_PARAMS["start_channel"]) * WDM_PARAMS["channel_spacing"]
+
+    for model_key, entry in sweep.items():
+        # Prefer noise_only_* for SKR; with_signal stores these to exclude classical signal power.
+        fwd_w = np.asarray(entry.get("noise_only_fwd", entry.get("fwd", [])), dtype=np.float64)
+        bwd_w = np.asarray(entry.get("noise_only_bwd", entry.get("bwd", [])), dtype=np.float64)
+
+        n_len = min(len(fwd_w), len(lengths_km))
+        if n_len == 0:
+            continue
+
+        skr_by_model: dict = {}
+        for mkey in skr_fns:
+            fwd_bps, fwd_bpp, fwd_qber = [], [], []
+            bwd_bps, bwd_bpp, bwd_qber = [], [], []
+            for li in range(n_len):
+                fwd_d = compute_skr_point(float(fwd_w[li]), float(lengths_km[li] * 1000), f_q_hz, fiber_cfg, skr_cfg, optimize)
+                bwd_d = compute_skr_point(float(bwd_w[li]), float(lengths_km[li] * 1000), f_q_hz, fiber_cfg, skr_cfg, optimize)
+                bps_f, bpp_f, q_f = fwd_d.get(mkey, (0.0, 0.0, float("nan")))
+                bps_b, bpp_b, q_b = bwd_d.get(mkey, (0.0, 0.0, float("nan")))
+                fwd_bps.append(bps_f); fwd_bpp.append(bpp_f); fwd_qber.append(q_f)
+                bwd_bps.append(bps_b); bwd_bpp.append(bpp_b); bwd_qber.append(q_b)
+            skr_by_model[mkey] = {
+                "fwd": (np.array(fwd_bps), np.array(fwd_bpp), np.array(fwd_qber)),
+                "bwd": (np.array(bwd_bps), np.array(bwd_bpp), np.array(bwd_qber)),
+            }
+        skr_result[model_key] = skr_by_model
+
+    return skr_result
+
 FIBER_PARAMS = dict(
     alpha_dB_per_km=0.2,
     gamma_per_W_km=1.3,
@@ -365,6 +571,51 @@ def describe_compute_device() -> str:
 def print_compute_device() -> None:
     """Print compute backend once at script startup."""
     print(f"Compute device: {describe_compute_device()}")
+
+
+def ensure_port_free(port: int, host: str = "127.0.0.1") -> None:
+    """Exit with an actionable error if ``host:port`` is already bound.
+
+    Guards against a stale Dash process silently hijacking a new launch —
+    if the port is held, ``app.run`` would emit an OSError that is easy to
+    miss, leaving the browser connected to the zombie.
+    """
+    import socket
+    import subprocess
+    import sys
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind((host, port))
+    except OSError:
+        pid_hint = ""
+        try:
+            result = subprocess.run(
+                ["netstat", "-ano"], capture_output=True, text=True, timeout=5
+            )
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if (
+                    len(parts) >= 5
+                    and parts[0] == "TCP"
+                    and parts[1].endswith(f":{port}")
+                    and parts[3] == "LISTENING"
+                ):
+                    pid_hint = f" (held by PID {parts[4]})"
+                    break
+        except Exception:
+            pass
+        sys.stderr.write(
+            f"\n[ERROR] Port {port} is already in use{pid_hint}.\n"
+            f"        A previous Dash instance is still running and will keep\n"
+            f"        serving stale --type / --modulation results to the browser.\n"
+            f"        Kill it first, e.g. (PowerShell):\n"
+            f"          Stop-Process -Id <PID> -Force\n"
+            f"        Then re-run this script.\n\n"
+        )
+        sys.exit(1)
+    finally:
+        probe.close()
 
 
 def set_csv_cache_enabled(enabled: bool) -> None:
@@ -838,6 +1089,7 @@ def _build_model_grid(
             B_s=base_config.B_s,
             P0=_get_P0(),
             beta_rolloff=spec["beta_rolloff"],
+            ook_filter_order=base_config.ook_filter_order,
             quantum_channel_indices=current_quantum_indices,
             channel_powers_W=base_config.channel_powers_W,
             num_channels=int(base_config.num_channels),
@@ -851,6 +1103,7 @@ def _build_model_grid(
             B_s=base_config.B_s,
             P0=_get_P0(),
             beta_rolloff=base_config.beta_rolloff,
+            ook_filter_order=base_config.ook_filter_order,
             quantum_channel_indices=current_quantum_indices,
             channel_powers_W=base_config.channel_powers_W,
             num_channels=int(base_config.num_channels),
@@ -925,6 +1178,7 @@ def _build_all_classical_grid(
         B_s=base_config.B_s,
         P0=_get_P0(),
         beta_rolloff=base_config.beta_rolloff if spec["beta_rolloff"] is None else spec["beta_rolloff"],
+        ook_filter_order=base_config.ook_filter_order,
         quantum_channel_indices=base_config.quantum_channel_indices,
         channel_powers_W=base_config.channel_powers_W,
         num_channels=int(base_config.num_channels),
@@ -1188,7 +1442,10 @@ VALID_Q_INDICES: list of q_idx that have non-zero noise for at least one model
 
         df = float(np.mean(np.diff(noise_f_grid)))
         all_by_len = {
-            ch_idx: {mk: {"fwd": np.zeros(n_l), "bwd": np.zeros(n_l)} for mk in model_keys}
+            ch_idx: {mk: {
+                "fwd": np.zeros(n_l), "bwd": np.zeros(n_l),
+                "noise_only_fwd": np.zeros(n_l), "noise_only_bwd": np.zeros(n_l),
+            } for mk in model_keys}
             for ch_idx in range(n_ch)
         }
         # Classical set: ITU G.694.1 channel numbers (e.g. {39, 40, 41} = C39/C40/C41)
@@ -1203,6 +1460,7 @@ VALID_Q_INDICES: list of q_idx that have non-zero noise for at least one model
             B_s=base_config.B_s,
             P0=_get_P0(),
             beta_rolloff=WDM_PARAMS["beta_rolloff"],
+            ook_filter_order=base_config.ook_filter_order,
             quantum_channel_indices=list(base_config.quantum_channel_indices),
             channel_powers_W=base_config.channel_powers_W,
             num_channels=int(base_config.num_channels),
@@ -1229,16 +1487,19 @@ VALID_Q_INDICES: list of q_idx that have non-zero noise for at least one model
             if (idx + 1) in classical_set:
                 signal_psd += ch.get_psd(noise_f_grid)
         for model_key in model_keys:
-            spec = specs[model_key]
-            # noise_fwd_psd_all has shape (N_f, N_L); broadcast with signal_psd
             for li in range(n_l):
-                total_fwd_psd = noise_fwd_psd_all[:, li] + signal_psd
-                total_bwd_psd = noise_bwd_psd_all[:, li] + signal_psd
-                total_fwd_power = float(np.sum(total_fwd_psd) * df)
-                total_bwd_power = float(np.sum(total_bwd_psd) * df)
+                noise_fwd_psd = noise_fwd_psd_all[:, li]
+                noise_bwd_psd = noise_bwd_psd_all[:, li]
+                total_fwd_power = float(np.sum(noise_fwd_psd + signal_psd) * df)
+                total_bwd_power = float(np.sum(noise_bwd_psd + signal_psd) * df)
+                # T1: store pure noise integrals for SKR (no signal contamination)
+                noise_only_fwd_power = float(np.sum(noise_fwd_psd) * df)
+                noise_only_bwd_power = float(np.sum(noise_bwd_psd) * df)
                 for ch_idx in range(n_ch):
                     all_by_len[ch_idx][model_key]["fwd"][li] = total_fwd_power
                     all_by_len[ch_idx][model_key]["bwd"][li] = total_bwd_power
+                    all_by_len[ch_idx][model_key]["noise_only_fwd"][li] = noise_only_fwd_power
+                    all_by_len[ch_idx][model_key]["noise_only_bwd"][li] = noise_only_bwd_power
 
         valid_indices = [
             ch_idx
@@ -1318,8 +1579,10 @@ VALID_Q_INDICES: list of q_idx that have non-zero noise for at least one model
                     continuous=bool(spec["continuous"]),
                 )
                 if len(fwd) > 0:
-                    all_by_len[q_local_idx][model_key]["fwd"][li] = float(fwd[q_local_idx])
-                    all_by_len[q_local_idx][model_key]["bwd"][li] = float(bwd[q_local_idx])
+                    # single_q_config contains exactly one quantum channel, so the
+                    # solver output is length-1 and should always be read at index 0.
+                    all_by_len[q_local_idx][model_key]["fwd"][li] = float(fwd[0])
+                    all_by_len[q_local_idx][model_key]["bwd"][li] = float(bwd[0])
 
     valid_q_indices = [
         q_local_idx
@@ -1372,6 +1635,8 @@ def precompute_by_channel(
             li: {mk: {
                 "fwd": np.zeros(len(noise_f_grid)),
                 "bwd": np.zeros(len(noise_f_grid)),
+                "noise_only_fwd": np.zeros(len(noise_f_grid)),
+                "noise_only_bwd": np.zeros(len(noise_f_grid)),
                 "x": np.asarray(noise_f_grid, dtype=np.float64),
                 "x_kind": "frequency_grid",
                 "y_kind": "power_per_bin",
@@ -1380,42 +1645,67 @@ def precompute_by_channel(
         }
         # Classical set: ITU G.694.1 channel numbers (e.g. {39, 40, 41})
         classical_set = set(CLASSICAL_INDICES)
-        for li, length_km in enumerate(LENGTHS_KM):
-            fiber = _make_fiber(fiber_params, length_km)
-            # Noise spectrum: use REAL quantum/classical split (only classical channels are pumps)
-            model_config_noise = WDMConfig(
-                start_freq=base_config.start_freq,
-                start_channel=base_config.start_channel,
-                end_channel=base_config.end_channel,
-                channel_spacing=base_config.channel_spacing,
-                B_s=base_config.B_s,
-                P0=_get_P0(),
-                beta_rolloff=WDM_PARAMS["beta_rolloff"],
-                quantum_channel_indices=list(base_config.quantum_channel_indices),
-                channel_powers_W=base_config.channel_powers_W,
-                num_channels=int(base_config.num_channels),
-            )
-            grid_noise = build_wdm_grid(
+        # Noise spectrum: use REAL quantum/classical split (only classical channels are pumps)
+        # model_config_noise, grid_model, and signal_psd don't depend on fiber length —
+        # build once per model_key to avoid redundant CSV loads and PSD integrations (T3)
+        model_config_noise = WDMConfig(
+            start_freq=base_config.start_freq,
+            start_channel=base_config.start_channel,
+            end_channel=base_config.end_channel,
+            channel_spacing=base_config.channel_spacing,
+            B_s=base_config.B_s,
+            P0=_get_P0(),
+            beta_rolloff=WDM_PARAMS["beta_rolloff"],
+            ook_filter_order=base_config.ook_filter_order,
+            quantum_channel_indices=list(base_config.quantum_channel_indices),
+            channel_powers_W=base_config.channel_powers_W,
+            num_channels=int(base_config.num_channels),
+        )
+        grid_cache: dict = {}
+        signal_psd_cache: dict = {}
+        for model_key in model_keys:
+            if model_key == "discrete":
+                stype = SpectrumType.SINGLE_FREQ
+            elif model_key == "nrz_ook":
+                stype = SpectrumType.NRZ_OOK
+            elif model_key == "osa_ook":
+                stype = SpectrumType.OSA_SAMPLED
+            else:
+                stype = SpectrumType.RAISED_COSINE
+            grid_kwargs = dict(
                 config=model_config_noise,
-                spectrum_type=SpectrumType.RAISED_COSINE,
+                spectrum_type=stype,
                 f_grid=noise_f_grid,
                 classical_channel_indices=CLASSICAL_INDICES,
-                modulation_format="16QAM",
+                modulation_format=MODULATION_FORMAT,
             )
-            noise_fwd_psd, noise_bwd_psd = _compute_noise_spectrum_pair(
-                "both", fiber, grid_noise, noise_f_grid
-            )
-            # Signal PSD: sum ONLY over classical channels (C39/C40/C41) — computed once, shared by all model_keys
+            if stype == SpectrumType.OSA_SAMPLED:
+                grid_kwargs["osa_csv_path"] = osa_csv_path
+                grid_kwargs["osa_rbw"] = _get_osa_rbw()
+            grid_model = build_wdm_grid(**grid_kwargs)
+            grid_cache[model_key] = grid_model
+            # Signal PSD: sum ONLY over classical channels (C39/C40/C41)
             signal_psd = np.zeros_like(noise_f_grid, dtype=np.float64)
-            for idx, ch in enumerate(grid_noise.channels):
+            for idx, ch in enumerate(grid_model.channels):
                 if (idx + 1) in classical_set:
                     signal_psd += ch.get_psd(noise_f_grid)
+            signal_psd_cache[model_key] = signal_psd
+
+        for li, length_km in enumerate(LENGTHS_KM):
+            fiber = _make_fiber(fiber_params, length_km)
             for model_key in model_keys:
-                spec = specs[model_key]
+                grid_model = grid_cache[model_key]
+                noise_fwd_psd, noise_bwd_psd = _compute_noise_spectrum_pair(
+                    "both", fiber, grid_model, noise_f_grid
+                )
+                signal_psd = signal_psd_cache[model_key]
                 total_fwd = (noise_fwd_psd + signal_psd) * df
                 total_bwd = (noise_bwd_psd + signal_psd) * df
                 all_by_ch[li][model_key]["fwd"] = np.asarray(total_fwd, dtype=np.float64)
                 all_by_ch[li][model_key]["bwd"] = np.asarray(total_bwd, dtype=np.float64)
+                # T1: store pure noise (FWM+SpRS, no signal) separately for SKR input
+                all_by_ch[li][model_key]["noise_only_fwd"] = np.asarray(noise_fwd_psd * df, dtype=np.float64)
+                all_by_ch[li][model_key]["noise_only_bwd"] = np.asarray(noise_bwd_psd * df, dtype=np.float64)
 
         valid_l_indices = [
             li
@@ -1519,6 +1809,7 @@ def precompute_by_channel(
             B_s=base_config.B_s,
             P0=_get_P0(),
             beta_rolloff=WDM_PARAMS["beta_rolloff"],
+            ook_filter_order=base_config.ook_filter_order,
             quantum_channel_indices=list(base_config.quantum_channel_indices),
             num_channels=int(base_config.num_channels),
         )
@@ -1707,13 +1998,14 @@ def get_noise_model_keys(noise_type: str) -> list[str]:
     from qkd_sim.config.plot_config import load_model_specs
 
     # FWM and SpRS share the same model group (same spectral models, different solvers)
+    _mod_key = MODULATION_FORMAT.lower()
     if noise_type in ("fwm", "sprs"):
-        group = f"fwm_noise_{MODULATION_FORMAT}"
+        group = f"fwm_noise_{_mod_key}"
         return list(load_model_specs(group).keys())
 
     # only_signal / with_signal / both: same models as fwm (signal + noise combined differently)
     # Return the fwm model keys (same spectral models, different computation path)
-    group = f"fwm_noise_{MODULATION_FORMAT}"
+    group = f"fwm_noise_{_mod_key}"
     return list(load_model_specs(group).keys())
 
 
@@ -1800,6 +2092,134 @@ def precompute_by_channel_all_powers(
                 _cache_precomputed_result(all_by_idx, p, noise_type, list(specs.keys()), index_prefix="ch")
             _POWER_CACHE[("ch", float(p))] = all_by_idx
             results[float(p)] = (all_by_idx, base_valid_l)
+
+        set_power_override(0.0)
+        return results[0.0]
+
+    if noise_type == "with_signal":
+        print(
+            "[profile] precompute_by_channel_all_powers: "
+            "with_signal: FWM(P^3) + SpRS(P^1) + signal(P^1) scaling from 0 dBm base"
+        )
+        from qkd_sim.physical.signal import SpectrumType
+        set_power_override(0.0)
+        classical_set = set(CLASSICAL_INDICES)
+        df = float(np.mean(np.diff(noise_f_grid)))
+        model_config_noise = WDMConfig(
+            start_freq=base_config.start_freq,
+            start_channel=base_config.start_channel,
+            end_channel=base_config.end_channel,
+            channel_spacing=base_config.channel_spacing,
+            B_s=base_config.B_s,
+            P0=_get_P0(),
+            beta_rolloff=WDM_PARAMS["beta_rolloff"],
+            ook_filter_order=base_config.ook_filter_order,
+            quantum_channel_indices=list(base_config.quantum_channel_indices),
+            channel_powers_W=base_config.channel_powers_W,
+            num_channels=int(base_config.num_channels),
+        )
+        model_keys_ws = get_noise_model_keys("with_signal")
+        specs_ws = {k: specs[k] for k in model_keys_ws if k in specs}
+        n_l_ws = len(LENGTHS_KM)
+
+        # Build WDM grid and signal PSD once per model_key (independent of length and power)
+        grid_cache_t4: dict = {}
+        signal_base_cache: dict = {}  # model_key → signal_psd [W/Hz] at 0 dBm
+        for mk in model_keys_ws:
+            if mk not in specs_ws:
+                continue
+            if mk == "discrete":
+                stype_t4 = SpectrumType.SINGLE_FREQ
+            elif mk == "nrz_ook":
+                stype_t4 = SpectrumType.NRZ_OOK
+            elif mk == "osa_ook":
+                stype_t4 = SpectrumType.OSA_SAMPLED
+            else:
+                stype_t4 = SpectrumType.RAISED_COSINE
+            gkw_t4 = dict(
+                config=model_config_noise,
+                spectrum_type=stype_t4,
+                f_grid=noise_f_grid,
+                classical_channel_indices=CLASSICAL_INDICES,
+                modulation_format=MODULATION_FORMAT,
+            )
+            if stype_t4 == SpectrumType.OSA_SAMPLED:
+                gkw_t4["osa_csv_path"] = osa_csv_path
+                gkw_t4["osa_rbw"] = _get_osa_rbw()
+            grid_t4 = build_wdm_grid(**gkw_t4)
+            grid_cache_t4[mk] = grid_t4
+            sig_base = np.zeros_like(noise_f_grid, dtype=np.float64)
+            for idx, ch in enumerate(grid_t4.channels):
+                if (idx + 1) in classical_set:
+                    sig_base += ch.get_psd(noise_f_grid)
+            signal_base_cache[mk] = sig_base  # [W/Hz] at 0 dBm
+
+        # Compute FWM-only and SpRS-only PSDs at 0 dBm for each (li, model_key)
+        with profile_scope("power +0 dBm: base FWM+SpRS precompute (with_signal)"):
+            fwm_base_ws: dict = {
+                li: {mk: {"fwd": np.zeros(len(noise_f_grid)), "bwd": np.zeros(len(noise_f_grid))} for mk in model_keys_ws}
+                for li in range(n_l_ws)
+            }
+            sprs_base_ws: dict = {
+                li: {mk: {"fwd": np.zeros(len(noise_f_grid)), "bwd": np.zeros(len(noise_f_grid))} for mk in model_keys_ws}
+                for li in range(n_l_ws)
+            }
+            x_base_ws: dict = {mk: np.asarray(noise_f_grid, dtype=np.float64) for mk in model_keys_ws}
+            for li, length_km in enumerate(LENGTHS_KM):
+                fiber_t4 = _make_fiber(fiber_params, length_km)
+                for mk in model_keys_ws:
+                    if mk not in grid_cache_t4:
+                        continue
+                    grid_t4 = grid_cache_t4[mk]
+                    fwm_fwd, fwm_bwd = _compute_noise_spectrum_pair("fwm", fiber_t4, grid_t4, noise_f_grid)
+                    sprs_fwd, sprs_bwd = _compute_noise_spectrum_pair("sprs", fiber_t4, grid_t4, noise_f_grid)
+                    fwm_base_ws[li][mk]["fwd"] = np.asarray(fwm_fwd * df, dtype=np.float64)
+                    fwm_base_ws[li][mk]["bwd"] = np.asarray(fwm_bwd * df, dtype=np.float64)
+                    sprs_base_ws[li][mk]["fwd"] = np.asarray(sprs_fwd * df, dtype=np.float64)
+                    sprs_base_ws[li][mk]["bwd"] = np.asarray(sprs_bwd * df, dtype=np.float64)
+        base_valid_l_ws = [
+            li for li in range(n_l_ws)
+            if any(
+                np.any(fwm_base_ws[li][mk]["fwd"] > 0) or np.any(sprs_base_ws[li][mk]["fwd"] > 0)
+                for mk in model_keys_ws if mk in fwm_base_ws[li]
+            )
+        ]
+
+        results: dict[float, tuple[dict, list]] = {}
+        for p in PRECOMPUTE_POWER_LEVELS:
+            fwm_scale = _power_scaling_factor("fwm", float(p))   # P³
+            sprs_scale = _power_scaling_factor("sprs", float(p))  # P¹
+            sig_scale = float(10.0 ** (float(p) / 10.0))          # P¹
+
+            all_by_idx: dict = {}
+            for li in range(n_l_ws):
+                all_by_idx[li] = {}
+                for mk in model_keys_ws:
+                    if mk not in fwm_base_ws[li]:
+                        continue
+                    fwm_fwd = fwm_base_ws[li][mk]["fwd"]
+                    fwm_bwd = fwm_base_ws[li][mk]["bwd"]
+                    sprs_fwd = sprs_base_ws[li][mk]["fwd"]
+                    sprs_bwd = sprs_base_ws[li][mk]["bwd"]
+                    sig_psd = signal_base_cache.get(mk, np.zeros(len(noise_f_grid)))
+                    sig_scaled = sig_scale * sig_psd * df  # [W/bin]
+
+                    noise_only_fwd = fwm_scale * fwm_fwd + sprs_scale * sprs_fwd
+                    noise_only_bwd = fwm_scale * fwm_bwd + sprs_scale * sprs_bwd
+                    all_by_idx[li][mk] = {
+                        "fwd": noise_only_fwd + sig_scaled,
+                        "bwd": noise_only_bwd + sig_scaled,
+                        "noise_only_fwd": noise_only_fwd,
+                        "noise_only_bwd": noise_only_bwd,
+                        "x": x_base_ws[mk],
+                        "x_kind": "frequency_grid",
+                        "y_kind": "power_per_bin",
+                    }
+
+            with profile_scope(f"power {p:+.0f} dBm: save CSV cache"):
+                _cache_precomputed_result(all_by_idx, p, noise_type, list(specs_ws.keys()), index_prefix="ch")
+            _POWER_CACHE[("ch", float(p))] = all_by_idx
+            results[float(p)] = (all_by_idx, base_valid_l_ws)
 
         set_power_override(0.0)
         return results[0.0]
@@ -2078,6 +2498,392 @@ def export_noise_vs_length_xlsx(
 
     wb.save(output_path)
     print(f"[export] wrote {output_path}")
+
+
+def _to_dbm_scalar(value_w: float) -> float | None:
+    """Convert linear power in watts to dBm, returning None for non-positive values."""
+    if not np.isfinite(value_w) or value_w <= 0.0:
+        return None
+    return float(10.0 * np.log10(value_w / 1e-3))
+
+
+def _normalize_itu_channel(channel_itu: float) -> int | float:
+    """Normalize an ITU channel number to an int or half-integer when possible."""
+    nearest_int = round(channel_itu)
+    if np.isclose(channel_itu, nearest_int, atol=1e-9):
+        return int(nearest_int)
+
+    nearest_half = round(channel_itu * 2.0) / 2.0
+    if np.isclose(channel_itu, nearest_half, atol=1e-9):
+        return float(nearest_half)
+
+    return float(channel_itu)
+
+
+def _channel_label(channel_itu: int | float | None) -> str:
+    """Return a display label like C39 or C32.5 for an ITU channel number."""
+    if channel_itu is None:
+        return ""
+    if isinstance(channel_itu, float) and not channel_itu.is_integer():
+        return f"C{channel_itu:.1f}"
+    return f"C{int(channel_itu)}"
+
+
+def _frequency_to_itu_channel(freq_hz: float) -> int | float:
+    """Convert a center frequency to a 1-based ITU G.694.1 channel number."""
+    channel_itu = (
+        WDM_PARAMS["start_channel"]
+        + (freq_hz - WDM_PARAMS["start_freq"]) / WDM_PARAMS["channel_spacing"]
+    )
+    return _normalize_itu_channel(float(channel_itu))
+
+
+def _series_prefixes(model_keys: list[str], noise_type: str) -> list[tuple[str, str]]:
+    """Return (model_key, direction) pairs used by exported CSV columns."""
+    directions = ("fwd",) if noise_type == "only_signal" else ("fwd", "bwd")
+    return [(model_key, direction) for model_key in model_keys for direction in directions]
+
+
+def _metric_columns(prefix: str) -> list[str]:
+    """Return exported metric columns for one model-direction series."""
+    return [
+        f"{prefix}_noise_power_w",
+        f"{prefix}_noise_power_dbm",
+        f"{prefix}_qber",
+        f"{prefix}_skr_bit_per_pulse",
+        f"{prefix}_skr_bps",
+    ]
+
+
+def _write_analysis_csv(
+    filepath: Path,
+    fieldnames: list[str],
+    rows: list[dict[str, object]],
+) -> None:
+    """Write a user-facing CSV export with a header row."""
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    with open(filepath, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"[export] wrote {filepath}")
+
+
+def export_noise_vs_frequency_csv(
+    all_by_ch_by_power: dict[float, dict],
+    model_keys: list[str],
+    specs: dict[str, dict],
+    LENGTHS_KM: np.ndarray,
+    noise_type: str,
+    modulation_format: str,
+    output_dir: Path,
+    fiber_cfg=None,
+    skr_cfg=None,
+) -> dict[str, Path]:
+    """Export noise-vs-frequency data as tidy and Origin-friendly CSV files.
+
+    The tidy CSV stores one row per data point. The wide CSV stores one row per
+    (power, fiber length, frequency) tuple and expands each model/direction into
+    its own columns for direct plotting in Origin.
+
+    If fiber_cfg and skr_cfg are provided, SKR/QBER columns are filled using
+    the approximate finite key rate model.
+    """
+    modulation_slug = modulation_format.lower()
+    base_name = f"noise_vs_frequency_{noise_type}_{modulation_slug}"
+    tidy_path = output_dir / f"{base_name}_tidy.csv"
+    wide_path = output_dir / f"{base_name}_wide.csv"
+    series_pairs = _series_prefixes(model_keys, noise_type)
+
+    tidy_rows: list[dict[str, object]] = []
+    wide_rows: list[dict[str, object]] = []
+
+    for power_dbm in sorted(all_by_ch_by_power):
+        all_by_ch = all_by_ch_by_power[power_dbm]
+        for l_idx in sorted(all_by_ch):
+            sweep = all_by_ch[l_idx]
+            length_km = float(LENGTHS_KM[l_idx])
+            series_maps: dict[tuple[str, str], dict[int, float]] = {}
+            x_lookup_hz: dict[int, float] = {}
+
+            for model_key, direction in series_pairs:
+                entry = sweep.get(model_key, {})
+                x_data = np.asarray(entry.get("x", []), dtype=np.float64)
+                y_data = np.asarray(entry.get(direction, []), dtype=np.float64)
+                if len(x_data) == 0 or len(x_data) != len(y_data):
+                    continue
+
+                model_label = str(specs.get(model_key, {}).get("label", model_key))
+                x_kind = str(entry.get("x_kind", ""))
+                y_kind = str(entry.get("y_kind", ""))
+                data_map: dict[int, float] = {}
+
+                for x_hz, noise_power_w in zip(x_data, y_data):
+                    x_key = int(round(float(x_hz)))
+                    x_lookup_hz[x_key] = float(x_hz)
+                    data_map[x_key] = float(noise_power_w)
+
+                    channel_itu: int | float | str = ""
+                    channel_label = ""
+                    if x_kind == "channel_center":
+                        channel_itu = _frequency_to_itu_channel(float(x_hz))
+                        channel_label = _channel_label(channel_itu)
+
+                    # Compute SKR/QBER if configs provided
+                    _qber_val = ""
+                    _skr_bpp_val = ""
+                    _skr_bps_val = ""
+                    if fiber_cfg is not None and skr_cfg is not None:
+                        dist_m = float(LENGTHS_KM[l_idx] * 1000.0)
+                        skr_d = compute_skr_point(float(noise_power_w), dist_m, float(x_hz), fiber_cfg, skr_cfg)
+                        _, (bps, bpp, qber) = list(skr_d.items())[0] if skr_d else ("", (0.0, 0.0, float("nan")))
+                        # Use approx_finite model as default
+                        approx = skr_d.get("approx_finite", (0.0, 0.0, float("nan")))
+                        _skr_bps_val = approx[0] if approx[0] > 0 else ""
+                        _skr_bpp_val = approx[1] if approx[1] > 0 else ""
+                        _qber_val = approx[2] if not np.isnan(float(approx[2])) else ""
+
+                    tidy_rows.append(
+                        {
+                            "sweep_type": "vs_frequency",
+                            "noise_type": noise_type,
+                            "modulation_format": modulation_slug,
+                            "power_dbm": float(power_dbm),
+                            "fiber_length_km": length_km,
+                            "model_key": model_key,
+                            "model_label": model_label,
+                            "direction": direction,
+                            "x_kind": x_kind,
+                            "y_kind": y_kind,
+                            "frequency_thz": float(x_hz) / 1e12,
+                            "channel_itu": channel_itu,
+                            "channel_label": channel_label,
+                            "noise_power_w": float(noise_power_w),
+                            "noise_power_dbm": _to_dbm_scalar(float(noise_power_w)) or "",
+                            "qber": _qber_val,
+                            "skr_bit_per_pulse": _skr_bpp_val,
+                            "skr_bps": _skr_bps_val,
+                        }
+                    )
+
+                if data_map:
+                    series_maps[(model_key, direction)] = data_map
+
+            for x_key in sorted(x_lookup_hz):
+                freq_hz = x_lookup_hz[x_key]
+                channel_itu_value = _frequency_to_itu_channel(freq_hz)
+                channel_itu: int | float | str = ""
+                channel_label = ""
+                if isinstance(channel_itu_value, int) or (
+                    isinstance(channel_itu_value, float) and channel_itu_value.is_integer()
+                ):
+                    channel_itu = channel_itu_value
+                    channel_label = _channel_label(channel_itu_value)
+
+                row: dict[str, object] = {
+                    "noise_type": noise_type,
+                    "modulation_format": modulation_slug,
+                    "power_dbm": float(power_dbm),
+                    "fiber_length_km": length_km,
+                    "frequency_thz": freq_hz / 1e12,
+                    "channel_itu": channel_itu,
+                    "channel_label": channel_label,
+                }
+                for model_key, direction in series_pairs:
+                    prefix = f"{model_key}_{direction}"
+                    noise_power_w = series_maps.get((model_key, direction), {}).get(x_key)
+                    row[f"{prefix}_noise_power_w"] = (
+                        float(noise_power_w) if noise_power_w is not None else ""
+                    )
+                    row[f"{prefix}_noise_power_dbm"] = (
+                        _to_dbm_scalar(float(noise_power_w))
+                        if noise_power_w is not None
+                        else ""
+                    ) or ""
+                    # Compute SKR/QBER if configs provided
+                    if fiber_cfg is not None and skr_cfg is not None and noise_power_w is not None:
+                        dist_m = float(LENGTHS_KM[l_idx] * 1000.0)
+                        skr_d = compute_skr_point(float(noise_power_w), dist_m, float(freq_hz), fiber_cfg, skr_cfg)
+                        approx = skr_d.get("approx_finite", (0.0, 0.0, float("nan")))
+                        row[f"{prefix}_qber"] = approx[2] if not np.isnan(float(approx[2])) else ""
+                        row[f"{prefix}_skr_bit_per_pulse"] = approx[1] if approx[1] > 0 else ""
+                        row[f"{prefix}_skr_bps"] = approx[0] if approx[0] > 0 else ""
+                    else:
+                        row[f"{prefix}_qber"] = ""
+                        row[f"{prefix}_skr_bit_per_pulse"] = ""
+                        row[f"{prefix}_skr_bps"] = ""
+                wide_rows.append(row)
+
+    tidy_fields = [
+        "sweep_type",
+        "noise_type",
+        "modulation_format",
+        "power_dbm",
+        "fiber_length_km",
+        "model_key",
+        "model_label",
+        "direction",
+        "x_kind",
+        "y_kind",
+        "frequency_thz",
+        "channel_itu",
+        "channel_label",
+        "noise_power_w",
+        "noise_power_dbm",
+        "qber",
+        "skr_bit_per_pulse",
+        "skr_bps",
+    ]
+    wide_fields = [
+        "noise_type",
+        "modulation_format",
+        "power_dbm",
+        "fiber_length_km",
+        "frequency_thz",
+        "channel_itu",
+        "channel_label",
+    ]
+    for model_key, direction in series_pairs:
+        wide_fields.extend(_metric_columns(f"{model_key}_{direction}"))
+
+    _write_analysis_csv(tidy_path, tidy_fields, tidy_rows)
+    _write_analysis_csv(wide_path, wide_fields, wide_rows)
+    return {"tidy": tidy_path, "wide": wide_path}
+
+
+def export_noise_vs_length_csv(
+    all_by_len_by_power: dict[float, dict],
+    model_keys: list[str],
+    specs: dict[str, dict],
+    LENGTHS_KM: np.ndarray,
+    channel_index_lookup: dict[int, int],
+    noise_type: str,
+    modulation_format: str,
+    output_dir: Path,
+    fiber_cfg=None,
+    skr_cfg=None,
+) -> dict[str, Path]:
+    """Export noise-vs-length data as tidy and Origin-friendly CSV files.
+
+    If fiber_cfg and skr_cfg are provided, SKR/QBER columns are filled using
+    the approximate finite key rate model.
+    """
+    modulation_slug = modulation_format.lower()
+    base_name = f"noise_vs_length_{noise_type}_{modulation_slug}"
+    tidy_path = output_dir / f"{base_name}_tidy.csv"
+    wide_path = output_dir / f"{base_name}_wide.csv"
+    series_pairs = _series_prefixes(model_keys, noise_type)
+
+    tidy_rows: list[dict[str, object]] = []
+    wide_rows: list[dict[str, object]] = []
+
+    for power_dbm in sorted(all_by_len_by_power):
+        all_by_len = all_by_len_by_power[power_dbm]
+        for outer_idx in sorted(all_by_len):
+            sweep = all_by_len[outer_idx]
+            channel_itu = int(channel_index_lookup[outer_idx])
+            channel_label = _channel_label(channel_itu)
+            frequency_thz = (
+                WDM_PARAMS["start_freq"]
+                + (channel_itu - WDM_PARAMS["start_channel"]) * WDM_PARAMS["channel_spacing"]
+            ) / 1e12
+
+            for li, length_km in enumerate(LENGTHS_KM):
+                row: dict[str, object] = {
+                    "noise_type": noise_type,
+                    "modulation_format": modulation_slug,
+                    "power_dbm": float(power_dbm),
+                    "channel_itu": channel_itu,
+                    "channel_label": channel_label,
+                    "frequency_thz": float(frequency_thz),
+                    "fiber_length_km": float(length_km),
+                }
+
+                for model_key, direction in series_pairs:
+                    entry = sweep.get(model_key, {})
+                    y_data = np.asarray(entry.get(direction, []), dtype=np.float64)
+                    noise_power_w = float(y_data[li]) if li < len(y_data) else None
+
+                    # Compute SKR/QBER if configs provided
+                    _qber_val = ""
+                    _skr_bpp_val = ""
+                    _skr_bps_val = ""
+                    if fiber_cfg is not None and skr_cfg is not None and noise_power_w is not None:
+                        dist_m = float(length_km * 1000.0)
+                        f_q_hz = WDM_PARAMS["start_freq"] + (channel_itu - WDM_PARAMS["start_channel"]) * WDM_PARAMS["channel_spacing"]
+                        skr_d = compute_skr_point(float(noise_power_w), dist_m, f_q_hz, fiber_cfg, skr_cfg)
+                        approx = skr_d.get("approx_finite", (0.0, 0.0, float("nan")))
+                        _skr_bps_val = approx[0] if approx[0] > 0 else ""
+                        _skr_bpp_val = approx[1] if approx[1] > 0 else ""
+                        _qber_val = approx[2] if not np.isnan(float(approx[2])) else ""
+
+                    if noise_power_w is not None:
+                        model_label = str(specs.get(model_key, {}).get("label", model_key))
+                        tidy_rows.append(
+                            {
+                                "sweep_type": "vs_length",
+                                "noise_type": noise_type,
+                                "modulation_format": modulation_slug,
+                                "power_dbm": float(power_dbm),
+                                "channel_itu": channel_itu,
+                                "channel_label": channel_label,
+                                "frequency_thz": float(frequency_thz),
+                                "fiber_length_km": float(length_km),
+                                "model_key": model_key,
+                                "model_label": model_label,
+                                "direction": direction,
+                                "noise_power_w": noise_power_w,
+                                "noise_power_dbm": _to_dbm_scalar(noise_power_w) or "",
+                                "qber": _qber_val,
+                                "skr_bit_per_pulse": _skr_bpp_val,
+                                "skr_bps": _skr_bps_val,
+                            }
+                        )
+
+                    prefix = f"{model_key}_{direction}"
+                    row[f"{prefix}_noise_power_w"] = noise_power_w if noise_power_w is not None else ""
+                    row[f"{prefix}_noise_power_dbm"] = (
+                        _to_dbm_scalar(noise_power_w) if noise_power_w is not None else ""
+                    ) or ""
+                    row[f"{prefix}_qber"] = _qber_val
+                    row[f"{prefix}_skr_bit_per_pulse"] = _skr_bpp_val
+                    row[f"{prefix}_skr_bps"] = _skr_bps_val
+
+                wide_rows.append(row)
+
+    tidy_fields = [
+        "sweep_type",
+        "noise_type",
+        "modulation_format",
+        "power_dbm",
+        "channel_itu",
+        "channel_label",
+        "frequency_thz",
+        "fiber_length_km",
+        "model_key",
+        "model_label",
+        "direction",
+        "noise_power_w",
+        "noise_power_dbm",
+        "qber",
+        "skr_bit_per_pulse",
+        "skr_bps",
+    ]
+    wide_fields = [
+        "noise_type",
+        "modulation_format",
+        "power_dbm",
+        "channel_itu",
+        "channel_label",
+        "frequency_thz",
+        "fiber_length_km",
+    ]
+    for model_key, direction in series_pairs:
+        wide_fields.extend(_metric_columns(f"{model_key}_{direction}"))
+
+    _write_analysis_csv(tidy_path, tidy_fields, tidy_rows)
+    _write_analysis_csv(wide_path, wide_fields, wide_rows)
+    return {"tidy": tidy_path, "wide": wide_path}
 
 
 def export_simulation_report(

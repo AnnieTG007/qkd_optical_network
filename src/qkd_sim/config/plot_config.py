@@ -88,3 +88,16 @@ def get_color(key: str) -> str:
     """返回模型对应的绘图颜色。"""
     cfg = _get_cache()
     return cfg["colors"][key]
+
+
+def load_default_skr_model() -> str:
+    """返回默认 SKR 模型 key（从 model_comparison.yaml 读取）。
+
+    若未配置或值无效，fallback 到 'approx_finite'。
+    """
+    cfg = _get_cache()
+    valid = {"infinite", "approx_finite", "strict_finite"}
+    key = cfg.get("default_skr_model", "approx_finite")
+    if key not in valid:
+        return "approx_finite"
+    return key

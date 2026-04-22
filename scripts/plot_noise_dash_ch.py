@@ -23,6 +23,7 @@ sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 from qkd_sim.config.plot_config import load_model_specs
 from scripts.dash_utils import (
     CLASSICAL_INDICES,
+    DEFAULT_SKR_MODEL_KEY,
     FIBER_PARAMS,
     LENGTHS_KM,
     NOISE_FLOOR_W,
@@ -34,13 +35,18 @@ from scripts.dash_utils import (
     _build_wdm_config,
     _display_channel_label,
     _get_osa_rbw,
+    _init_skr_model_registry,
     _resolve_osa_csv,
     adaptive_linear_ticks,
     adaptive_log_ticks,
     add_strategy_cli_args,
+    compute_skr_vs_channel,
+    ensure_port_free,
+    export_noise_vs_frequency_csv,
     export_noise_vs_frequency_xlsx,
     export_simulation_report,
     get_noise_model_keys,
+    load_skr_config_for_dash,
     override_strategy_from_cli,
     precompute_by_channel_all_powers,
     print_compute_device,
@@ -117,18 +123,26 @@ parser.add_argument(
 parser.add_argument(
     "--export-excel",
     action="store_true",
-    help="After precomputation, export Excel files and exit (do not start Dash server).",
+    help="After precomputation, export analysis files (Excel + CSV) and exit.",
 )
 parser.add_argument(
     "--export-only",
     action="store_true",
     help="Shorthand for --export-excel.",
 )
+parser.add_argument("--skr-profile", choices=["custom", "reference"], default="custom",
+                    help="SKR config profile to use for SKR subplots and CSV export.")
 add_strategy_cli_args(parser)
 ARGS = parser.parse_args()
 NOISE_TYPE = ARGS.type
 import scripts.dash_utils as _du
-_du.MODULATION_FORMAT = ARGS.modulation
+_du.MODULATION_FORMAT = ARGS.modulation.upper()
+
+# Fail fast if a stale Dash instance is still holding 8051 — otherwise app.run
+# would OSError after the full precompute and the browser would keep reading
+# the zombie. --export-only / --profile-only never reach app.run, so skip.
+if not (ARGS.profile_only or ARGS.export_only):
+    ensure_port_free(8051)
 
 # 策略参数覆盖：在预计算之前用 CLI 参数替换 CLASSICAL_INDICES
 if ARGS.strategy_name or ARGS.num_classical or ARGS.reference_channel:
@@ -203,8 +217,38 @@ with profile_scope("startup: y-axis ranges for all power levels"):
     for p in PRECOMPUTE_POWER_LEVELS:
         data = _POWER_CACHE.get(("ch", p), _POWER_CACHE.get(("ch", 0.0), {}))
         _POWER_Y_RANGES[p] = _global_ranges(data, model_keys)
+
+# --- SKR: load config and precompute cache ---
+_FIBER_CFG, _SKR_CFG = load_skr_config_for_dash(ARGS.skr_profile)
+# _SKR_MODEL_KEYS kept for cache compatibility; display uses DEFAULT_SKR_MODEL_KEY only
+_SKR_MODEL_KEYS = list(_init_skr_model_registry().keys())  # ["infinite", "approx_finite", "strict_finite"]
+quantum_center_freqs_hz = np.array(
+    [WDM_PARAMS["start_freq"] + (itn - WDM_PARAMS["start_channel"]) * WDM_PARAMS["channel_spacing"]
+     for itn in base_quantum_indices],
+    dtype=np.float64,
+)
+_SKR_CACHE_CH: dict[float, dict[int, dict]] = {}  # power_dbm -> l_idx -> skr_result
+
+
+def _build_ch_skr_cache(power_dbm: float, sweep_at_l: dict, l_idx: int) -> dict:
+    """Build SKR cache for a single (power, length) combo."""
+    dist_m = float(ACTIVE_LENGTHS_KM[l_idx] * 1000.0)
+    return compute_skr_vs_channel(sweep_at_l, dist_m, quantum_center_freqs_hz, _FIBER_CFG, _SKR_CFG, optimize=False)
+
+
+with profile_scope("startup: SKR cache (per-channel)"):
+    if NOISE_TYPE == "with_signal":
+        for p in PRECOMPUTE_POWER_LEVELS:
+            cache_key = ("ch", p)
+            data = _POWER_CACHE.get(cache_key, _POWER_CACHE.get(("ch", 0.0), {}))
+            _SKR_CACHE_CH[p] = {}
+            for l_idx in sorted(data.keys()):
+                _SKR_CACHE_CH[p][l_idx] = _build_ch_skr_cache(p, data[l_idx], l_idx)
+
 elapsed = time.perf_counter() - t0
 print(f"Precompute done in {elapsed:.1f}s. Valid selections: {len(VALID_L_INDICES)}")
+
+_CURRENT_POWER_DBM: float = 0.0  # updated by power slider callback for SKR cache lookup
 
 # Diagnostic: verify continuous vs discrete model data shapes
 l_diag = VALID_L_INDICES[0]
@@ -218,11 +262,30 @@ for mk in model_keys:
     print(f"  {mk}: x.shape={x.shape}, fwd.shape={fwd.shape}, x_kind={x_kind}, y_kind={y_kind}")
 
 if ARGS.profile_only or ARGS.export_only:
-    # Export Excel files then exit (--export-only implies --export-excel)
+    # Export analysis files then exit (--export-only implies --export-excel)
     if ARGS.export_only or ARGS.export_excel:
-        out_dir = _PROJECT_ROOT / "data" / "precomputed"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        xlsx_path = out_dir / "noise_vs_frequency.xlsx"
+        xlsx_dir = _PROJECT_ROOT / "data" / "precomputed"
+        xlsx_dir.mkdir(parents=True, exist_ok=True)
+        export_dir = _PROJECT_ROOT / "data" / "exports"
+        export_dir.mkdir(parents=True, exist_ok=True)
+
+        power_exports = {
+            float(p): _POWER_CACHE.get(("ch", float(p)), _POWER_CACHE.get(("ch", 0.0), {}))
+            for p in PRECOMPUTE_POWER_LEVELS
+        }
+        export_noise_vs_frequency_csv(
+            all_by_ch_by_power=power_exports,
+            model_keys=model_keys,
+            specs=specs,
+            LENGTHS_KM=ACTIVE_LENGTHS_KM,
+            noise_type=NOISE_TYPE,
+            modulation_format=ARGS.modulation,
+            output_dir=export_dir,
+            fiber_cfg=_FIBER_CFG,
+            skr_cfg=_SKR_CFG,
+        )
+
+        xlsx_path = xlsx_dir / "noise_vs_frequency.xlsx"
         export_noise_vs_frequency_xlsx(
             all_by_ch=_POWER_CACHE.get(("ch", 0.0), {}),
             model_keys=model_keys,
@@ -230,7 +293,7 @@ if ARGS.profile_only or ARGS.export_only:
             LENGTHS_KM=ACTIVE_LENGTHS_KM,
             output_path=xlsx_path,
         )
-        report_path = out_dir / "simulation_report.txt"
+        report_path = xlsx_dir / "simulation_report.txt"
         export_simulation_report(
             fiber_params=FIBER_PARAMS,
             noise_f_grid=noise_f_grid,
@@ -313,12 +376,12 @@ def update_power_and_graph(power_idx: int, length_selection_idx: int) -> tuple[s
     set_power_override(power_dbm)
     cache_key = ("ch", power_dbm)
     all_by_ch = _POWER_CACHE.get(cache_key, _POWER_CACHE.get(("ch", 0.0), {}))
-    valid_l_indices = VALID_L_INDICES
     label = f"Classical power: {power_dbm:.1f} dBm (precomputed)"
-    global Y_LOG_RANGE, Y_DBM_RANGE
+    global Y_LOG_RANGE, Y_DBM_RANGE, _CURRENT_POWER_DBM
     _y_range = _POWER_Y_RANGES.get(power_dbm, (Y_LOG_RANGE, Y_DBM_RANGE))
     Y_LOG_RANGE, Y_DBM_RANGE = _y_range
-    l_idx = valid_l_indices[length_selection_idx]
+    _CURRENT_POWER_DBM = power_dbm
+    l_idx = VALID_L_INDICES[length_selection_idx]
     fig = _make_figure(all_by_ch[l_idx], l_idx)
     return label, fig
 
@@ -334,24 +397,64 @@ def update_graph_on_length(length_selection_idx: int, power_idx: int) -> go.Figu
     set_power_override(power_dbm)
     cache_key = ("ch", power_dbm)
     all_by_ch = _POWER_CACHE.get(cache_key, _POWER_CACHE.get(("ch", 0.0), {}))
-    global Y_LOG_RANGE, Y_DBM_RANGE
+    global Y_LOG_RANGE, Y_DBM_RANGE, _CURRENT_POWER_DBM
     _y_range = _POWER_Y_RANGES.get(power_dbm, (Y_LOG_RANGE, Y_DBM_RANGE))
     Y_LOG_RANGE, Y_DBM_RANGE = _y_range
+    _CURRENT_POWER_DBM = power_dbm
     l_idx = VALID_L_INDICES[length_selection_idx]
     fig = _make_figure(all_by_ch[l_idx], l_idx)
     return fig
 
 
+def _compute_skr_y_ranges(skr_cache_l: dict) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Compute log y-axis ranges for SKR [bit/pulse] and SKR [bps]."""
+    bps_vals: list[float] = []
+    bpp_vals: list[float] = []
+    for mkey_data in skr_cache_l.values():
+        for skr_data in mkey_data.values():
+            for direction in ("fwd", "bwd"):
+                bps_arr, bpp_arr, _ = skr_data.get(direction, (np.array([]), np.array([]), np.array([])))
+                if len(bps_arr) > 0:
+                    valid_bps = bps_arr[bps_arr > 0]
+                    if len(valid_bps) > 0:
+                        bps_vals.extend(valid_bps.tolist())
+                if len(bpp_arr) > 0:
+                    valid_bpp = bpp_arr[bpp_arr > 0]
+                    if len(valid_bpp) > 0:
+                        bpp_vals.extend(valid_bpp.tolist())
+    if not bps_vals:
+        return (-12.0, 0.0), (-15.0, 0.0)
+    bps_arr = np.asarray(bps_vals, dtype=np.float64)
+    bpp_arr = np.asarray(bpp_vals, dtype=np.float64)
+    bps_lo = float(np.log10(bps_arr.min()) - 0.3)
+    bps_hi = float(np.log10(bps_arr.max()) + 0.3)
+    bpp_lo = float(np.log10(bpp_arr.min()) - 0.3)
+    bpp_hi = float(np.log10(bpp_arr.max()) + 0.3)
+    return (bpp_lo, bpp_hi), (bps_lo, bps_hi)
+
+
 def _make_figure(sweep: dict, l_idx: int) -> go.Figure:
     if NOISE_TYPE == "only_signal":
-        subplot_titles = ("Signal Power [W]", "Signal Power [dBm]")
+        noise_titles = ("Signal Power [W]", "Signal Power [dBm]")
     else:
-        subplot_titles = ("Noise Power [W]", "Noise Power [dBm]")
-    fig = make_subplots(
-        rows=1, cols=2,
-        subplot_titles=subplot_titles,
-    )
+        noise_titles = ("Noise Power [W]", "Noise Power [dBm]")
 
+    has_skr = NOISE_TYPE == "with_signal"
+    if has_skr:
+        fig = make_subplots(
+            rows=2, cols=2,
+            shared_xaxes=True,
+            vertical_spacing=0.08,
+            subplot_titles=(*noise_titles, "SKR [bit/pulse]", "SKR [bps]"),
+        )
+    else:
+        fig = make_subplots(
+            rows=1, cols=2,
+            shared_xaxes=True,
+            subplot_titles=noise_titles,
+        )
+
+    # --- Noise traces (row 1) ---
     for model_key in model_keys:
         spec = specs[model_key]
         entry = sweep.get(model_key, {})
@@ -377,7 +480,6 @@ def _make_figure(sweep: dict, l_idx: int) -> go.Figure:
                 legendgroup = f"{model_key}-{direction}"
 
             if spec["continuous"] or NOISE_TYPE == "with_signal":
-                # Continuous model or with_signal: lines on full f_grid
                 mode = "lines"
                 line_cfg = dict(color=spec["color"], width=2.0, dash=dash_style)
                 marker_cfg = None
@@ -387,7 +489,6 @@ def _make_figure(sweep: dict, l_idx: int) -> go.Figure:
                 hover_w = "f=%{x:.4f} THz<br>P=%{y:.3e} W<extra>" + name + "</extra>"
                 hover_db = "f=%{x:.4f} THz<br>P=%{y:.2f} dBm<extra>" + name + "</extra>"
             else:
-                # Discrete model: markers only at channel centers
                 mask = arr_w >= NOISE_FLOOR_W
                 if not np.any(mask):
                     continue
@@ -401,79 +502,112 @@ def _make_figure(sweep: dict, l_idx: int) -> go.Figure:
                 hover_db = "f=%{x:.4f} THz<br>P=%{y:.2f} dBm<extra>" + name + "</extra>"
 
             fig.add_trace(
-                go.Scatter(
-                    x=x_plot,
-                    y=y_plot,
-                    mode=mode,
-                    line=line_cfg,
-                    marker=marker_cfg,
-                    connectgaps=False,
-                    name=name,
-                    legendgroup=legendgroup,
-                    showlegend=True,
-                    hovertemplate=hover_w,
-                ),
-                row=1,
-                col=1,
+                go.Scatter(x=x_plot, y=y_plot, mode=mode, line=line_cfg, marker=marker_cfg,
+                           connectgaps=False, name=name, legendgroup=legendgroup,
+                           showlegend=True, hovertemplate=hover_w),
+                row=1, col=1,
             )
-
             fig.add_trace(
-                go.Scatter(
-                    x=x_plot,
-                    y=y_db,
-                    mode=mode,
-                    line=line_cfg,
-                    marker=marker_cfg,
-                    connectgaps=False,
-                    name=name,
-                    legendgroup=legendgroup,
-                    showlegend=False,
-                    hovertemplate=hover_db,
-                ),
-                row=1,
-                col=2,
+                go.Scatter(x=x_plot, y=y_db, mode=mode, line=line_cfg, marker=marker_cfg,
+                           connectgaps=False, name=name, legendgroup=legendgroup,
+                           showlegend=False, hovertemplate=hover_db),
+                row=1, col=2,
             )
 
+    # --- SKR traces (row 2) ---
+    if has_skr:
+        global _CURRENT_POWER_DBM
+        pwr = _CURRENT_POWER_DBM
+        skr_cache_l = _SKR_CACHE_CH.get(pwr, {}).get(l_idx, {})
+        skr_model_key = DEFAULT_SKR_MODEL_KEY
+
+        # SKR x-axis: quantum channel center frequencies (THz), independent of noise x_grid
+        x_skr_thz = quantum_center_freqs_hz / 1e12
+
+        for model_key in model_keys:
+            spec = specs[model_key]
+            if model_key not in skr_cache_l:
+                continue
+            for direction in ("fwd", "bwd"):
+                skr_data = skr_cache_l.get(model_key, {}).get(skr_model_key, {}).get(direction)
+                if skr_data is None:
+                    continue
+                bps_arr, bpp_arr, _qber_arr = skr_data
+                if len(bps_arr) == 0:
+                    continue
+
+                skr_name = f"{spec['label']} ({direction})"
+                skr_lg = f"{model_key}-{direction}"
+
+                # Discrete models (channel-sampled) → markers only; continuous → lines
+                skr_mode = "lines" if spec["continuous"] else "markers"
+                skr_line = dict(color=spec["color"], width=1.5, dash="solid") if spec["continuous"] else None
+                skr_marker = None if spec["continuous"] else dict(size=5, color=spec["color"])
+
+                # SKR [bit/pulse] — row 2, col 1
+                bpp_plot = np.where(bpp_arr > 0, bpp_arr, np.nan)
+                fig.add_trace(
+                    go.Scatter(x=x_skr_thz, y=bpp_plot, mode=skr_mode,
+                               line=skr_line, marker=skr_marker,
+                               connectgaps=False, name=skr_name, legendgroup=skr_lg,
+                               showlegend=False,
+                               hovertemplate=f"f=%{{x:.4f}} THz<br>SKR=%{{y:.3e}} bit/pulse<extra>{skr_name}</extra>"),
+                    row=2, col=1,
+                )
+                # SKR [bps] — row 2, col 2
+                bps_plot = np.where(bps_arr > 0, bps_arr, np.nan)
+                fig.add_trace(
+                    go.Scatter(x=x_skr_thz, y=bps_plot, mode=skr_mode,
+                               line=skr_line, marker=skr_marker,
+                               connectgaps=False, name=skr_name, legendgroup=skr_lg,
+                               showlegend=False,
+                               hovertemplate=f"f=%{{x:.4f}} THz<br>SKR=%{{y:.3e}} bps<extra>{skr_name}</extra>"),
+                    row=2, col=2,
+                )
+
+        skr_bpp_range, skr_bps_range = _compute_skr_y_ranges(skr_cache_l)
+    else:
+        skr_bpp_range, skr_bps_range = (-15.0, 0.0), (-12.0, 0.0)
+
+    # --- Axes ---
     fig.update_xaxes(title_text="Frequency [THz]", row=1, col=1)
     fig.update_xaxes(title_text="Frequency [THz]", row=1, col=2)
+    if has_skr:
+        fig.update_xaxes(title_text="Frequency [THz]", row=2, col=1)
+        fig.update_xaxes(title_text="Frequency [THz]", row=2, col=2)
 
     fig.update_yaxes(
-        title_text="Power [W]",
-        type="log",
-        range=list(Y_LOG_RANGE),
-        showgrid=True,
-        row=1,
-        col=1,
-        **adaptive_log_ticks(*Y_LOG_RANGE),
+        title_text="Power [W]", type="log", range=list(Y_LOG_RANGE),
+        showgrid=True, row=1, col=1, **adaptive_log_ticks(*Y_LOG_RANGE),
     )
     fig.update_yaxes(
-        title_text="Power [dBm]",
-        type="linear",
-        range=list(Y_DBM_RANGE),
-        showgrid=True,
-        row=1,
-        col=2,
-        **adaptive_linear_ticks(*Y_DBM_RANGE),
+        title_text="Power [dBm]", type="linear", range=list(Y_DBM_RANGE),
+        showgrid=True, row=1, col=2, **adaptive_linear_ticks(*Y_DBM_RANGE),
     )
+
+    if has_skr:
+        fig.update_yaxes(
+            title_text="SKR [bit/pulse]", type="log", range=list(skr_bpp_range),
+            showgrid=True, row=2, col=1, **adaptive_log_ticks(*skr_bpp_range),
+        )
+        fig.update_yaxes(
+            title_text="SKR [bps]", type="log", range=list(skr_bps_range),
+            showgrid=True, row=2, col=2, **adaptive_log_ticks(*skr_bps_range),
+        )
+
     fig.update_layout(
         template="plotly_white",
         width=1500,
-        height=560,
+        height=1000 if has_skr else 550,
         legend=dict(groupclick="toggleitem"),
         title=f"Noise vs Channel Frequency [{NOISE_TYPE}]"
         + (f" | L = {ACTIVE_LENGTHS_KM[l_idx]:.1f} km" if NOISE_TYPE != "only_signal" else " | G_TX (fiber-length independent)"),
         annotations=[
             dict(
-                x=0.5,
-                y=-0.13,
-                xref="paper",
-                yref="paper",
-                text=_build_caption(),
-                showarrow=False,
-                font=dict(size=10, color="gray"),
-                align="center",
-                xanchor="center",
-                yanchor="top",
+                x=0.5, y=-0.05, xref="paper", yref="paper",
+                text=_build_caption(), showarrow=False,
+                font=dict(size=10, color="gray"), align="center",
+                xanchor="center", yanchor="top",
             )
         ],
     )

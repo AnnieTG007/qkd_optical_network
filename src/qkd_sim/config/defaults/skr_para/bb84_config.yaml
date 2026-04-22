@@ -1,0 +1,62 @@
+# BB84 QKD 安全码率配置文件
+# 公式来源: docs/formulas_skr.md
+# 光纤衰减 alpha 由 FiberConfig（fiber_smf.yaml）提供
+#
+# 使用方式:
+#   load_skr_config(path, profile="custom")    # 默认，日常仿真
+#   load_skr_config(path, profile="reference") # 复现文献结果
+#
+# reference: Wiesemann et al. (arXiv:2405.16578) 理论参考值
+# custom:    实际系统仿真参数
+
+reference:
+  # 文献参考值（Wiesemann et al. arXiv:2405.16578）
+  eta_spd: 1.0                # SPD 量子效率 (η_spd)，理想值
+  IL_dB: 0.0                 # 插入损耗 [dB]，理想无损耗
+  dark_count_prob: 3.2e-7    # 暗计数概率/脉冲 (p_dark)
+  noise_count_prob: 0.0      # 噪声光子计数概率/脉冲 (p_noise)
+  mu_signal: 0.5             # 信号态平均光子数 (μ)
+  mu_decoy: 0.15            # 诱骗态平均光子数 (ν)
+  e_det: 0.02                # 探测器本征误码率 (e_Det)
+  f_ec: 1.16                # 纠错效率 (f_e)
+  R_rep: 6.25e+8             # 脉冲重复率 [Hz]
+  q_sifting: 0.5            # 筛选效率（BB84 = 0.5）
+  p_signal: 0.5              # 信号态发送概率 (p_μ)
+  p_decoy: 0.5              # 诱骗态发送概率 (p_ν)
+  block_length:
+    mode: "alice"
+    N_alice: 1.0e+8
+    N_bob: ~
+  gamma_ks: 5.0             # Gaussian 置信倍数 (γ_ks)
+  P_X_alice: 0.5            # Alice X 基矢选取概率（对称 BB84）
+  P_X_bob: 0.5              # Bob X 基矢选取概率（对称 BB84）
+  R_0: 6.25e+8             # 信号发射率 [Hz]（用于块长计算）
+  epsilon_cor: 1.0e-12      # 正确性安全参数 (ε_cor)
+  epsilon_sec: 1.0e-12      # 保密性安全参数 (ε_sec)
+  concentration_method: "Hoeffding"
+
+custom:
+  # 自定义参数（实际系统仿真）
+  eta_spd: 0.1               # SPD 量子效率 (η_spd)
+  IL_dB: 8.0                 # 插入损耗 [dB]（不含光纤衰减）
+  dark_count_prob: 1.0e-9   # 暗计数概率/脉冲 (p_dark)
+  noise_count_prob: 0.0      # 噪声光子计数概率/脉冲 (p_noise)，可由 SpRS 噪声模型填入
+  mu_signal: 0.5             # 信号态平均光子数 (μ)
+  mu_decoy: 0.1             # 诱骗态平均光子数 (ν)，须 < mu_signal
+  e_det: 0.01               # 探测器本征误码率 (e_Det)
+  f_ec: 1.16                # 纠错效率 (f_e)
+  R_rep: 1.0e+9             # 脉冲重复率 [Hz]
+  q_sifting: 0.5            # 筛选效率（BB84 = 0.5）
+  p_signal: 0.7             # 信号态发送概率 (p_μ)
+  p_decoy: 0.3              # 诱骗态发送概率 (p_ν)
+  block_length:
+    mode: "alice"
+    N_alice: 1.0e+10
+    N_bob: ~
+  gamma_ks: 5.0             # Gaussian 置信倍数 (γ_ks)
+  P_X_alice: 0.9            # Alice X 基矢选取概率
+  P_X_bob: 0.9              # Bob X 基矢选取概率
+  R_0: 1.0e+9              # 信号发射率 [Hz]（用于块长计算）
+  epsilon_cor: 1.0e-12     # 正确性安全参数 (ε_cor)
+  epsilon_sec: 1.0e-12     # 保密性安全参数 (ε_sec)
+  concentration_method: "Hoeffding"

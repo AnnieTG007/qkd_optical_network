@@ -167,6 +167,39 @@ FWM 求解器 (`fwm_solver.py`) 在 GPU 可用时自动使用 `_gpu_fwm_efficien
 
 ## M. 文档同步
 
-`AGENTS.md`（Codex 项目指南）与本文件 `AGENTS.md` 为镜像文档，内容应同步更新：
-- 修改 AGENTS.md 后，同步更新 AGENTS.md 的对应章节
-- 两者结构一致，仅标题和面向对象不同（Codex → Codex）
+`AGENTS.md`（Codex 项目指南）与 `CLAUDE.md` 为镜像文档，内容应同步更新：
+- 修改 CLAUDE.md 后，同步更新 AGENTS.md 的对应章节
+- 两者结构一致，仅标题和面向对象不同（Claude → Codex）
+
+---
+
+## N. 噪声计算实现备忘（2026-04 新增）
+
+### GPU 路径
+- **FWM**：`fwm_solver.py` 在 `GPU_ENABLED` 时走 `compute_fwm_spectrum_conti_gpu`（`fwm_solver.py:987-992`）
+- **SpRS**：`sprs_solver.py` 同样模式，`compute_sprs_spectrum_conti()` 在 GPU 可用时调用 `_compute_sprs_psd_batch_gpu()`（2026-04 新增）
+- 新增 solver **必须**通过 `get_array_module()` 分派，禁止在核心循环硬编码 `numpy`
+- Raman gain / phonon / cross-section 在 CPU 算（scipy interp 不支持 CuPy），sigma 矩阵移到 GPU 做传播积分
+
+### 功率缩放策略（`dash_utils.py::precompute_by_channel_all_powers`）
+| noise_type | 缩放规则 |
+|------------|---------|
+| `sprs` | P¹ = `10^(p/10)` |
+| `fwm` | P³ = `10^(3p/10)` |
+| `both` | fwm_base×P³ + sprs_base×P |
+| `with_signal` | fwm_base×P³ + sprs_base×P + signal_base×P（2026-04 新增） |
+| `only_signal` | 全量重算（信号本身即目标，无优化空间） |
+
+### 冗余计算陷阱（`precompute_by_channel()` `with_signal` 分支）
+- `build_wdm_grid()` **不依赖光纤长度**，必须提到 `for li` 循环外按 `model_key` 缓存一次
+- 经典信号 PSD **不依赖光纤长度**，同样提到循环外按 `(model_key)` 缓存
+- `OSA_SAMPLED` 谱读 CSV 代价大，每次重建 grid 会重加载 → 务必用 `grid_cache`
+
+### SKR 物理隔离（`with_signal` 分支）
+- **根本原因**：`precompute_by_channel()` 把经典信号 PSD 加入 `fwd/bwd` 全频谱，插值到量子信道时信号旁瓣污染噪声功率 → p_noise≈1 → QBER≈0.5 → SKR=0 → NaN → 图上无点
+- **修复方式**：分别存 `noise_only_fwd/bwd`（仅 FWM+SpRS）和 `fwd/bwd`（含信号，用于显示）；`compute_skr_vs_channel()` 和 `compute_skr_vs_length()` 优先读 `noise_only_*` 键（fallback 到 `fwd/bwd` 兼容旧数据）
+- **禁止**将经典信号 PSD 送入 SKR 的 noise interp
+
+### 离散 vs 连续可视化规则
+- **频率 x 轴**（`plot_noise_dash_ch.py`）：`spec["continuous"]=False` → `mode="markers"`；`True` → `mode="lines"`；SKR 同规则（2026-04 修复 SKR traces 始终用 lines 的 bug）
+- **长度 x 轴**（`plot_noise_dash_len.py`）：所有模型均用 `lines+markers`（长度是连续物理变量）
