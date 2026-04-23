@@ -87,7 +87,7 @@ def mp_worker_single_length(
             spectrum_type=SpectrumType.RAISED_COSINE,
             f_grid=noise_f_grid,
             classical_channel_indices=classical_indices,
-            modulation_format="16QAM",
+            modulation_format="DP-16QAM",
         )
         fiber = _make_fiber(fiber_params, length_km)
         n_fwd, n_bwd = _noise_pair("both", fiber, grid_noise, noise_f_grid)
@@ -136,7 +136,7 @@ def mp_worker_single_length(
             spectrum_type=SpectrumType.RAISED_COSINE,
             f_grid=noise_f_grid,
             classical_channel_indices=all_idx,
-            modulation_format="16QAM",
+            modulation_format="DP-16QAM",
         )
         fiber = _make_fiber(fiber_params, length_km)
         for mk in model_keys:
@@ -177,7 +177,7 @@ def mp_worker_single_length(
                     spectrum_type=sp["spectrum_type"],
                     f_grid=noise_f_grid,
                     classical_channel_indices=classical_indices,
-                    modulation_format="16QAM" if sp["spectrum_type"] == SpectrumType.RAISED_COSINE else "OOK",
+                    modulation_format="DP-16QAM" if sp["spectrum_type"] == SpectrumType.RAISED_COSINE else "OOK",
                 )
                 fwd, bwd = _noise_pair(noise_type, fiber, grid, noise_f_grid)
                 fwd = fwd * df
@@ -219,7 +219,7 @@ def mp_worker_single_length(
                         spectrum_type=sp["spectrum_type"],
                         f_grid=noise_f_grid,
                         classical_channel_indices=classical_indices,
-                        modulation_format="16QAM" if sp["spectrum_type"] == SpectrumType.RAISED_COSINE else "OOK",
+                        modulation_format="DP-16QAM" if sp["spectrum_type"] == SpectrumType.RAISED_COSINE else "OOK",
                     )
                     # Use compute_forward/compute_backward (return N_q power, not N_f PSD)
                     if noise_type in ("fwm", "both"):

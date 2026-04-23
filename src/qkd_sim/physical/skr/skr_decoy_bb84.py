@@ -306,6 +306,11 @@ def strict_finite_key_rate(
 
     mu_1 = skr_cfg.mu_signal    # signal intensity
     mu_2 = skr_cfg.mu_decoy     # decoy intensity
+
+    # GitHub 一致性：mu_1 <= mu_2 时返回 0（避免无效约束导致 NaN）
+    if mu_1 <= mu_2:
+        return 0.0, 0.0, 0.0
+
     P_mu_1 = skr_cfg.p_signal
     P_mu_2 = skr_cfg.p_decoy
 
@@ -316,26 +321,7 @@ def strict_finite_key_rate(
 
     R_0 = skr_cfg.R_0
 
-    # --- 块长解析：mode=alice 或 mode=bob ---
-    bl = skr_cfg.block_length
-    if bl.mode == "alice":
-        N_A = bl.N_alice
-        integration_time = N_A / R_0
-    else:
-        # fixed-N_bob: n_bob = t * R_0 * P_XX * P_det_1
-        # => t = n_bob / (R_0 * P_XX * P_det_1)
-        integration_time = bl.N_bob / (R_0 * P_XX * P_det_1)
-        N_A = integration_time * R_0  # 等效 Alice 发送脉冲数（用于统计涨落）
-
-    epsilon_cor = skr_cfg.epsilon_cor
-    epsilon_sec = skr_cfg.epsilon_sec
-    epsilon_0 = epsilon_sec / 15.0
-    epsilon_1 = epsilon_0
-    epsilon_2 = epsilon_0
-
-    method = skr_cfg.concentration_method
-
-    # --- 信道透过率和暗计数 ---
+    # --- 信道透过率和暗计数（需先计算以便 mode=bob 使用）---
     eta_sys = (
         skr_cfg.eta_spd
         * math.exp(-fiber_cfg.alpha * distance_m)
@@ -353,6 +339,25 @@ def strict_finite_key_rate(
 
     P_det_1 = _P_det(mu_1)
     P_det_2 = _P_det(mu_2)
+
+    # --- 块长解析：mode=alice 或 mode=bob ---
+    bl = skr_cfg.block_length
+    if bl.mode == "alice" or skr_cfg.fix_alice:
+        N_A = bl.N_alice
+        integration_time = N_A / R_0
+    else:
+        # fixed-N_bob: n_bob = t * R_0 * P_XX * P_det_1
+        # => t = n_bob / (R_0 * P_XX * P_det_1)
+        integration_time = bl.N_bob / (R_0 * P_XX * P_det_1)
+        N_A = integration_time * R_0  # 等效 Alice 发送脉冲数（用于统计涨落）
+
+    epsilon_cor = skr_cfg.epsilon_cor
+    epsilon_sec = skr_cfg.epsilon_sec
+    epsilon_0 = epsilon_sec / 15.0
+    epsilon_1 = epsilon_0
+    epsilon_2 = epsilon_0
+
+    method = skr_cfg.concentration_method
 
     # 误码概率（给定检测）
     def _P_err(mu: float) -> float:
@@ -458,7 +463,7 @@ def strict_finite_key_rate(
         lambda_Z_plus = 0.5
 
     if s_X_1_minus > 0.0 and s_Z_1_minus > 0.0:
-        gamma_val = _gamma_serfling(epsilon_0, lambda_Z_plus, s_X_1_minus, s_Z_1_minus)
+        gamma_val = _gamma_serfling(epsilon_0, lambda_Z_plus, s_X_1_minus, s_Z_1_minus, skr_cfg.improved_serfling)
         lambda_X_plus = _clip(0.0, 0.5, lambda_Z_plus + gamma_val)
     else:
         lambda_X_plus = 0.5

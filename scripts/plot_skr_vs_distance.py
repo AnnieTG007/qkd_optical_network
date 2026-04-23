@@ -42,6 +42,8 @@ def parse_args() -> argparse.Namespace:
                    help="Maximum distance [km], default 350")
     p.add_argument("--n-points", type=int, default=200,
                    help="Number of distance sampling points, default 200")
+    p.add_argument("--no-optimize", action="store_true",
+                   help="Skip Nelder-Mead parameter optimization (fast mode)")
     p.add_argument("--output", type=Path, default=None,
                    help="Output image path (shows interactive window if not specified)")
     return p.parse_args()
@@ -72,9 +74,12 @@ def main() -> None:
     skr_strict = np.zeros(len(distances_m))
 
     for i, d in enumerate(distances_m):
+        if i % 20 == 0:
+            print(f"[{i}/{len(distances_m)}] Computing distance {distances_km[i]:.1f} km...")
         skr_inf[i],    _, _ = infinite_key_rate(d, fiber_cfg, skr_cfg, p_noise)
         skr_approx[i], _, _ = approx_finite_key_rate(d, fiber_cfg, skr_cfg, p_noise)
-        skr_strict[i], _, _ = strict_finite_key_rate(d, fiber_cfg, skr_cfg, p_noise)
+        skr_strict[i], _, _ = strict_finite_key_rate(d, fiber_cfg, skr_cfg, p_noise,
+                                                      optimize_params=not args.no_optimize)
 
     # --- Plotting ---
     fig, ax = plt.subplots(figsize=(10, 5))

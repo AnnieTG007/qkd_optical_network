@@ -34,11 +34,13 @@ reference:
   epsilon_cor: 1.0e-12      # 正确性安全参数 (ε_cor)
   epsilon_sec: 1.0e-12      # 保密性安全参数 (ε_sec)
   concentration_method: "Hoeffding"
+  improved_serfling: false  # 是否使用改进的 Serfling 不等式
+  fix_alice: true           # True=N_alice 固定，False=N_bob 固定
 
 custom:
   # 自定义参数（实际系统仿真）
-  eta_spd: 0.1               # SPD 量子效率 (η_spd)
-  IL_dB: 8.0                 # 插入损耗 [dB]（不含光纤衰减）
+  eta_spd: 0.9               # SPD 量子效率 (η_spd)
+  IL_dB: 0.0                 # 插入损耗 [dB]（不含光纤衰减）
   dark_count_prob: 1.0e-9   # 暗计数概率/脉冲 (p_dark)
   noise_count_prob: 0.0      # 噪声光子计数概率/脉冲 (p_noise)，可由 SpRS 噪声模型填入
   mu_signal: 0.5             # 信号态平均光子数 (μ)
@@ -60,3 +62,5 @@ custom:
   epsilon_cor: 1.0e-12     # 正确性安全参数 (ε_cor)
   epsilon_sec: 1.0e-12     # 保密性安全参数 (ε_sec)
   concentration_method: "Hoeffding"
+  improved_serfling: false  # 是否使用改进的 Serfling 不等式
+  fix_alice: true           # True=N_alice 固定，False=N_bob 固定

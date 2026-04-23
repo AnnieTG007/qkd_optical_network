@@ -36,6 +36,7 @@ def _load_wdm_params() -> dict:
         end_channel=cfg.end_channel,
         channel_spacing=cfg.channel_spacing,
         B_s=cfg.B_s,
+        data_rate_bps=cfg.data_rate_bps,
         P0=cfg.P0,
         beta_rolloff=cfg.beta_rolloff,
         ook_filter_order=cfg.ook_filter_order,
@@ -291,7 +292,7 @@ def _init_default_skr_model() -> str:
 _init_default_skr_model()
 
 # 调制格式：由 Dash 脚本 --modulation 参数设置
-MODULATION_FORMAT: str = "16qam"
+MODULATION_FORMAT: str = "dp-16qam"
 def _load_fiber_params() -> dict:
     from qkd_sim.config.schema import load_fiber_config
     cfg = load_fiber_config(_YAML_FIBER_PATH)
@@ -312,6 +313,7 @@ FIBER_PARAMS = {k: v for k, v in _FIBER_CFG.items() if k != 'length_km_samples'}
 LENGTHS_KM = np.array(_FIBER_CFG['length_km_samples'])
 OSA_CSV_PATH = _PROJECT_ROOT / "data" / "osa"
 _osa_rbw_hz: float | None = None
+_osa_rbw_csv_path: Path | None = None
 
 
 def _infer_rbw_from_csv(csv_path: Path) -> float:
@@ -330,11 +332,22 @@ def _infer_rbw_from_csv(csv_path: Path) -> float:
     return float(rbw)
 
 
-def _get_osa_rbw() -> float:
-    """Get OSA RBW, inferring from CSV if not yet set."""
-    global _osa_rbw_hz
-    if _osa_rbw_hz is None:
+def _get_osa_rbw(csv_path: Path | None = None) -> float:
+    """Get OSA RBW, inferring from CSV if not yet set.
+
+    Parameters
+    ----------
+    csv_path : Path or None
+        OSA CSV path to infer RBW from. If None, uses a default path.
+    """
+    global _osa_rbw_hz, _osa_rbw_csv_path
+    if csv_path is not None and (_osa_rbw_hz is None or _osa_rbw_csv_path != csv_path):
+        _osa_rbw_csv_path = csv_path
+        _osa_rbw_hz = _infer_rbw_from_csv(csv_path)
+    elif _osa_rbw_hz is None:
+        # Fallback to default path for backward compatibility
         csv_path = OSA_CSV_PATH / "spectrum_OOK.csv"
+        _osa_rbw_csv_path = csv_path
         _osa_rbw_hz = _infer_rbw_from_csv(csv_path)
     return _osa_rbw_hz
 
@@ -348,7 +361,7 @@ def _build_caption() -> str:
     - Fiber parameters (alpha, gamma, D)
     """
     ch_spacing_ghz = WDM_PARAMS["channel_spacing"] / 1e9
-    data_rate_gbaud = WDM_PARAMS["B_s"] / 1e9
+    data_rate_gbps = WDM_PARAMS["data_rate_bps"] / 1e9
     # CLASSICAL_INDICES 已是 1-based ITU 信道号（如 [39, 40, 41] = C39/C40/C41）
     classical_freqs = [
         WDM_PARAMS["start_freq"] + (itn - WDM_PARAMS["start_channel"]) * WDM_PARAMS["channel_spacing"]
@@ -361,7 +374,7 @@ def _build_caption() -> str:
     )
     return (
         f"Channel spacing: {ch_spacing_ghz:.0f} GHz | "
-        f"Data rate: {data_rate_gbaud:.0f} GBaud | "
+        f"Data rate: {data_rate_gbps:.0f} Gbps | "
         f"OSA RBW: {_get_osa_rbw() / 1e9:.0f} GHz | "
         f"Classical channels: {classical_desc}"
     )
@@ -659,12 +672,13 @@ def _precompute_length_worker(
     noise_f_grid: np.ndarray,
     osa_csv_path: Path,
     fiber_params: dict,
+    osa_center_freq_hz: float | None = None,
 ) -> tuple[float, dict, list]:
     """Worker: precompute by length for one power level. Runs in subprocess."""
     set_power_override(float(power_dbm))
     all_by_idx, valid_ch = precompute_by_length(
         noise_type, specs, LENGTHS_KM, base_config,
-        noise_f_grid, osa_csv_path, fiber_params,
+        noise_f_grid, osa_csv_path, fiber_params, osa_center_freq_hz,
     )
     return float(power_dbm), all_by_idx, valid_ch
 
@@ -678,12 +692,13 @@ def _precompute_channel_worker(
     noise_f_grid: np.ndarray,
     osa_csv_path: Path,
     fiber_params: dict,
+    osa_center_freq_hz: float | None = None,
 ) -> tuple[float, dict, list]:
     """Worker: precompute by channel for one power level. Runs in subprocess."""
     set_power_override(float(power_dbm))
     all_by_idx, valid_l = precompute_by_channel(
         noise_type, specs, LENGTHS_KM, base_config,
-        noise_f_grid, osa_csv_path, fiber_params,
+        noise_f_grid, osa_csv_path, fiber_params, osa_center_freq_hz,
     )
     return float(power_dbm), all_by_idx, valid_l
 
@@ -1011,23 +1026,48 @@ _LEGEND_SYNC_JS = """
 """
 
 
-def _resolve_osa_csv(modulation_format: str = "16QAM") -> Path:
-    """Resolve OSA CSV path based on modulation format.
+def _resolve_osa_csv(modulation_format: str = "DP-16QAM") -> tuple[Path, float | None]:
+    """Resolve OSA CSV path based on modulation format, and extract center frequency from filename.
+
+    Filename pattern: spectrum_<fmt>_<freq>THz.csv (e.g., spectrum_16QAM_196.0THz.csv)
 
     Parameters
     ----------
     modulation_format : str
-        "OOK" or "16QAM" (case-insensitive)
+        "OOK" or "DP-16QAM" (case-insensitive)
+
+    Returns
+    -------
+    csv_path : Path
+        Path to the OSA CSV file
+    center_freq_hz : float | None
+        Center frequency in Hz parsed from filename, or None if not found
     """
+    import re
+
     fmt_lower = modulation_format.lower()
+    # Map modulation format to filename pattern suffix
+    if fmt_lower == "ook":
+        pattern = re.compile(r"^spectrum_OOK_(\d+\.\d+)THz\.csv$", re.IGNORECASE)
+    else:  # dp-16qam or default
+        pattern = re.compile(r"^spectrum_16QAM_(\d+\.\d+)THz\.csv$", re.IGNORECASE)
+
+    for csv_path in OSA_CSV_PATH.glob("*.csv"):
+        m = pattern.match(csv_path.name)
+        if m:
+            center_freq_thz = float(m.group(1))
+            center_freq_hz = center_freq_thz * 1e12
+            return csv_path, center_freq_hz
+
+    # Fallback: try old filename without frequency suffix
     if fmt_lower == "ook":
         filename = "spectrum_OOK.csv"
-    else:  # 16qam or default
+    else:
         filename = "spectrum_16QAM.csv"
     csv_path = OSA_CSV_PATH / filename
-    if not csv_path.exists():
-        raise FileNotFoundError(f"OSA CSV not found: {csv_path}")
-    return csv_path
+    if csv_path.exists():
+        return csv_path, None  # Old file, no center frequency
+    raise FileNotFoundError(f"OSA CSV not found for {modulation_format!r} in {OSA_CSV_PATH}")
 
 
 def _build_noise_frequency_grid(config: WDMConfig) -> np.ndarray:
@@ -1053,11 +1093,11 @@ def _modulation_format_for_model(model_key: str, spec: dict) -> str:
     if spec["spectrum_type"] == SpectrumType.NRZ_OOK:
         return "OOK"
     if spec["spectrum_type"] == SpectrumType.RAISED_COSINE:
-        return "16QAM"
+        return "DP-16QAM"
     # OSA_SAMPLED: determine by model_key
     if model_key == "osa_ook":
         return "OOK"
-    return "16QAM"
+    return "DP-16QAM"
 
 
 def _build_model_grid(
@@ -1066,6 +1106,7 @@ def _build_model_grid(
     base_config: WDMConfig,
     f_grid: np.ndarray,
     osa_csv_path: Path,
+    osa_center_freq_hz: float | None = None,
 ):
     from qkd_sim.physical.signal import SpectrumType
 
@@ -1087,6 +1128,7 @@ def _build_model_grid(
             end_channel=base_config.end_channel,
             channel_spacing=base_config.channel_spacing,
             B_s=base_config.B_s,
+            data_rate_bps=base_config.data_rate_bps,
             P0=_get_P0(),
             beta_rolloff=spec["beta_rolloff"],
             ook_filter_order=base_config.ook_filter_order,
@@ -1101,6 +1143,7 @@ def _build_model_grid(
             end_channel=base_config.end_channel,
             channel_spacing=base_config.channel_spacing,
             B_s=base_config.B_s,
+            data_rate_bps=base_config.data_rate_bps,
             P0=_get_P0(),
             beta_rolloff=base_config.beta_rolloff,
             ook_filter_order=base_config.ook_filter_order,
@@ -1116,7 +1159,8 @@ def _build_model_grid(
             spectrum_type=spec["spectrum_type"],
             f_grid=f_grid,
             osa_csv_path=osa_csv_path,
-            osa_rbw=_get_osa_rbw(),
+            osa_rbw=_get_osa_rbw(osa_csv_path),
+            osa_center_freq_hz=osa_center_freq_hz,
             classical_channel_indices=CLASSICAL_INDICES,
             modulation_format=mod_fmt,
         )
@@ -1167,6 +1211,7 @@ def _build_all_classical_grid(
     base_config: WDMConfig,
     f_grid: np.ndarray,
     osa_csv_path: Path,
+    osa_center_freq_hz: float | None = None,
 ):
     from qkd_sim.physical.signal import SpectrumType
 
@@ -1176,6 +1221,7 @@ def _build_all_classical_grid(
         end_channel=base_config.end_channel,
         channel_spacing=base_config.channel_spacing,
         B_s=base_config.B_s,
+        data_rate_bps=base_config.data_rate_bps,
         P0=_get_P0(),
         beta_rolloff=base_config.beta_rolloff if spec["beta_rolloff"] is None else spec["beta_rolloff"],
         ook_filter_order=base_config.ook_filter_order,
@@ -1191,7 +1237,8 @@ def _build_all_classical_grid(
             spectrum_type=spec["spectrum_type"],
             f_grid=f_grid,
             osa_csv_path=osa_csv_path,
-            osa_rbw=_get_osa_rbw(),
+            osa_rbw=_get_osa_rbw(osa_csv_path),
+            osa_center_freq_hz=osa_center_freq_hz,
             modulation_format=mod_fmt,
         )
     return build_wdm_grid(
@@ -1414,6 +1461,7 @@ def precompute_by_length(
     noise_f_grid: np.ndarray,
     osa_csv_path: Path,
     fiber_params: dict,
+    osa_center_freq_hz: float | None = None,
 ) -> tuple[dict, list]:
     """Precompute noise vs fiber length for all quantum channels.
 
@@ -1458,6 +1506,7 @@ VALID_Q_INDICES: list of q_idx that have non-zero noise for at least one model
             end_channel=base_config.end_channel,
             channel_spacing=base_config.channel_spacing,
             B_s=base_config.B_s,
+            data_rate_bps=base_config.data_rate_bps,
             P0=_get_P0(),
             beta_rolloff=WDM_PARAMS["beta_rolloff"],
             ook_filter_order=base_config.ook_filter_order,
@@ -1470,7 +1519,7 @@ VALID_Q_INDICES: list of q_idx that have non-zero noise for at least one model
             spectrum_type=SpectrumType.RAISED_COSINE,
             f_grid=noise_f_grid,
             classical_channel_indices=CLASSICAL_INDICES,
-            modulation_format="16QAM",
+            modulation_format="DP-16QAM",
         )
         # Vectorize over all lengths at once
         noise_fwd_psd_all, noise_bwd_psd_all = _compute_noise_spectrum_pair(
@@ -1519,7 +1568,7 @@ VALID_Q_INDICES: list of q_idx that have non-zero noise for at least one model
         }
         for model_key in model_keys:
             spec = specs[model_key]
-            grid_all = _build_all_classical_grid(model_key, spec, base_config, noise_f_grid, osa_csv_path)
+            grid_all = _build_all_classical_grid(model_key, spec, base_config, noise_f_grid, osa_csv_path, osa_center_freq_hz)
             signal = _integrate_signal_per_channel(grid_all, grid_all.f_grid)
             classical_mask = np.array([ch.channel_type == "classical" for ch in grid_all.channels], dtype=bool)
 
@@ -1567,6 +1616,7 @@ VALID_Q_INDICES: list of q_idx that have non-zero noise for at least one model
                     single_q_config,
                     noise_f_grid,
                     osa_csv_path,
+                    osa_center_freq_hz,
                 )
             grid = grid_cache[cache_key]
             # Fiber varies with length, not with q_idx or model_key; create once per length
@@ -1604,6 +1654,7 @@ def precompute_by_channel(
     noise_f_grid: np.ndarray,
     osa_csv_path: Path,
     fiber_params: dict,
+    osa_center_freq_hz: float | None = None,
 ) -> tuple[dict, list]:
     """Precompute noise vs quantum channel frequency for all lengths.
 
@@ -1654,6 +1705,7 @@ def precompute_by_channel(
             end_channel=base_config.end_channel,
             channel_spacing=base_config.channel_spacing,
             B_s=base_config.B_s,
+            data_rate_bps=base_config.data_rate_bps,
             P0=_get_P0(),
             beta_rolloff=WDM_PARAMS["beta_rolloff"],
             ook_filter_order=base_config.ook_filter_order,
@@ -1681,7 +1733,7 @@ def precompute_by_channel(
             )
             if stype == SpectrumType.OSA_SAMPLED:
                 grid_kwargs["osa_csv_path"] = osa_csv_path
-                grid_kwargs["osa_rbw"] = _get_osa_rbw()
+                grid_kwargs["osa_rbw"] = _get_osa_rbw(osa_csv_path)
             grid_model = build_wdm_grid(**grid_kwargs)
             grid_cache[model_key] = grid_model
             # Signal PSD: sum ONLY over classical channels (C39/C40/C41)
@@ -1725,7 +1777,7 @@ def precompute_by_channel(
         df = float(np.mean(np.diff(noise_f_grid)))
         for model_key in model_keys:
             spec = specs[model_key]
-            grid_all = _build_all_classical_grid(model_key, spec, base_config, noise_f_grid, osa_csv_path)
+            grid_all = _build_all_classical_grid(model_key, spec, base_config, noise_f_grid, osa_csv_path, osa_center_freq_hz)
             classical_mask = np.array(
                 [ch.channel_type == "classical" for ch in grid_all.channels], dtype=bool
             )
@@ -1776,7 +1828,7 @@ def precompute_by_channel(
     # Precompute quantum channel center frequencies for discrete-model x-axis
     q_center_freqs = np.array(
         [
-            WDM_PARAMS["start_freq"] + idx * WDM_PARAMS["channel_spacing"]
+            WDM_PARAMS["start_freq"] + (idx - WDM_PARAMS["start_channel"]) * WDM_PARAMS["channel_spacing"]
             for idx in quantum_indices
         ],
         dtype=np.float64,
@@ -1807,6 +1859,7 @@ def precompute_by_channel(
             end_channel=base_config.end_channel,
             channel_spacing=base_config.channel_spacing,
             B_s=base_config.B_s,
+            data_rate_bps=base_config.data_rate_bps,
             P0=_get_P0(),
             beta_rolloff=WDM_PARAMS["beta_rolloff"],
             ook_filter_order=base_config.ook_filter_order,
@@ -1867,6 +1920,7 @@ def precompute_by_channel(
                 base_config,
                 noise_f_grid,
                 osa_csv_path,
+                osa_center_freq_hz,
             )
             t_grid += time.perf_counter() - _t
         grid = grid_cache[model_key]
@@ -1942,6 +1996,7 @@ def precompute_by_channel(
                     _build_wdm_config([q_idx]),
                     noise_f_grid,
                     osa_csv_path,
+                    osa_center_freq_hz,
                 )
                 t_grid += time.perf_counter() - _t
 
@@ -2018,6 +2073,7 @@ def precompute_by_channel_all_powers(
     noise_f_grid: np.ndarray,
     osa_csv_path: Path,
     fiber_params: dict,
+    osa_center_freq_hz: float | None = None,
 ) -> tuple[dict, list]:
     """Precompute ALL power levels at startup, save to CSV and memory cache.
 
@@ -2042,7 +2098,7 @@ def precompute_by_channel_all_powers(
         with profile_scope("power +0 dBm: base precompute_by_channel"):
             base_all_by_idx, base_valid_l = precompute_by_channel(
                 noise_type, specs, LENGTHS_KM, base_config,
-                noise_f_grid, osa_csv_path, fiber_params,
+                noise_f_grid, osa_csv_path, fiber_params, osa_center_freq_hz,
             )
         results: dict[float, tuple[dict, list]] = {}
         for p in PRECOMPUTE_POWER_LEVELS:
@@ -2071,12 +2127,12 @@ def precompute_by_channel_all_powers(
         with profile_scope("power +0 dBm: base FWM precompute_by_channel"):
             fwm_base_by_idx, fwm_valid_l = precompute_by_channel(
                 "fwm", specs, LENGTHS_KM, base_config,
-                noise_f_grid, osa_csv_path, fiber_params,
+                noise_f_grid, osa_csv_path, fiber_params, osa_center_freq_hz,
             )
         with profile_scope("power +0 dBm: base SpRS precompute_by_channel"):
             sprs_base_by_idx, sprs_valid_l = precompute_by_channel(
                 "sprs", specs, LENGTHS_KM, base_config,
-                noise_f_grid, osa_csv_path, fiber_params,
+                noise_f_grid, osa_csv_path, fiber_params, osa_center_freq_hz,
             )
         base_valid_l = sorted(set(fwm_valid_l) & set(sprs_valid_l))
         results: dict[float, tuple[dict, list]] = {}
@@ -2111,6 +2167,7 @@ def precompute_by_channel_all_powers(
             end_channel=base_config.end_channel,
             channel_spacing=base_config.channel_spacing,
             B_s=base_config.B_s,
+            data_rate_bps=base_config.data_rate_bps,
             P0=_get_P0(),
             beta_rolloff=WDM_PARAMS["beta_rolloff"],
             ook_filter_order=base_config.ook_filter_order,
@@ -2132,7 +2189,7 @@ def precompute_by_channel_all_powers(
                 stype_t4 = SpectrumType.SINGLE_FREQ
             elif mk == "nrz_ook":
                 stype_t4 = SpectrumType.NRZ_OOK
-            elif mk == "osa_ook":
+            elif mk in ("osa", "osa_ook"):
                 stype_t4 = SpectrumType.OSA_SAMPLED
             else:
                 stype_t4 = SpectrumType.RAISED_COSINE
@@ -2145,7 +2202,8 @@ def precompute_by_channel_all_powers(
             )
             if stype_t4 == SpectrumType.OSA_SAMPLED:
                 gkw_t4["osa_csv_path"] = osa_csv_path
-                gkw_t4["osa_rbw"] = _get_osa_rbw()
+                gkw_t4["osa_rbw"] = _get_osa_rbw(osa_csv_path)
+                gkw_t4["osa_center_freq_hz"] = osa_center_freq_hz
             grid_t4 = build_wdm_grid(**gkw_t4)
             grid_cache_t4[mk] = grid_t4
             sig_base = np.zeros_like(noise_f_grid, dtype=np.float64)
@@ -2232,7 +2290,7 @@ def precompute_by_channel_all_powers(
             with profile_scope(f"power {p:+.0f} dBm: precompute_by_channel"):
                 all_by_idx, valid_l = precompute_by_channel(
                     noise_type, specs, LENGTHS_KM, base_config,
-                    noise_f_grid, osa_csv_path, fiber_params,
+                    noise_f_grid, osa_csv_path, fiber_params, osa_center_freq_hz,
                 )
             with profile_scope(f"power {p:+.0f} dBm: save CSV cache"):
                 _cache_precomputed_result(all_by_idx, p, noise_type, list(specs.keys()), index_prefix="ch")
@@ -2248,7 +2306,7 @@ def precompute_by_channel_all_powers(
                     executor.submit(
                         _precompute_channel_worker,
                         p, noise_type, specs, LENGTHS_KM, base_config,
-                        noise_f_grid, osa_csv_path, fiber_params,
+                        noise_f_grid, osa_csv_path, fiber_params, osa_center_freq_hz,
                     ): p
                     for p in PRECOMPUTE_POWER_LEVELS
                 }
@@ -2276,6 +2334,7 @@ def precompute_by_length_all_powers(
     noise_f_grid: np.ndarray,
     osa_csv_path: Path,
     fiber_params: dict,
+    osa_center_freq_hz: float | None = None,
 ) -> tuple[dict, list]:
     """Precompute ALL power levels at startup, save to CSV and memory cache.
 
@@ -2299,12 +2358,12 @@ def precompute_by_length_all_powers(
         with profile_scope("power +0 dBm: base FWM precompute_by_length"):
             fwm_base_by_idx, fwm_valid_ch = precompute_by_length(
                 "fwm", specs, LENGTHS_KM, base_config,
-                noise_f_grid, osa_csv_path, fiber_params,
+                noise_f_grid, osa_csv_path, fiber_params, osa_center_freq_hz,
             )
         with profile_scope("power +0 dBm: base SpRS precompute_by_length"):
             sprs_base_by_idx, sprs_valid_ch = precompute_by_length(
                 "sprs", specs, LENGTHS_KM, base_config,
-                noise_f_grid, osa_csv_path, fiber_params,
+                noise_f_grid, osa_csv_path, fiber_params, osa_center_freq_hz,
             )
         base_valid_ch = sorted(set(fwm_valid_ch) & set(sprs_valid_ch))
         results: dict[float, tuple[dict, list]] = {}
@@ -2331,7 +2390,7 @@ def precompute_by_length_all_powers(
             set_power_override(float(p))
             all_by_idx, valid_ch = precompute_by_length(
                 noise_type, specs, LENGTHS_KM, base_config,
-                noise_f_grid, osa_csv_path, fiber_params,
+                noise_f_grid, osa_csv_path, fiber_params, osa_center_freq_hz,
             )
             _cache_precomputed_result(all_by_idx, p, noise_type, list(specs.keys()), index_prefix="len")
             _POWER_CACHE[("len", p)] = all_by_idx
@@ -2345,7 +2404,7 @@ def precompute_by_length_all_powers(
                 executor.submit(
                     _precompute_length_worker,
                     p, noise_type, specs, LENGTHS_KM, base_config,
-                    noise_f_grid, osa_csv_path, fiber_params,
+                    noise_f_grid, osa_csv_path, fiber_params, osa_center_freq_hz,
                 ): p
                 for p in PRECOMPUTE_POWER_LEVELS
             }

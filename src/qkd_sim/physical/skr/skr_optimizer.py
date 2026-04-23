@@ -35,8 +35,8 @@ BOUNDS = [
 # 默认初始猜测 [mu_decoy, mu_signal, p_signal, P_X_alice]
 DEFAULT_X0 = [0.1, 0.5, 0.7, 0.9]
 
-# mu_signal > mu_decoy 的最小裕度
-EPSILON_FEASIBLE = 0.05
+# mu_signal > mu_decoy 的最小裕度（与 GitHub qkdsimulator.py 一致）
+EPSILON_FEASIBLE = 0.0001
 
 # 不可行区域惩罚值
 PENALTY = 1e30
@@ -140,8 +140,10 @@ class SKROptimizer:
             fun=lambda x: self._objective(x, distance_m),
             x0=np.array(x0, dtype=float),
             method="Nelder-Mead",
-            options={"maxiter": 2000, "adaptive": True, "fatol": 1e-12},
+            options={"maxiter": 100000, "adaptive": True, "fatol": 1e-8},
         )
+
+        print(f"  -> distance={distance_m/1e3:.1f}km nfev={result.nfev} success={result.success}")
 
         mu_decoy, mu_signal, p_signal, px_alice = self._decode_params(result.x)
         p_decoy = 1.0 - p_signal

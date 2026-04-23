@@ -356,6 +356,7 @@ def build_wdm_grid(
     f_grid: np.ndarray | None = None,
     osa_csv_path: str | Path | None = None,
     osa_rbw: float | None = None,
+    osa_center_freq_hz: float | None = None,
     classical_channel_indices: list[int] | None = None,
     modulation_format: str = "OOK",
 ) -> WDMGrid:
@@ -378,7 +379,7 @@ def build_wdm_grid(
 
     调制格式 (modulation_format) 对连续解析模型的影响：
       - "OOK"：classical 信道用 NRZ_OOK；OSA 默认用 spectrum_OOK.csv
-      - "16QAM"：classical 信道用 RAISED_COSINE；OSA 默认用 spectrum_16QAM.csv
+      - "DP-16QAM"：classical 信道用 RAISED_COSINE；OSA 默认用 spectrum_16QAM.csv
 
     OSA_SAMPLED 谱型：
       - 从 osa_csv_path 加载模板后，将峰值平移对齐到每个经典信道的 f_center
@@ -400,14 +401,14 @@ def build_wdm_grid(
         显式指定经典信道 ITU 信道号（1-based），如 [39, 40, 41] 表示 C39/C40/C41。
         为 None 时：classical = all_indices - quantum。
     modulation_format : str
-        调制格式，"OOK" 或 "16QAM"（默认 "OOK"）
+        调制格式，"OOK" 或 "DP-16QAM"（默认 "OOK"）
 
     Returns
     -------
     WDMGrid
     """
-    if modulation_format not in ("OOK", "16QAM"):
-        raise ValueError(f"modulation_format must be 'OOK' or '16QAM', got '{modulation_format}'")
+    if modulation_format not in ("OOK", "DP-16QAM"):
+        raise ValueError(f"modulation_format must be 'OOK' or 'DP-16QAM', got '{modulation_format}'")
 
     num_channels = int(config.num_channels)
     # ITU 信道号集合 = [start_channel, end_channel]（支持半整数 interleave）
@@ -445,7 +446,7 @@ def build_wdm_grid(
         analytic_stype = SpectrumType.RAISED_COSINE
         osa_default_name = "spectrum_16QAM.csv"
 
-    # OSA 模板预处理（峰值对齐至各信道 f_center）
+    # OSA 模板预处理（对齐至各信道 f_center）
     osa_offsets = None
     osa_template_psd = None
     if spectrum_type == SpectrumType.OSA_SAMPLED:
@@ -453,7 +454,11 @@ def build_wdm_grid(
             raise ValueError("OSA_SAMPLED requires osa_rbw")
         csv_path = osa_csv_path if osa_csv_path is not None else osa_default_name
         osa_f_raw, osa_psd_raw = load_osa_csv(Path(csv_path), osa_rbw)
-        template_center = float(osa_f_raw[int(np.argmax(osa_psd_raw))])
+        # Use passed center frequency; fallback to peak detection for backward compat
+        if osa_center_freq_hz is not None:
+            template_center = float(osa_center_freq_hz)
+        else:
+            template_center = float(osa_f_raw[int(np.argmax(osa_psd_raw))])
         osa_offsets = osa_f_raw - template_center  # 相对偏移
         osa_template_psd = osa_psd_raw
 

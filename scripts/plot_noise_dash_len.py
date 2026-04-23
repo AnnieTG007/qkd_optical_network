@@ -80,7 +80,9 @@ def _global_ranges(all_data: dict, model_keys: list[str]) -> tuple[tuple[float, 
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--type", default="fwm", choices=["fwm", "sprs", "both", "only_signal", "with_signal"])
-parser.add_argument("--modulation", default="16qam", choices=["ook", "16qam"])
+parser.add_argument("--modulation", default="dp-16qam", choices=["ook", "dp-16qam"])
+parser.add_argument("--data-rate", type=float, default=200e9,
+                    help="Bit rate [bps]. DP-16QAM default: 200e9 (200 Gbps); OOK default: 10.3e9 (10.3 Gbps)")
 parser.add_argument(
     "--export-excel",
     action="store_true",
@@ -97,7 +99,8 @@ add_strategy_cli_args(parser)
 ARGS = parser.parse_args()
 NOISE_TYPE = ARGS.type
 import scripts.dash_utils as _du
-_du.MODULATION_FORMAT = ARGS.modulation
+_du.MODULATION_FORMAT = ARGS.modulation.upper()
+_du.WDM_PARAMS["data_rate_bps"] = ARGS.data_rate
 
 # Fail fast if a stale Dash instance is still holding 8050 — otherwise app.run
 # would OSError after the full precompute and the browser would keep reading
@@ -120,7 +123,7 @@ print_compute_device()
 print(f"Precomputing ALL power levels for type={NOISE_TYPE}")
 t0 = time.time()
 
-osa_csv_path = _resolve_osa_csv(ARGS.modulation)
+osa_csv_path, osa_center_freq_hz = _resolve_osa_csv(ARGS.modulation)
 # base_quantum_indices_list: ITU G.694.1 channel numbers (1-based), e.g. [1, 2, ..., 61]
 base_quantum_indices_list = [
     itn
@@ -141,6 +144,7 @@ ALL_BY_LEN, VALID_INDICES = precompute_by_length_all_powers(
     noise_f_grid=noise_f_grid,
     osa_csv_path=osa_csv_path,
     fiber_params=FIBER_PARAMS,
+    osa_center_freq_hz=osa_center_freq_hz,
 )
 if not VALID_INDICES:
     raise RuntimeError(f"No valid channels found for noise type {NOISE_TYPE!r}")

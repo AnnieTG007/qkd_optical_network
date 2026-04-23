@@ -98,8 +98,8 @@ model_groups:
     - rc_beta05
     - osa
 
-  # ---- 16QAM 调制场景 ----
-  fwm_noise_16qam:
+  # ---- DP-16QAM 调制场景 ----
+  fwm_noise_dp-16qam:
     - discrete
     - rc_beta001
     - rc_beta05
@@ -119,7 +119,7 @@ model_groups:
     - osa_ook
 
   # ---- SpRS 噪声场景（与 FWM 共享相同模型规格） ----
-  sprs_noise_16qam:
+  sprs_noise_dp-16qam:
     - discrete
     - rc_beta001
     - rc_beta05

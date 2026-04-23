@@ -108,7 +108,9 @@ def _select_profile_lengths(lengths_km: np.ndarray, count: int | None) -> np.nda
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--type", default="fwm", choices=["fwm", "sprs", "both", "only_signal", "with_signal"])
-parser.add_argument("--modulation", default="16qam", choices=["ook", "16qam"])
+parser.add_argument("--modulation", default="dp-16qam", choices=["ook", "dp-16qam"])
+parser.add_argument("--data-rate", type=float, default=200e9,
+                    help="Bit rate [bps]. DP-16QAM default: 200e9 (200 Gbps); OOK default: 10.3e9 (10.3 Gbps)")
 parser.add_argument(
     "--profile-only",
     action="store_true",
@@ -137,6 +139,7 @@ ARGS = parser.parse_args()
 NOISE_TYPE = ARGS.type
 import scripts.dash_utils as _du
 _du.MODULATION_FORMAT = ARGS.modulation.upper()
+_du.WDM_PARAMS["data_rate_bps"] = ARGS.data_rate
 
 # Fail fast if a stale Dash instance is still holding 8051 — otherwise app.run
 # would OSError after the full precompute and the browser would keep reading
@@ -174,7 +177,7 @@ else:
 t0 = time.perf_counter()
 
 with profile_scope("startup: build config, frequency grid, model specs"):
-    osa_csv_path = _resolve_osa_csv(ARGS.modulation)
+    osa_csv_path, osa_center_freq_hz = _resolve_osa_csv(ARGS.modulation)
     # base_quantum_indices: ITU G.694.1 channel numbers (1-based)
     base_quantum_indices = [
         itn
@@ -203,6 +206,7 @@ ALL_BY_CH, VALID_L_INDICES = precompute_by_channel_all_powers(
     noise_f_grid=noise_f_grid,
     osa_csv_path=osa_csv_path,
     fiber_params=FIBER_PARAMS,
+    osa_center_freq_hz=osa_center_freq_hz,
 )
 if not VALID_L_INDICES:
     raise RuntimeError(f"No valid lengths found for noise type {NOISE_TYPE!r}")
@@ -479,7 +483,7 @@ def _make_figure(sweep: dict, l_idx: int) -> go.Figure:
                 name = f"{spec['label']} ({direction})"
                 legendgroup = f"{model_key}-{direction}"
 
-            if spec["continuous"] or NOISE_TYPE == "with_signal":
+            if spec["continuous"]:
                 mode = "lines"
                 line_cfg = dict(color=spec["color"], width=2.0, dash=dash_style)
                 marker_cfg = None

@@ -52,7 +52,7 @@ $$
 G_TX(f) 按升余弦滚降分布，滚降因子为 β_rolloff（0 ≤ β_rolloff ≤ 1）：
 
 $$
-\text{对于第n个信道，中心频率}\ f_n,\ \text{符号速率}\ R_s = B_s：
+\text{对于第n个信道，中心频率}\ f_n,\ \text{符号速率}\ R_s = B_s\ \text{（B_s 在 YAML 中定义为波特率，非信号带宽）}
 $$
 
 $$
@@ -95,7 +95,7 @@ $$
 G_{\text{TX}}(f) = \frac{P_{\text{ch}}}{R_b} \cdot \text{sinc}^2(\pi \Delta f \cdot T_b) \cdot |H(\Delta f)|^2
 $$
 
-其中 $\Delta f = f - f_n$，$T_b = 1/R_b$，$R_b = B_s$。
+其中 $\Delta f = f - f_n$，$T_b = 1/R_b$，$R_b = B_s$（NRZ-OOK 中 B_s 即为比特速率，$R_b = 10.3$ Gbps）。
 
 #### 接收滤波器：Butterworth 滤波器
 

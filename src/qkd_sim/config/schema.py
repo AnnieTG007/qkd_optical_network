@@ -102,7 +102,9 @@ class WDMConfig:
         信道总数（由 start_channel / end_channel 派生）。
         为兼容旧调用保留该字段；若显式传入，必须与派生值一致。
     B_s : float
-        信号带宽 / 符号速率 [Hz]
+        符号速率（波特率）[Hz]。DP-16QAM: 25 GBaud; NRZ-OOK: 10.3 GBaud
+    data_rate_bps : float
+        比特速率 [bps]。DP-16QAM: 200 Gbps; NRZ-OOK: 10.3 Gbps
     P0 : float
         单信道发射功率 [W]
     beta_rolloff : float
@@ -118,6 +120,7 @@ class WDMConfig:
     start_channel: float
     end_channel: float
     B_s: float
+    data_rate_bps: float
     P0: float
     beta_rolloff: float = 0.0
     ook_filter_order: int = 1          # NRZ-OOK Butterworth 滤波器阶数（m=1 退化为 Lorentzian）
@@ -131,6 +134,8 @@ class WDMConfig:
             raise ValueError("channel_spacing must be positive")
         if self.B_s <= 0.0:
             raise ValueError("B_s must be positive")
+        if self.data_rate_bps <= 0.0:
+            raise ValueError("data_rate_bps must be positive")
         if self.P0 < 0.0:
             raise ValueError("P0 must be non-negative")
 
@@ -311,6 +316,8 @@ class SKRConfig:
         epsilon_cor        : float  正确性参数 (ε_cor)
         epsilon_sec        : float  保密性参数 (ε_sec)
         concentration_method : str  浓度不等式方法："Hoeffding" 或 "Azuma"
+        improved_serfling  : bool  是否使用改进的 Serfling 不等式（Fung et al.），默认 False
+        fix_alice          : bool  True=N_alice 固定，False=N_bob 固定，默认 True
 
     __post_init__ 计算字段:
         IL       : float  插入损耗线性值 = 10^(-IL_dB/10)
@@ -344,6 +351,8 @@ class SKRConfig:
     epsilon_cor: float
     epsilon_sec: float
     concentration_method: str = "Hoeffding"
+    improved_serfling: bool = False  # 是否使用改进的 Serfling 不等式（Fung et al.）
+    fix_alice: bool = True  # True=N_alice 固定，False=N_bob 固定
 
     # 由 __post_init__ 计算
     IL: float = field(init=False, repr=False)
