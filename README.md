@@ -98,8 +98,6 @@ python scripts/plot_noise_dash_len.py --type=fwm --export-only
 # 生成: data/precomputed/noise_vs_length.xlsx     (每个 sheet = 一个量子信道)
 #       data/precomputed/simulation_report.txt
 
-# 信号功率谱
-python scripts/plot_signal_tx.py
 ```
 
 启动后访问：
@@ -269,7 +267,6 @@ src/qkd_sim/
 scripts/
 ├── plot_noise_dash_len.py # Dash App 1
 ├── plot_noise_dash_ch.py  # Dash App 2
-├── plot_signal_tx.py      # 信号功率谱
 └── dash_utils.py          # 共享常量和辅助函数
 docs/
 ├── formulas_signal.md     # 信号建模公式

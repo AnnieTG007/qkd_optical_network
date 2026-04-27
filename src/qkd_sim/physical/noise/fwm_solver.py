@@ -878,7 +878,7 @@ class DiscreteFWMSolver(NoiseSolver):
             integrand = (D ** 2) * eta * Gi * Gj * Gk
             integral_ij = np.sum(integrand) * df * df
 
-            G_fwd_psd = 4.0 * (gamma ** 2) * np.exp(-alpha1 * L) * integral_ij / 9.0
+            G_fwd_psd = (gamma ** 2) * np.exp(-alpha1 * L) * integral_ij / 9.0
             bw_q = self._target_noise_bandwidth(q_ch, df)
             P_fwd[iq] = G_fwd_psd * bw_q
 
@@ -1250,7 +1250,7 @@ class DiscreteFWMSolver(NoiseSolver):
                             ) * df * df
                             exp_factor = np.exp(-alpha1_j * L_batch)
                             out[start + j, L_start:L_end] = (
-                                4.0 * (fiber.gamma ** 2) * exp_factor * integral / 9.0
+                                (fiber.gamma ** 2) * exp_factor * integral / 9.0
                             )
                         else:
                             F_L_4d = _F_antiderivative_vec(
@@ -1451,7 +1451,7 @@ class DiscreteFWMSolver(NoiseSolver):
                     integrand = D2_3d * eta * Gi_3d * Gj_3d * Gk
                     # Sum over pump-pair axes (1, 2), result: (n_chunk,)
                     integral = xp.sum(integrand, axis=(1, 2)) * df * df
-                    out = (gamma ** 2 / 9.0) * 4.0 * exp_alpha1 * integral
+                    out = (gamma ** 2 / 9.0) * exp_alpha1 * integral
                 else:
                     # Backward: alpha1_chunk stays 1D so float(alpha1) works
                     F_L = _gpu_F_antiderivative(
@@ -1489,7 +1489,7 @@ class DiscreteFWMSolver(NoiseSolver):
                         integrand * valid_mask[:, :, :, xp.newaxis], axis=(1, 2)
                     ) * df * df  # (n_chunk, N_L)
                     exp_factor = xp.exp(-alpha1_chunk[:, xp.newaxis] * L_values_arr[xp.newaxis, :])  # (n_chunk, N_L)
-                    out[:] = (gamma ** 2 / 9.0) * 4.0 * exp_factor * integral_all
+                    out[:] = (gamma ** 2 / 9.0) * exp_factor * integral_all
                 else:
                     # alpha1_4d broadcasts to (n_chunk, N_a, N_a, N_L) — correct per-frequency alpha1
                     alpha1_broadcast = xp.broadcast_to(alpha1_4d, (n_chunk, N_a, N_a, N_L))

@@ -33,7 +33,7 @@ $$
 其中相位匹配因子 Δβ 的二阶展开近似为：
 
 $$
-\Delta\beta = \frac{2\pi\lambda^2}{c} |f_3 - f_2| \cdot |f_4 - f_1| \left[ D_c + \frac{\lambda^2}{2c}(|f_3 - f_2| + |f_4 - f_2|)\frac{dD_c}{d\lambda} \right]
+\Delta\beta = \frac{2\pi\lambda^2}{c} |f_3 - f_2| \cdot |f_4 - f_2| \left[ D_c + \frac{\lambda^2}{2c}(|f_3 - f_2| + |f_4 - f_2|)\frac{dD_c}{d\lambda} \right]
 $$
 
 其中：
