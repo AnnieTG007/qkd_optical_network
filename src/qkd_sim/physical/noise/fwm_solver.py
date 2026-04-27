@@ -1111,10 +1111,7 @@ class DiscreteFWMSolver(NoiseSolver):
                     alpha1 = alpha1_chunk[j]
                     Gk_j = Gk_T[j, :]  # (N_pairs,)
                     alpha_k_j = alpha_k_T[j, :]
-                    # Spectral pruning: f_k = f_i + f_j - f1 must fall within the pump grid
-                    fk_j = Fk[:, :, j]  # (N_a, N_a)
-                    spectral_valid = (fk_j >= pump_grid_f32[0]) & (fk_j <= pump_grid_f32[-1])
-                    valid_mask_2d = spectral_valid & (Gk_j > 0.0).reshape(N_a, N_a)
+                    valid_mask_2d = (Gk_j > 0.0).reshape(N_a, N_a)
 
                     if not np.any(valid_mask_2d):
                         out[start + j] = 0.0
@@ -1222,10 +1219,7 @@ class DiscreteFWMSolver(NoiseSolver):
                     for j in range(n_chunk):
                         Gk_j = Gk_T[j, :]  # (N_pairs,)
                         alpha_k_j = alpha_k_T[j, :]
-                        # Spectral pruning: f_k = f_i + f_j - f1 must fall within the pump grid
-                        fk_j = Fk[0, :, :, j]  # (N_a, N_a)
-                        spectral_valid = (fk_j >= pump_grid_f32[0]) & (fk_j <= pump_grid_f32[-1])
-                        valid_mask_2d = spectral_valid & (Gk_j > 0.0).reshape(N_a, N_a)
+                        valid_mask_2d = (Gk_j > 0.0).reshape(N_a, N_a)
                         if not np.any(valid_mask_2d):
                             continue
 
@@ -1401,10 +1395,7 @@ class DiscreteFWMSolver(NoiseSolver):
                 for j in range(n_chunk):
                     Gk_j = Gk_T[j, :]
                     alpha_k_j = alpha_k_T[j, :]
-                    # Spectral pruning: f_k = f_i + f_j - f1_j must fall within the pump grid
-                    fk_j = Fk[:, :, j]  # (N_a, N_a)
-                    spectral_valid = (fk_j >= pump_grid_f32[0]) & (fk_j <= pump_grid_f32[-1])
-                    valid_mask_2d = spectral_valid & (Gk_j > 0.0).reshape(N_a, N_a)
+                    valid_mask_2d = (Gk_j > 0.0).reshape(N_a, N_a)
                     if not np.any(valid_mask_2d):
                         continue
 
@@ -1505,10 +1496,7 @@ class DiscreteFWMSolver(NoiseSolver):
                     for j in range(n_chunk):
                         Gk_j = Gk_T[j, :]
                         alpha_k_j = alpha_k_T[j, :]
-                        # Spectral pruning: f_k = f_i + f_j - f1_j must fall within the pump grid
-                        fk_j = Fk[0, :, :, j]  # (N_a, N_a)
-                        spectral_valid = (fk_j >= pump_grid_f32[0]) & (fk_j <= pump_grid_f32[-1])
-                        valid_mask_2d = spectral_valid & (Gk_j > 0.0).reshape(N_a, N_a)
+                        valid_mask_2d = (Gk_j > 0.0).reshape(N_a, N_a)
                         if not np.any(valid_mask_2d):
                             continue
 
@@ -1714,12 +1702,8 @@ class DiscreteFWMSolver(NoiseSolver):
             f4_3d = xp.broadcast_to(Fj_f32[xp.newaxis, :, :], (n_chunk, N_a, N_a))
             delta_beta_3d = _gpu_phase_mismatch(f2_3d, f3_3d, f4_3d, D_c, D_slope)
 
-            # Spectral pruning: f_k = f_i + f_j - f1 must fall within the pump grid
-            # Fk: (N_a, N_a, n_chunk), transpose to match Gk shape
-            spectral_valid = (
-                (Fk >= pump_grid_f32[0]) & (Fk <= pump_grid_f32[-1])
-            ).transpose(2, 0, 1)  # → (n_chunk, N_a, N_a)
-            valid_mask = spectral_valid & (Gk > 0.0)
+            # Mask: Gk > 0 (valid pump pair)
+            valid_mask = Gk > 0.0  # (n_chunk, N_a, N_a)
 
             # delta_alpha: (n_chunk, N_a, N_a)
             da_3d = (
@@ -1958,12 +1942,8 @@ class DiscreteFWMSolver(NoiseSolver):
             f4_3d = xp.broadcast_to(Fj_f32[xp.newaxis, :, :], (n_chunk, N_a, N_a))
             delta_beta_3d = _gpu_phase_mismatch(f2_3d, f3_3d, f4_3d, D_c, D_slope)
 
-            # Spectral pruning: f_k = f_i + f_j - f1 must fall within the pump grid
-            # Fk: (N_a, N_a, n_chunk), Gk: (n_chunk, N_a, N_a) — transpose Fk to match
-            spectral_valid = (
-                (Fk >= pump_grid_f32[0]) & (Fk <= pump_grid_f32[-1])
-            ).transpose(2, 0, 1)  # → (n_chunk, N_a, N_a)
-            valid_mask = spectral_valid & (Gk > 0.0)
+            # Mask: Gk > 0 (valid pump pair)
+            valid_mask = Gk > 0.0
 
             da_3d = (
                 alpha_k
