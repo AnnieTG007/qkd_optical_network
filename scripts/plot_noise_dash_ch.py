@@ -136,6 +136,8 @@ parser.add_argument("--skr-profile", choices=["custom", "reference"], default="c
                     help="SKR config profile to use for SKR subplots and CSV export.")
 parser.add_argument("--resolution", type=float, default=1e9,
                     help="Noise frequency grid resolution [Hz]. Default: 1e9 (1 GHz).")
+parser.add_argument("--active-threshold-db", type=float, default=-50.0,
+                    help="FWM active frequency bin threshold [dB]. Default: -50.0.")
 add_strategy_cli_args(parser)
 ARGS = parser.parse_args()
 NOISE_TYPE = ARGS.type
@@ -143,6 +145,7 @@ import scripts.dash_utils as _du
 _du.MODULATION_FORMAT = ARGS.modulation.upper()
 _du.WDM_PARAMS["data_rate_bps"] = ARGS.data_rate
 _du.NOISE_GRID_RESOLUTION_HZ = ARGS.resolution
+_du.ACTIVE_THRESHOLD_DB = ARGS.active_threshold_db
 
 # SKR model override
 if ARGS.skr_model is not None:

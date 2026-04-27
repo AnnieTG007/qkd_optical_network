@@ -24,11 +24,17 @@ Python 循环，实现 ~10-100x 加速。
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 from qkd_sim.physical.fiber import Fiber
 from qkd_sim.physical.signal import SpectrumType, WDMGrid
 from qkd_sim.physical.noise.base import NoiseSolver
+
+# Diagnostic prints (N_active / chunk_size) only emitted when DEBUG_MODE is set.
+# Enable with `DEBUG_MODE=true` (PowerShell: `$env:DEBUG_MODE="true"`).
+_DEBUG_MODE: bool = os.environ.get("DEBUG_MODE", "").lower() in ("1", "true", "yes", "on")
 
 # GPU acceleration: lazily-imported so CPU-only environments are unaffected.
 _gpu_xp: "type | None" = None
@@ -365,8 +371,24 @@ class DiscreteFWMSolver(NoiseSolver):
     >>> P_bwd = solver.compute_backward(fiber, wdm_grid)  # shape (N_q,)
     """
 
-    def __init__(self, channel_spacing: float | None = None) -> None:
+    def __init__(
+        self,
+        channel_spacing: float | None = None,
+        active_threshold_db: float = -50.0,
+    ) -> None:
+        """Initialize DiscreteFWMSolver.
+
+        Parameters
+        ----------
+        channel_spacing : float or None
+            信道间隔 [Hz]。None 时从 wdm_grid 自动推断（要求等间隔）。
+        active_threshold_db : float
+            连续谱计算中活跃频率 bin 的相对阈值 [dB]。
+            G_min = G_tx.max() * 10^(threshold_db/10)。
+            默认 -50.0（即 1e-5）；收紧到 -40.0 可减少 ~50% N_active。
+        """
         self.channel_spacing = channel_spacing
+        self._active_threshold_db = active_threshold_db
         # 推断后缓存（首次调用时计算，后续直接复用）
         self._inferred_spacing: float | None = None
         # 拓扑级缓存：避免重复计算 FWM 有效三元组
@@ -819,7 +841,7 @@ class DiscreteFWMSolver(NoiseSolver):
         G_tx = self._build_total_classical_psd(wdm_grid, f_grid, df)
         alpha_grid = np.asarray(fiber.get_loss_at_freq(f_grid), dtype=np.float64)
 
-        G_min = G_tx.max() * 1e-5  # -50 dB relative threshold
+        G_min = G_tx.max() * 10 ** (self._active_threshold_db / 10.0)  # active threshold [dB]
         active = G_tx > G_min
         if not np.any(active):
             return np.zeros(len(q_chs), dtype=np.float64)
@@ -889,7 +911,7 @@ class DiscreteFWMSolver(NoiseSolver):
         G_tx = self._build_total_classical_psd(wdm_grid, f_grid, df)
         alpha_grid = np.asarray(fiber.get_loss_at_freq(f_grid), dtype=np.float64)
 
-        G_min = G_tx.max() * 1e-5  # -50 dB relative threshold
+        G_min = G_tx.max() * 10 ** (self._active_threshold_db / 10.0)  # active threshold [dB]
         active = G_tx > G_min
         if not np.any(active):
             return np.zeros(len(q_chs), dtype=np.float64)
@@ -998,7 +1020,7 @@ class DiscreteFWMSolver(NoiseSolver):
         G_tx = self._build_total_classical_psd(wdm_grid, f_grid, df)
         alpha_grid = np.asarray(fiber.get_loss_at_freq(f_grid), dtype=np.float64)
 
-        G_min = G_tx.max() * 1e-5  # -50 dB relative threshold
+        G_min = G_tx.max() * 10 ** (self._active_threshold_db / 10.0)  # active threshold [dB]
         active = G_tx > G_min
         if not np.any(active):
             if L_arr is None:
@@ -1044,12 +1066,13 @@ class DiscreteFWMSolver(NoiseSolver):
         N_pairs = N_a * N_a
         chunk_size = 10 if N_pairs * N_a > 50_000_000 else 50
 
-        N_L_diag = int(np.asarray(L_arr).size) if L_arr is not None else 1
-        print(
-            f"[fwm-cpu] {direction} N_active={N_a}/{n_f} "
-            f"({100.0 * N_a / max(n_f, 1):.1f}%) "
-            f"N_L={N_L_diag} chunk_size={chunk_size}"
-        )
+        if _DEBUG_MODE:
+            N_L_diag = int(np.asarray(L_arr).size) if L_arr is not None else 1
+            print(
+                f"[fwm-cpu] {direction} N_active={N_a}/{n_f} "
+                f"({100.0 * N_a / max(n_f, 1):.1f}%) "
+                f"N_L={N_L_diag} chunk_size={chunk_size}"
+            )
 
         def compute_for_length(L: float) -> np.ndarray:
             """Compute FWM spectrum for a single fiber length L [m]."""
@@ -1290,7 +1313,7 @@ class DiscreteFWMSolver(NoiseSolver):
         G_tx_cpu = self._build_total_classical_psd(wdm_grid, f_grid_cpu, df)
         alpha_grid_cpu = np.asarray(fiber.get_loss_at_freq(f_grid_cpu), dtype=np.float64)
 
-        G_min_cpu = G_tx_cpu.max() * 1e-5  # -50 dB relative threshold
+        G_min_cpu = G_tx_cpu.max() * 10 ** (self._active_threshold_db / 10.0)  # active threshold [dB]
         active_cpu = G_tx_cpu > G_min_cpu
         n_f = f_grid_cpu.size
         if not np.any(active_cpu):
@@ -1333,21 +1356,27 @@ class DiscreteFWMSolver(NoiseSolver):
         # Dynamic chunk_size: read GPU free VRAM and cap to ~40% for the
         # ~6 concurrent (n_chunk, N_a, N_a, N_L) float64 temporaries
         # (Gi/Gj/D/Gk/eta/integrand or F_L/F_0 in backward case).
+        # Also enforce a minimum budget of total*0.35 so chunk_size doesn't
+        # collapse to 1 when CuPy memory pool retains cached blocks across
+        # successive calls (mem_info would otherwise report falsely low free).
         try:
             import cupy as cp
-            free_bytes, _total_bytes = cp.cuda.Device().mem_info
-            budget_bytes = int(free_bytes * 0.4)
+            cp.get_default_memory_pool().free_all_blocks()
+            free_bytes, total_bytes = cp.cuda.Device().mem_info
+            min_budget = int(total_bytes * 0.35)
+            budget_bytes = max(int(free_bytes * 0.4), min_budget)
             bytes_per_chunk_unit = N_a * N_a * max(N_L_for_chunk, 1) * 8 * 6
             chunk_size = max(1, min(50, int(budget_bytes / max(bytes_per_chunk_unit, 1))))
         except Exception:
             # Fallback to legacy heuristic if mem_info unavailable.
             chunk_size = 10 if N_pairs * N_a > 50_000_000 else 50
 
-        print(
-            f"[fwm-gpu] {direction} N_active={N_a}/{n_f} "
-            f"({100.0 * N_a / max(n_f, 1):.1f}%) "
-            f"N_L={N_L_for_chunk} chunk_size={chunk_size}"
-        )
+        if _DEBUG_MODE:
+            print(
+                f"[fwm-gpu] {direction} N_active={N_a}/{n_f} "
+                f"({100.0 * N_a / max(n_f, 1):.1f}%) "
+                f"N_L={N_L_for_chunk} chunk_size={chunk_size}"
+            )
 
         # Extract fiber scalars for GPU phase-mismatch (avoids calling Fiber methods on GPU).
         D_c = float(fiber._D_c)

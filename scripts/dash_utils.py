@@ -18,6 +18,10 @@ from qkd_sim.physical.signal import build_wdm_grid
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _SCRIPT_DIR.parent
 
+# Diagnostic output gate. Enable via env var, e.g. PowerShell:
+#   $env:DEBUG_MODE="true"; python scripts/plot_noise_dash_ch.py ...
+_DEBUG_MODE: bool = os.environ.get("DEBUG_MODE", "").lower() in ("1", "true", "yes", "on")
+
 # WDM 参数从 YAML 加载，保持唯一真值
 _CONFIG_DIR = _PROJECT_ROOT / "src" / "qkd_sim" / "config"
 _YAML_WDM_PATH = _CONFIG_DIR / "defaults" / "wdm_para" / "wdm_100ghz.yaml"
@@ -255,6 +259,7 @@ def override_strategy_from_cli(strategy_name, num_classical, reference_channel):
 WDM_PARAMS = _load_wdm_params()
 CLASSICAL_INDICES = _load_classical_indices()
 NOISE_GRID_RESOLUTION_HZ = 1e9
+ACTIVE_THRESHOLD_DB = -50.0  # FWM active frequency bin threshold [dB]
 NOISE_FLOOR_W = 1e-23
 FREQ_GRID_PADDING_FACTOR = 1.5
 
@@ -672,11 +677,13 @@ _GPU_STATUS_PRINTED: bool = False
 
 
 def _print_gpu_status_once() -> None:
-    """One-shot diagnostic print of GPU availability and free VRAM."""
+    """One-shot diagnostic print of GPU availability and free VRAM (DEBUG_MODE only)."""
     global _GPU_STATUS_PRINTED
     if _GPU_STATUS_PRINTED:
         return
     _GPU_STATUS_PRINTED = True
+    if not _DEBUG_MODE:
+        return
     try:
         from qkd_sim.utils.gpu_utils import GPU_ENABLED
         if GPU_ENABLED:
@@ -1393,7 +1400,7 @@ def _compute_noise_power_pair(
         )
 
     if noise_type in ("fwm", "both"):
-        solver = DiscreteFWMSolver()
+        solver = DiscreteFWMSolver(active_threshold_db=ACTIVE_THRESHOLD_DB)
         f_i, b_i = _call_solver(solver)
         fwd += f_i
         bwd += b_i
@@ -1435,7 +1442,7 @@ def _compute_noise_spectrum_pair(
     bwd = np.zeros((n_f, n_l), dtype=np.float64)
 
     if noise_type in ("fwm", "both"):
-        solver = DiscreteFWMSolver()
+        solver = DiscreteFWMSolver(active_threshold_db=ACTIVE_THRESHOLD_DB)
         fwm_fwd = solver.compute_fwm_spectrum_conti(
             fiber, grid, f_grid, direction="forward", L_arr=L_arr
         )

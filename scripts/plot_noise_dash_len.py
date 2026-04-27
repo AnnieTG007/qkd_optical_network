@@ -95,11 +95,14 @@ parser.add_argument(
 )
 parser.add_argument("--skr-profile", choices=["custom", "reference"], default="custom",
                     help="SKR config profile to use for SKR subplots and CSV export.")
+parser.add_argument("--active-threshold-db", type=float, default=-50.0,
+                    help="FWM active frequency bin threshold [dB]. Default: -50.0.")
 add_strategy_cli_args(parser)
 ARGS = parser.parse_args()
 NOISE_TYPE = ARGS.type
 import scripts.dash_utils as _du
 _du.MODULATION_FORMAT = ARGS.modulation.upper()
+_du.ACTIVE_THRESHOLD_DB = ARGS.active_threshold_db
 
 # SKR model override
 if ARGS.skr_model is not None:
