@@ -213,6 +213,13 @@ def add_strategy_cli_args(parser):
         default=None,
         help="1-based ITU G.694.1 reference channel number (e.g. 35 = C35)",
     )
+    parser.add_argument(
+        "--skr-model",
+        type=str,
+        default=None,
+        choices=["infinite", "approx_finite", "strict_finite"],
+        help="SKR model for display (overrides default_skr_model from YAML)",
+    )
 
 
 def override_strategy_from_cli(strategy_name, num_classical, reference_channel):
@@ -247,7 +254,7 @@ def override_strategy_from_cli(strategy_name, num_classical, reference_channel):
 
 WDM_PARAMS = _load_wdm_params()
 CLASSICAL_INDICES = _load_classical_indices()
-NOISE_GRID_RESOLUTION_HZ = 5e9
+NOISE_GRID_RESOLUTION_HZ = 1e9
 NOISE_FLOOR_W = 1e-23
 FREQ_GRID_PADDING_FACTOR = 1.5
 
@@ -659,6 +666,34 @@ def profile_scope(label: str) -> Iterator[None]:
 def _get_mp_workers() -> int:
     """Number of worker processes for precomputation."""
     return max(1, os.cpu_count() or 1)
+
+
+_GPU_STATUS_PRINTED: bool = False
+
+
+def _print_gpu_status_once() -> None:
+    """One-shot diagnostic print of GPU availability and free VRAM."""
+    global _GPU_STATUS_PRINTED
+    if _GPU_STATUS_PRINTED:
+        return
+    _GPU_STATUS_PRINTED = True
+    try:
+        from qkd_sim.utils.gpu_utils import GPU_ENABLED
+        if GPU_ENABLED:
+            try:
+                import cupy as cp
+                free_b, total_b = cp.cuda.Device().mem_info
+                dev_id = cp.cuda.Device().id
+                print(
+                    f"[gpu] is_gpu=True device={dev_id} "
+                    f"free={free_b / 1024**3:.2f} GiB / total={total_b / 1024**3:.2f} GiB"
+                )
+            except Exception as exc:
+                print(f"[gpu] is_gpu=True (mem_info unavailable: {exc!r})")
+        else:
+            print("[gpu] is_gpu=False — solvers will fall back to CPU NumPy path")
+    except Exception as exc:
+        print(f"[gpu] status check failed: {exc!r}")
 
 
 # --- Worker functions for multiprocessing (must be module-level for Windows spawn) ---
@@ -2085,6 +2120,8 @@ def precompute_by_channel_all_powers(
     """
     import multiprocessing
 
+    _print_gpu_status_once()
+
     with profile_scope("precompute_by_channel_all_powers: clear stale CSV cache"):
         _clear_precomputed_csv_files("ch")
         _POWER_CACHE.clear()
@@ -2223,18 +2260,28 @@ def precompute_by_channel_all_powers(
                 for li in range(n_l_ws)
             }
             x_base_ws: dict = {mk: np.asarray(noise_f_grid, dtype=np.float64) for mk in model_keys_ws}
-            for li, length_km in enumerate(LENGTHS_KM):
-                fiber_t4 = _make_fiber(fiber_params, length_km)
-                for mk in model_keys_ws:
-                    if mk not in grid_cache_t4:
-                        continue
-                    grid_t4 = grid_cache_t4[mk]
-                    fwm_fwd, fwm_bwd = _compute_noise_spectrum_pair("fwm", fiber_t4, grid_t4, noise_f_grid)
-                    sprs_fwd, sprs_bwd = _compute_noise_spectrum_pair("sprs", fiber_t4, grid_t4, noise_f_grid)
-                    fwm_base_ws[li][mk]["fwd"] = np.asarray(fwm_fwd * df, dtype=np.float64)
-                    fwm_base_ws[li][mk]["bwd"] = np.asarray(fwm_bwd * df, dtype=np.float64)
-                    sprs_base_ws[li][mk]["fwd"] = np.asarray(sprs_fwd * df, dtype=np.float64)
-                    sprs_base_ws[li][mk]["bwd"] = np.asarray(sprs_bwd * df, dtype=np.float64)
+            L_arr_ws = np.asarray(LENGTHS_KM, dtype=np.float64) * 1e3  # (N_L,)
+            fiber_t4 = _make_fiber(fiber_params, float(LENGTHS_KM[0]))  # L only for metadata; actual lengths via L_arr
+
+            for mk in model_keys_ws:
+                if mk not in grid_cache_t4:
+                    continue
+                grid_t4 = grid_cache_t4[mk]
+
+                with profile_scope(f"FWM L_arr batch [{mk}]"):
+                    fwm_fwd_all, fwm_bwd_all = _compute_noise_spectrum_pair(
+                        "fwm", fiber_t4, grid_t4, noise_f_grid, L_arr=L_arr_ws
+                    )  # (N_f, N_L)
+                with profile_scope(f"SpRS L_arr batch [{mk}]"):
+                    sprs_fwd_all, sprs_bwd_all = _compute_noise_spectrum_pair(
+                        "sprs", fiber_t4, grid_t4, noise_f_grid, L_arr=L_arr_ws
+                    )  # (N_f, N_L)
+
+                for li in range(n_l_ws):
+                    fwm_base_ws[li][mk]["fwd"] = np.asarray(fwm_fwd_all[:, li] * df, dtype=np.float64)
+                    fwm_base_ws[li][mk]["bwd"] = np.asarray(fwm_bwd_all[:, li] * df, dtype=np.float64)
+                    sprs_base_ws[li][mk]["fwd"] = np.asarray(sprs_fwd_all[:, li] * df, dtype=np.float64)
+                    sprs_base_ws[li][mk]["bwd"] = np.asarray(sprs_bwd_all[:, li] * df, dtype=np.float64)
         base_valid_l_ws = [
             li for li in range(n_l_ws)
             if any(
@@ -2345,6 +2392,8 @@ def precompute_by_length_all_powers(
     Returns (all_by_len at 0 dBm, valid_ch_indices).
     """
     import multiprocessing
+
+    _print_gpu_status_once()
 
     _clear_precomputed_csv_files("len")
     _POWER_CACHE.clear()

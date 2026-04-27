@@ -773,7 +773,11 @@ class DiscreteSPRSSolver(NoiseSolver):
         base_2d = np.asarray(G_pump, dtype=np.float64).reshape(1, -1) * sigma_2d
 
         out = np.zeros((f_grid.size, L_values.size), dtype=np.float64)
-        max_l_batch = 4
+        # Limit intermediate (N_f, N_f, batch) array memory usage.
+        # Each such array uses N_f² × batch × 8 bytes.  Target ≤ 256 MB.
+        _MAX_SPRS_TMP_MB = 256
+        _bytes_per_batch = f_grid.size * f_grid.size * 8
+        max_l_batch = max(1, int((_MAX_SPRS_TMP_MB * 1024 * 1024) / max(_bytes_per_batch, 1)))
         for start in range(0, L_values.size, max_l_batch):
             stop = min(start + max_l_batch, L_values.size)
             L_batch = L_values[start:stop].reshape(1, 1, -1)

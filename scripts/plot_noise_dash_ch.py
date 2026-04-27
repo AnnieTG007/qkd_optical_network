@@ -134,12 +134,19 @@ parser.add_argument(
 )
 parser.add_argument("--skr-profile", choices=["custom", "reference"], default="custom",
                     help="SKR config profile to use for SKR subplots and CSV export.")
+parser.add_argument("--resolution", type=float, default=1e9,
+                    help="Noise frequency grid resolution [Hz]. Default: 1e9 (1 GHz).")
 add_strategy_cli_args(parser)
 ARGS = parser.parse_args()
 NOISE_TYPE = ARGS.type
 import scripts.dash_utils as _du
 _du.MODULATION_FORMAT = ARGS.modulation.upper()
 _du.WDM_PARAMS["data_rate_bps"] = ARGS.data_rate
+_du.NOISE_GRID_RESOLUTION_HZ = ARGS.resolution
+
+# SKR model override
+if ARGS.skr_model is not None:
+    _du.DEFAULT_SKR_MODEL_KEY = ARGS.skr_model
 
 # Fail fast if a stale Dash instance is still holding 8051 — otherwise app.run
 # would OSError after the full precompute and the browser would keep reading

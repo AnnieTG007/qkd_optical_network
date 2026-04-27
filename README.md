@@ -75,7 +75,8 @@ print("SpRS 前向噪声:", noise["sprs_fwd"])
 | 参数 | 说明 |
 |------|------|
 | `--type` | 噪声类型：`fwm`, `sprs`, `both`, `only_signal`, `with_signal` |
-| `--modulation` | 调制格式：`16qam`（默认，Raised Cosine + OSA 16QAM），`ook`（NRZ-OOK + OSA OOK）|
+| `--modulation` | 调制格式：`16qam`（默认，Raised Cosine + OSA 16QAM），`ook`（NRZ-OOK + OSA OOK），`dp-16qam` |
+| `--skr-model` | SKR 模型：`approx_finite`（默认），`infinite`，`strict_finite` |
 | `--export-excel` | 预计算后导出 Excel 文件并退出（不启动 Dash 服务器） |
 | `--export-only` | `--export-excel` 的简写 |
 
@@ -205,6 +206,23 @@ python scripts/plot_skr_optimization_vs_distance.py --profile=reference
 # 指定自定义 YAML（覆盖 --profile 默认路径）
 python scripts/plot_skr_vs_distance.py --skr-config=/path/to/my_config.yaml --profile=custom
 ```
+
+#### SKR 模型选择
+
+噪声-vs-频率 / 噪声-vs-长度 Dash 脚本（`plot_noise_dash_ch.py` 和 `plot_noise_dash_len.py`）在 `--type=with_signal` 时会显示 SKR 子图。默认使用 **approx_finite**（近似有限长）模型。可通过 `--skr-model` 参数切换：
+
+```bash
+# 无限长密钥模型（无有限长效应，SKR 最高）
+python scripts/plot_noise_dash_ch.py --type=with_signal --modulation=dp-16qam --skr-model=infinite
+
+# 近似有限长模型（默认，3-state decoy + Gaussian 修正）
+python scripts/plot_noise_dash_ch.py --type=with_signal --modulation=dp-16qam --skr-model=approx_finite
+
+# 严格有限长模型（1-decoy + Hoeffding/Azuma 不等式，SKR 最低）
+python scripts/plot_noise_dash_len.py --type=with_signal --modulation=dp-16qam --skr-model=strict_finite
+```
+
+三个模型的数学公式见 `docs/formulas_skr.md`，实现见 `src/qkd_sim/physical/skr/skr_decoy_bb84.py`。
 
 #### 块长模式（Block Length）
 

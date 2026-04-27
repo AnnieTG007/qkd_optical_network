@@ -16,7 +16,7 @@ data_rate_bps: 2.0e+11       # 比特速率 [bps]（200 Gbps DP-16QAM；NRZ-OOK 
                               # DP-16QAM: data_rate = 8 × B_s（4 bits/symbol × 2 polarizations）
                               # NRZ-OOK: data_rate = B_s（1 bit/symbol）；带宽 B ≈ 2 × data_rate（sinc² 主瓣）
 P0: 1.0e-3                    # 单信道发射功率 [W]（0 dBm）
-beta_rolloff: 0.0             # 升余弦滚降因子（0=矩形谱）
+beta_rolloff: 0.75             # 升余弦滚降因子（0=矩形谱）
 ook_filter_order: 5            # NRZ-OOK Butterworth 滤波器阶数（m=2，默认 1 退化为 Lorentzian）
 quantum_channel_indices: []     # 量子信道索引（空=全部为经典）
 # 经典泵浦信道 — strategy 与 indices 二选一，indices 有值时忽略 strategy
@@ -25,7 +25,7 @@ classical_channel_indices:   # null = 使用 strategy；直接指定如 [38, 39,
 classical_channel_strategy:
   name: "equal_interval"
   reference_channel: 35   # ITU G.694.1 C35 = 193.5 THz（量子信道参考点，自身不算经典泵浦）
-  num_classical: 3        # 低频侧取 3 个连续 ITU 信道
+  num_classical: 9        # 低频侧取 3 个连续 ITU 信道
   reserved:
     - name: "sync"
       channel: 33         # ITU C33 保留（保护带宽 100 GHz，下方经典信道不与其冲突则可用）

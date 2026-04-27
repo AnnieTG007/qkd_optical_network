@@ -100,6 +100,11 @@ ARGS = parser.parse_args()
 NOISE_TYPE = ARGS.type
 import scripts.dash_utils as _du
 _du.MODULATION_FORMAT = ARGS.modulation.upper()
+
+# SKR model override
+if ARGS.skr_model is not None:
+    _du.DEFAULT_SKR_MODEL_KEY = ARGS.skr_model
+
 _du.WDM_PARAMS["data_rate_bps"] = ARGS.data_rate
 
 # Fail fast if a stale Dash instance is still holding 8050 — otherwise app.run

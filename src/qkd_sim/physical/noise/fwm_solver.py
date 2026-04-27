@@ -1044,6 +1044,13 @@ class DiscreteFWMSolver(NoiseSolver):
         N_pairs = N_a * N_a
         chunk_size = 10 if N_pairs * N_a > 50_000_000 else 50
 
+        N_L_diag = int(np.asarray(L_arr).size) if L_arr is not None else 1
+        print(
+            f"[fwm-cpu] {direction} N_active={N_a}/{n_f} "
+            f"({100.0 * N_a / max(n_f, 1):.1f}%) "
+            f"N_L={N_L_diag} chunk_size={chunk_size}"
+        )
+
         def compute_for_length(L: float) -> np.ndarray:
             """Compute FWM spectrum for a single fiber length L [m]."""
             out = np.zeros(n_f, dtype=np.float64)
@@ -1321,7 +1328,26 @@ class DiscreteFWMSolver(NoiseSolver):
 
         N_a = Fi_f32.shape[0]
         N_pairs = N_a * N_a
-        chunk_size = 10 if N_pairs * N_a > 50_000_000 else 50
+        N_L_for_chunk = int(np.asarray(L_arr).size) if L_arr is not None else 1
+
+        # Dynamic chunk_size: read GPU free VRAM and cap to ~40% for the
+        # ~6 concurrent (n_chunk, N_a, N_a, N_L) float64 temporaries
+        # (Gi/Gj/D/Gk/eta/integrand or F_L/F_0 in backward case).
+        try:
+            import cupy as cp
+            free_bytes, _total_bytes = cp.cuda.Device().mem_info
+            budget_bytes = int(free_bytes * 0.4)
+            bytes_per_chunk_unit = N_a * N_a * max(N_L_for_chunk, 1) * 8 * 6
+            chunk_size = max(1, min(50, int(budget_bytes / max(bytes_per_chunk_unit, 1))))
+        except Exception:
+            # Fallback to legacy heuristic if mem_info unavailable.
+            chunk_size = 10 if N_pairs * N_a > 50_000_000 else 50
+
+        print(
+            f"[fwm-gpu] {direction} N_active={N_a}/{n_f} "
+            f"({100.0 * N_a / max(n_f, 1):.1f}%) "
+            f"N_L={N_L_for_chunk} chunk_size={chunk_size}"
+        )
 
         # Extract fiber scalars for GPU phase-mismatch (avoids calling Fiber methods on GPU).
         D_c = float(fiber._D_c)
