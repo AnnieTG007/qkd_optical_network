@@ -2,6 +2,8 @@
 
 光纤量子密钥分发（QKD）网络的物理层噪声建模与网络层资源分配仿真平台。
 
+> **文档说明**：架构详细定义见 [.claude/architecture.md](.claude/architecture.md)。CLAUDE.md 为 Claude Code 使用指南，AGENTS.md 为 Codex 使用指南，两者互为镜像。
+
 ## 物理层建模
 
 - **FWM**（四波混频）噪声：离散信道模型 + 连续 PSD 模型
@@ -56,7 +58,7 @@ wdm_cfg = WDMConfig(
     channel_spacing=100e9,
     B_s=32e9,
     P0=1e-3,
-    quantum_channel_indices=[38, 39, 40, 41],  # zero-based
+    quantum_channel_indices=[38, 39, 40, 41],  # 1-based ITU G.694.1 信道号（C38=193.8THz 等）
 )
 
 fiber = Fiber(fiber_cfg)
@@ -139,10 +141,10 @@ wdm_cfg = WDMConfig(
 
 #### 经典信道位置
 
-修改 `wdm_para/wdm_100ghz.yaml` 中的 `classical_channel_indices`（zero-based 索引）：
+修改 `wdm_para/wdm_100ghz.yaml` 中的 `classical_channel_indices`（1-based ITU G.694.1 信道号）：
 ```yaml
-classical_channel_indices: [38, 39, 40]   # 默认：C39/C40/C41（193.9–194.1 THz）
-classical_channel_indices: [30, 31, 32]    # C31/C32/C33（193.1–193.3 THz）
+classical_channel_indices: [38, 39, 40]   # 默认：C38/C39/C40（193.8–194.0 THz）
+classical_channel_indices: [30, 31, 32]    # C30/C31/C32（193.0–193.2 THz）
 ```
 
 #### 调制格式
@@ -168,7 +170,7 @@ python scripts/plot_noise_dash_ch.py \
 |------|------|
 | `--strategy-name` | `equal_interval`（低频侧连续）或 `interleave`（半频间隔） |
 | `--num-classical` | 经典信道数量 |
-| `--reference-channel` | zero-based 参考信道索引（C35 = 34） |
+| `--reference-channel` | 1-based ITU G.694.1 参考信道号（C35 = 35） |
 
 保留约束（sync/reference 信道及其保护带宽）在 `wdm_100ghz.yaml` 的 `classical_channel_strategy.reserved` 中配置。
 

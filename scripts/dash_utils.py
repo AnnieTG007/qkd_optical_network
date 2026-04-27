@@ -1443,11 +1443,8 @@ def _compute_noise_spectrum_pair(
 
     if noise_type in ("fwm", "both"):
         solver = DiscreteFWMSolver(active_threshold_db=ACTIVE_THRESHOLD_DB)
-        fwm_fwd = solver.compute_fwm_spectrum_conti(
-            fiber, grid, f_grid, direction="forward", L_arr=L_arr
-        )
-        fwm_bwd = solver.compute_fwm_spectrum_conti(
-            fiber, grid, f_grid, direction="backward", L_arr=L_arr
+        fwm_fwd, fwm_bwd = solver.compute_fwm_spectrum_conti_pair(
+            fiber, grid, f_grid, L_arr=L_arr
         )
         if L_arr is None:
             fwd[:, 0] += fwm_fwd

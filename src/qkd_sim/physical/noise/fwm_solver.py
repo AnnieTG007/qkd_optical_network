@@ -1111,7 +1111,10 @@ class DiscreteFWMSolver(NoiseSolver):
                     alpha1 = alpha1_chunk[j]
                     Gk_j = Gk_T[j, :]  # (N_pairs,)
                     alpha_k_j = alpha_k_T[j, :]
-                    valid_mask_2d = (Gk_j > 0.0).reshape(N_a, N_a)
+                    # Spectral pruning: f_k = f_i + f_j - f1 must fall within the pump grid
+                    fk_j = Fk[:, :, j]  # (N_a, N_a)
+                    spectral_valid = (fk_j >= pump_grid_f32[0]) & (fk_j <= pump_grid_f32[-1])
+                    valid_mask_2d = spectral_valid & (Gk_j > 0.0).reshape(N_a, N_a)
 
                     if not np.any(valid_mask_2d):
                         out[start + j] = 0.0
@@ -1219,7 +1222,10 @@ class DiscreteFWMSolver(NoiseSolver):
                     for j in range(n_chunk):
                         Gk_j = Gk_T[j, :]  # (N_pairs,)
                         alpha_k_j = alpha_k_T[j, :]
-                        valid_mask_2d = (Gk_j > 0.0).reshape(N_a, N_a)
+                        # Spectral pruning: f_k = f_i + f_j - f1 must fall within the pump grid
+                        fk_j = Fk[0, :, :, j]  # (N_a, N_a)
+                        spectral_valid = (fk_j >= pump_grid_f32[0]) & (fk_j <= pump_grid_f32[-1])
+                        valid_mask_2d = spectral_valid & (Gk_j > 0.0).reshape(N_a, N_a)
                         if not np.any(valid_mask_2d):
                             continue
 
@@ -1277,6 +1283,289 @@ class DiscreteFWMSolver(NoiseSolver):
 
         L_values = np.asarray(L_arr, dtype=np.float64).reshape(-1)
         return compute_vectorized_L(L_values)
+
+    # -------------------------------------------------------------------------
+    # Merged forward/backward: compute both directions in one pass
+    # -------------------------------------------------------------------------
+
+    def compute_fwm_spectrum_conti_pair(
+        self,
+        fiber: Fiber,
+        wdm_grid: WDMGrid,
+        f_grid: np.ndarray,
+        L_arr: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Compute FWM forward and backward PSD simultaneously, sharing all intermediates.
+
+        Returns the same shapes as compute_fwm_spectrum_conti() × 2 but avoids
+        duplicating G_tx, alpha_grid, active mask, Fi/Fj/Gi/Gj/alpha_i/alpha_j/D/
+        Fk_ij, pump lookups, and per-chunk Fk/Gk/alpha_k/delta_beta.
+
+        Returns
+        -------
+        (fwd, bwd), each shape (N_f,) or (N_f, N_L)
+        """
+        xp_placeholder, is_gpu = _get_gpu_module()
+        if is_gpu:
+            return self.compute_fwm_spectrum_conti_pair_gpu(
+                fiber, wdm_grid, f_grid, L_arr=L_arr
+            )
+
+        # ---- Shared pre-computation (identical to single-direction path) ----
+        f_grid = np.asarray(f_grid, dtype=np.float64)
+        self._validate_frequency_grid(f_grid)
+
+        df = float(np.mean(np.diff(f_grid)))
+        G_tx = self._build_total_classical_psd(wdm_grid, f_grid, df)
+        alpha_grid = np.asarray(fiber.get_loss_at_freq(f_grid), dtype=np.float64)
+
+        G_min = G_tx.max() * 10 ** (self._active_threshold_db / 10.0)
+        active = G_tx > G_min
+        n_f = f_grid.size
+        if not np.any(active):
+            if L_arr is None:
+                return (
+                    np.zeros_like(f_grid, dtype=np.float64),
+                    np.zeros_like(f_grid, dtype=np.float64),
+                )
+            L_values = np.asarray(L_arr, dtype=np.float64).reshape(-1)
+            return (
+                np.zeros((n_f, L_values.size), dtype=np.float64),
+                np.zeros((n_f, L_values.size), dtype=np.float64),
+            )
+
+        f_active = f_grid[active]
+        G_active = G_tx[active]
+        alpha_active = alpha_grid[active]
+
+        Fi, Fj = np.meshgrid(f_active, f_active, indexing="ij")
+        Gi, Gj = np.meshgrid(G_active, G_active, indexing="ij")
+        alpha_i, alpha_j = np.meshgrid(alpha_active, alpha_active, indexing="ij")
+        D = np.where(np.abs(Fi - Fj) <= 0.5 * df, 3.0, 6.0)
+        Fk_ij = Fi + Fj
+
+        Fi_f32 = Fi.astype(np.float64)
+        Fj_f32 = Fj.astype(np.float64)
+        Gi_f32 = Gi.astype(np.float64)
+        Gj_f32 = Gj.astype(np.float64)
+        alpha_i_f32 = alpha_i.astype(np.float64)
+        alpha_j_f32 = alpha_j.astype(np.float64)
+        D_f32 = D.astype(np.float64)
+        Fk_ij_f32 = (Fi_f32 + Fj_f32).astype(np.float64)
+        Fi_f64 = Fi_f32.astype(np.float64)
+        Fj_f64 = Fj_f32.astype(np.float64)
+
+        pump_grid_f32 = f_grid.astype(np.float64)
+        pump_G_f32 = G_tx.astype(np.float64)
+        alpha_grid_f32 = alpha_grid.astype(np.float64)
+
+        N_a = Fi_f32.shape[0]
+        N_pairs = N_a * N_a
+        chunk_size = 10 if N_pairs * N_a > 50_000_000 else 50
+
+        if _DEBUG_MODE:
+            N_L_diag = int(np.asarray(L_arr).size) if L_arr is not None else 1
+            print(
+                f"[fwm-cpu-pair] N_active={N_a}/{n_f} "
+                f"({100.0 * N_a / max(n_f, 1):.1f}%) "
+                f"N_L={N_L_diag} chunk_size={chunk_size}"
+            )
+
+        # ---- Scalar L: inner loop computes both directions from shared Fk/Gk/alpha_k ----
+        def compute_for_length_pair(L: float) -> tuple[np.ndarray, np.ndarray]:
+            out_fwd = np.zeros(n_f, dtype=np.float64)
+            out_bwd = np.zeros(n_f, dtype=np.float64)
+            alpha1_full = fiber.get_loss_at_freq(f_grid)
+
+            for start in range(0, n_f, chunk_size):
+                end = min(start + chunk_size, n_f)
+                f1_chunk = f_grid[start:end]
+                n_chunk = end - start
+                alpha1_chunk = alpha1_full[start:end]
+
+                Fk = Fk_ij_f32[:, :, np.newaxis] - f1_chunk[np.newaxis, np.newaxis, :]
+                Fk_T = Fk.transpose(2, 0, 1).reshape(n_chunk, -1)
+                sorted_idx = np.clip(
+                    np.searchsorted(pump_grid_f32, Fk_T), 1, len(pump_grid_f32) - 1
+                )
+                x0 = pump_grid_f32[sorted_idx - 1]
+                x1 = pump_grid_f32[sorted_idx]
+                y0 = pump_G_f32[sorted_idx - 1]
+                y1 = pump_G_f32[sorted_idx]
+                t = np.clip((Fk_T - x0) / (x1 - x0), 0.0, 1.0)
+                Gk_T = (y0 + (y1 - y0) * t).astype(np.float64)
+                a0 = alpha_grid_f32[sorted_idx - 1]
+                a1_arr = alpha_grid_f32[sorted_idx]
+                alpha_k_T = (a0 + (a1_arr - a0) * t).astype(np.float64)
+
+                for j in range(n_chunk):
+                    Gk_j = Gk_T[j, :]
+                    alpha_k_j = alpha_k_T[j, :]
+                    # Spectral pruning: f_k = f_i + f_j - f1_j must fall within the pump grid
+                    fk_j = Fk[:, :, j]  # (N_a, N_a)
+                    spectral_valid = (fk_j >= pump_grid_f32[0]) & (fk_j <= pump_grid_f32[-1])
+                    valid_mask_2d = spectral_valid & (Gk_j > 0.0).reshape(N_a, N_a)
+                    if not np.any(valid_mask_2d):
+                        continue
+
+                    Gk_2d = Gk_j.reshape(N_a, N_a)
+                    alpha_k_2d = alpha_k_j.reshape(N_a, N_a)
+                    alpha1 = float(alpha1_chunk[j])
+                    f1_j = float(f1_chunk[j])
+
+                    delta_alpha = alpha_k_2d + alpha_i_f32 + alpha_j_f32 - alpha1
+                    delta_beta = fiber.get_phase_mismatch(
+                        f2=(Fk_ij_f32 - f1_j).astype(np.float64),
+                        f3=Fi_f64,
+                        f4=Fj_f64,
+                    )
+
+                    # Forward
+                    eta = _fwm_efficiency(
+                        delta_alpha=delta_alpha.astype(np.float64),
+                        delta_beta=delta_beta,
+                        L=L,
+                    )
+                    integrand_fwd = (D_f32 ** 2) * eta * Gi_f32 * Gj_f32 * Gk_2d
+                    integral_fwd = np.sum(integrand_fwd[valid_mask_2d]) * df * df
+                    out_fwd[start + j] = (
+                        4.0 * (fiber.gamma ** 2)
+                        * np.exp(-alpha1 * L)
+                        * integral_fwd
+                        / 9.0
+                    )
+
+                    # Backward: F(l) antiderivative difference
+                    F_L = _F_antiderivative(
+                        l=np.full_like(delta_alpha, L),
+                        z_obs=0.0,
+                        alpha1=alpha1,
+                        delta_alpha=delta_alpha,
+                        delta_beta=delta_beta,
+                        L=L,
+                    )
+                    F_0 = _F_antiderivative(
+                        l=np.zeros_like(delta_alpha),
+                        z_obs=0.0,
+                        alpha1=alpha1,
+                        delta_alpha=delta_alpha,
+                        delta_beta=delta_beta,
+                        L=L,
+                    )
+                    integrand_bwd = (D_f32 ** 2) * Gi_f32 * Gj_f32 * Gk_2d * (F_L - F_0)
+                    integral_bwd = np.sum(integrand_bwd[valid_mask_2d]) * df * df
+                    out_bwd[start + j] = (
+                        fiber.rayleigh_coeff * (fiber.gamma ** 2) * integral_bwd / 9.0
+                    )
+
+            return out_fwd, out_bwd
+
+        # ---- Vectorized L: broadcast over L, compute both directions per chunk ----
+        _MAX_L_BATCH: int = 4
+
+        def compute_vectorized_L_pair(L_values_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            N_L = L_values_arr.shape[0]
+            out_fwd = np.zeros((n_f, N_L), dtype=np.float64)
+            out_bwd = np.zeros((n_f, N_L), dtype=np.float64)
+            alpha1_arr = fiber.get_loss_at_freq(f_grid)
+
+            Gi_4d = Gi_f32[np.newaxis, :, :, np.newaxis]
+            Gj_4d = Gj_f32[np.newaxis, :, :, np.newaxis]
+            D_4d = D_f32[np.newaxis, :, :, np.newaxis]
+            Fk_ij_4d = Fk_ij_f32[np.newaxis, :, :, np.newaxis]
+
+            for L_start in range(0, N_L, _MAX_L_BATCH):
+                L_end = min(L_start + _MAX_L_BATCH, N_L)
+                L_batch = L_values_arr[L_start:L_end]
+                n_L_batch = L_batch.shape[0]
+
+                for start in range(0, n_f, chunk_size):
+                    end = min(start + chunk_size, n_f)
+                    f1_chunk = f_grid[start:end]
+                    n_chunk = end - start
+                    alpha1_chunk = np.asarray(
+                        alpha1_arr[start:end], dtype=np.float64
+                    )
+
+                    Fk = Fk_ij_4d - f1_chunk.reshape((1, 1, 1, n_chunk))
+                    Fk_T = Fk.transpose(3, 1, 2, 0).reshape(n_chunk, -1)
+                    sorted_idx = np.clip(
+                        np.searchsorted(pump_grid_f32, Fk_T), 1, len(pump_grid_f32) - 1
+                    )
+                    x0 = pump_grid_f32[sorted_idx - 1]
+                    x1 = pump_grid_f32[sorted_idx]
+                    y0 = pump_G_f32[sorted_idx - 1]
+                    y1 = pump_G_f32[sorted_idx]
+                    t = np.clip((Fk_T - x0) / (x1 - x0), 0.0, 1.0)
+                    Gk_T = (y0 + (y1 - y0) * t).astype(np.float64)
+                    a0 = alpha_grid_f32[sorted_idx - 1]
+                    a1_arr_int = alpha_grid_f32[sorted_idx]
+                    alpha_k_T = (a0 + (a1_arr_int - a0) * t).astype(np.float64)
+
+                    for j in range(n_chunk):
+                        Gk_j = Gk_T[j, :]
+                        alpha_k_j = alpha_k_T[j, :]
+                        # Spectral pruning: f_k = f_i + f_j - f1_j must fall within the pump grid
+                        fk_j = Fk[0, :, :, j]  # (N_a, N_a)
+                        spectral_valid = (fk_j >= pump_grid_f32[0]) & (fk_j <= pump_grid_f32[-1])
+                        valid_mask_2d = spectral_valid & (Gk_j > 0.0).reshape(N_a, N_a)
+                        if not np.any(valid_mask_2d):
+                            continue
+
+                        Gk_2d = Gk_j.reshape(N_a, N_a)
+                        alpha_k_2d = alpha_k_j.reshape(N_a, N_a)
+                        alpha1_j = float(alpha1_chunk[j])
+                        f1_j = float(f1_chunk[j])
+
+                        delta_beta_j = fiber.get_phase_mismatch(
+                            f2=(Fk_ij_f32 - f1_j).astype(np.float64),
+                            f3=Fi_f64,
+                            f4=Fj_f64,
+                        )
+
+                        da_4d = (alpha_k_2d + alpha_i_f32 + alpha_j_f32 - alpha1_j)[
+                            np.newaxis, :, :, np.newaxis
+                        ]
+                        db_4d = delta_beta_j[np.newaxis, :, :, np.newaxis]
+                        Gk_4d = Gk_2d[np.newaxis, :, :, np.newaxis]
+
+                        # Forward
+                        eta_4d = _fwm_efficiency_vec(da_4d, db_4d, L_batch)
+                        integrand_fwd = (D_4d ** 2) * eta_4d * Gi_4d * Gj_4d * Gk_4d
+                        integral_fwd = np.sum(
+                            integrand_fwd[0, valid_mask_2d, :], axis=0
+                        ) * df * df
+                        exp_factor = np.exp(-alpha1_j * L_batch)
+                        out_fwd[start + j, L_start:L_end] = (
+                            (fiber.gamma ** 2) * exp_factor * integral_fwd / 9.0
+                        )
+
+                        # Backward
+                        F_L_4d = _F_antiderivative_vec(
+                            1.0, 0.0, alpha1_j, da_4d, db_4d, L_batch
+                        )
+                        F_0_4d = _F_antiderivative_vec(
+                            0.0, 0.0, alpha1_j, da_4d, db_4d, L_batch
+                        )
+                        diff = F_L_4d - F_0_4d
+                        integrand_bwd = (D_4d ** 2) * Gi_4d * Gj_4d * Gk_4d * diff
+                        integral_bwd = np.sum(
+                            integrand_bwd[0, valid_mask_2d, :], axis=0
+                        ) * df * df
+                        out_bwd[start + j, L_start:L_end] = (
+                            fiber.rayleigh_coeff
+                            * (fiber.gamma ** 2)
+                            * integral_bwd
+                            / 9.0
+                        )
+
+            return out_fwd, out_bwd
+
+        if L_arr is None:
+            return compute_for_length_pair(fiber.L)
+
+        L_values = np.asarray(L_arr, dtype=np.float64).reshape(-1)
+        return compute_vectorized_L_pair(L_values)
 
     # -------------------------------------------------------------------------
     # GPU-accelerated entry point (called by the CPU path above when GPU available)
@@ -1425,8 +1714,12 @@ class DiscreteFWMSolver(NoiseSolver):
             f4_3d = xp.broadcast_to(Fj_f32[xp.newaxis, :, :], (n_chunk, N_a, N_a))
             delta_beta_3d = _gpu_phase_mismatch(f2_3d, f3_3d, f4_3d, D_c, D_slope)
 
-            # Mask: Gk > 0 (valid pump pair)
-            valid_mask = Gk > 0.0  # (n_chunk, N_a, N_a)
+            # Spectral pruning: f_k = f_i + f_j - f1 must fall within the pump grid
+            # Fk: (N_a, N_a, n_chunk), transpose to match Gk shape
+            spectral_valid = (
+                (Fk >= pump_grid_f32[0]) & (Fk <= pump_grid_f32[-1])
+            ).transpose(2, 0, 1)  # → (n_chunk, N_a, N_a)
+            valid_mask = spectral_valid & (Gk > 0.0)
 
             # delta_alpha: (n_chunk, N_a, N_a)
             da_3d = (
@@ -1524,3 +1817,248 @@ class DiscreteFWMSolver(NoiseSolver):
             chunk_result = _gpu_batch_fwm(start, end)
             out_cpu[start:end, :] = to_host(chunk_result)
         return out_cpu
+
+    # -------------------------------------------------------------------------
+    # GPU merged forward/backward: compute both directions in one GPU pass
+    # -------------------------------------------------------------------------
+
+    def compute_fwm_spectrum_conti_pair_gpu(
+        self,
+        fiber: Fiber,
+        wdm_grid: WDMGrid,
+        f_grid: np.ndarray,
+        L_arr: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """GPU-accelerated FWM forward+backward PSD in a single pass.
+
+        Shares all GPU intermediates (Fk, Gk, alpha_k, delta_beta) between
+        forward and backward, returning (fwd, bwd).
+
+        Returns the same shapes as compute_fwm_spectrum_conti_gpu() × 2.
+        """
+        xp, is_gpu = _get_gpu_module()
+        if not is_gpu:
+            return self.compute_fwm_spectrum_conti_pair(
+                fiber, wdm_grid, f_grid, L_arr=L_arr
+            )
+
+        from qkd_sim.utils.gpu_utils import to_device, to_host
+
+        f_grid_cpu = np.asarray(f_grid, dtype=np.float64)
+        self._validate_frequency_grid(f_grid_cpu)
+
+        df = float(np.mean(np.diff(f_grid_cpu)))
+        G_tx_cpu = self._build_total_classical_psd(wdm_grid, f_grid_cpu, df)
+        alpha_grid_cpu = np.asarray(fiber.get_loss_at_freq(f_grid_cpu), dtype=np.float64)
+
+        G_min_cpu = G_tx_cpu.max() * 10 ** (self._active_threshold_db / 10.0)
+        active_cpu = G_tx_cpu > G_min_cpu
+        n_f = f_grid_cpu.size
+        if not np.any(active_cpu):
+            if L_arr is None:
+                return (
+                    np.zeros_like(f_grid_cpu, dtype=np.float64),
+                    np.zeros_like(f_grid_cpu, dtype=np.float64),
+                )
+            L_values = np.asarray(L_arr, dtype=np.float64).reshape(-1)
+            return (
+                np.zeros((n_f, L_values.size), dtype=np.float64),
+                np.zeros((n_f, L_values.size), dtype=np.float64),
+            )
+
+        f_grid = xp.asarray(f_grid_cpu, dtype=xp.float64)
+        G_tx = xp.asarray(G_tx_cpu, dtype=xp.float64)
+        alpha_grid = xp.asarray(alpha_grid_cpu, dtype=xp.float64)
+        active = xp.asarray(active_cpu)
+        f_active = f_grid[active]
+        G_active = G_tx[active]
+        alpha_active = alpha_grid[active]
+
+        Fi, Fj = xp.meshgrid(f_active, f_active, indexing="ij")
+        Gi, Gj = xp.meshgrid(G_active, G_active, indexing="ij")
+        alpha_i, alpha_j = xp.meshgrid(alpha_active, alpha_active, indexing="ij")
+        D = xp.where(xp.abs(Fi - Fj) <= 0.5 * df, 3.0, 6.0)
+
+        Fk_ij = Fi + Fj
+        Fi_f32 = Fi.astype(xp.float64)
+        Fj_f32 = Fj.astype(xp.float64)
+        Gi_f32 = Gi.astype(xp.float64)
+        Gj_f32 = Gj.astype(xp.float64)
+        alpha_i_f32 = alpha_i.astype(xp.float64)
+        alpha_j_f32 = alpha_j.astype(xp.float64)
+        D_f32 = D.astype(xp.float64)
+        Fk_ij_f32 = (Fi_f32 + Fj_f32).astype(xp.float64)
+
+        pump_grid_f32 = f_grid.astype(xp.float64)
+        pump_G_f32 = G_tx.astype(xp.float64)
+        alpha_grid_f32 = alpha_grid.astype(xp.float64)
+
+        N_a = Fi_f32.shape[0]
+        N_pairs = N_a * N_a
+        N_L_for_chunk = int(np.asarray(L_arr).size) if L_arr is not None else 1
+
+        try:
+            import cupy as cp
+            cp.get_default_memory_pool().free_all_blocks()
+            free_bytes, total_bytes = cp.cuda.Device().mem_info
+            min_budget = int(total_bytes * 0.35)
+            budget_bytes = max(int(free_bytes * 0.4), min_budget)
+            bytes_per_chunk_unit = N_a * N_a * max(N_L_for_chunk, 1) * 8 * 6
+            chunk_size = max(1, min(50, int(budget_bytes / max(bytes_per_chunk_unit, 1))))
+        except Exception:
+            chunk_size = 10 if N_pairs * N_a > 50_000_000 else 50
+
+        if _DEBUG_MODE:
+            print(
+                f"[fwm-gpu-pair] N_active={N_a}/{n_f} "
+                f"({100.0 * N_a / max(n_f, 1):.1f}%) "
+                f"N_L={N_L_for_chunk} chunk_size={chunk_size}"
+            )
+
+        D_c = float(fiber._D_c)
+        D_slope = float(fiber._D_slope)
+        gamma = float(fiber.gamma)
+        rayleigh_coeff = float(fiber.rayleigh_coeff)
+        L_fiber = float(fiber.L)
+        L_values_arr = (
+            xp.asarray(L_arr, dtype=xp.float64).reshape(-1) if L_arr is not None else None
+        )
+
+        def _gpu_batch_fwm_pair(
+            chunk_start: int, chunk_end: int, L_batch: xp.ndarray | None
+        ) -> tuple[xp.ndarray, xp.ndarray]:
+            """Compute FWM forward+backward for frequencies [chunk_start, chunk_end)."""
+            f1_chunk = f_grid[chunk_start:chunk_end]
+            n_chunk = chunk_end - chunk_start
+            alpha1_chunk = alpha_grid_f32[chunk_start:chunk_end]
+
+            Fk = Fk_ij_f32[:, :, xp.newaxis] - f1_chunk[xp.newaxis, xp.newaxis, :]
+            Fk_T = Fk.transpose(2, 0, 1).reshape(n_chunk, -1)
+
+            sorted_idx = xp.clip(
+                xp.searchsorted(pump_grid_f32, Fk_T), 1, len(pump_grid_f32) - 1
+            )
+            x0 = pump_grid_f32[sorted_idx - 1]
+            x1 = pump_grid_f32[sorted_idx]
+            y0 = pump_G_f32[sorted_idx - 1]
+            y1 = pump_G_f32[sorted_idx]
+            t = xp.clip((Fk_T - x0) / (x1 - x0), 0.0, 1.0)
+            Gk_T = (y0 + (y1 - y0) * t).astype(xp.float64)
+            a0 = alpha_grid_f32[sorted_idx - 1]
+            a1_arr = alpha_grid_f32[sorted_idx]
+            alpha_k_T = (a0 + (a1_arr - a0) * t).astype(xp.float64)
+
+            Gk = Gk_T.reshape(n_chunk, N_a, N_a)
+            alpha_k = alpha_k_T.reshape(n_chunk, N_a, N_a)
+
+            f2_3d = (Fk_ij_f32[:, :, xp.newaxis] - f1_chunk[xp.newaxis, xp.newaxis, :]).transpose(
+                2, 0, 1
+            )
+            f3_3d = xp.broadcast_to(Fi_f32[xp.newaxis, :, :], (n_chunk, N_a, N_a))
+            f4_3d = xp.broadcast_to(Fj_f32[xp.newaxis, :, :], (n_chunk, N_a, N_a))
+            delta_beta_3d = _gpu_phase_mismatch(f2_3d, f3_3d, f4_3d, D_c, D_slope)
+
+            # Spectral pruning: f_k = f_i + f_j - f1 must fall within the pump grid
+            # Fk: (N_a, N_a, n_chunk), Gk: (n_chunk, N_a, N_a) — transpose Fk to match
+            spectral_valid = (
+                (Fk >= pump_grid_f32[0]) & (Fk <= pump_grid_f32[-1])
+            ).transpose(2, 0, 1)  # → (n_chunk, N_a, N_a)
+            valid_mask = spectral_valid & (Gk > 0.0)
+
+            da_3d = (
+                alpha_k
+                + xp.broadcast_to(alpha_i_f32, (n_chunk, N_a, N_a))
+                + xp.broadcast_to(alpha_j_f32, (n_chunk, N_a, N_a))
+                - alpha1_chunk[:, xp.newaxis, xp.newaxis]
+            )
+
+            if L_batch is None:
+                # ---- Scalar L path ----
+                Gi_3d = xp.broadcast_to(Gi_f32[xp.newaxis, :, :], (n_chunk, N_a, N_a))
+                Gj_3d = xp.broadcast_to(Gj_f32[xp.newaxis, :, :], (n_chunk, N_a, N_a))
+                D2_3d = xp.broadcast_to((D_f32 ** 2)[xp.newaxis, :, :], (n_chunk, N_a, N_a))
+
+                # Forward
+                eta = _gpu_fwm_efficiency(da_3d, delta_beta_3d, L_fiber)
+                eta_masked = xp.where(valid_mask, eta, 0.0)
+                exp_alpha1 = xp.exp(-alpha1_chunk * L_fiber)
+                integrand_fwd = D2_3d * eta_masked * Gi_3d * Gj_3d * Gk
+                integral_fwd = xp.sum(integrand_fwd, axis=(1, 2)) * df * df
+                out_fwd = (gamma ** 2 / 9.0) * exp_alpha1 * integral_fwd
+
+                # Backward
+                F_L = _gpu_F_antiderivative(
+                    xp.full_like(da_3d, L_fiber), 0.0, alpha1_chunk, da_3d, delta_beta_3d, L_fiber
+                )
+                F_0 = _gpu_F_antiderivative(
+                    xp.zeros_like(da_3d), 0.0, alpha1_chunk, da_3d, delta_beta_3d, L_fiber
+                )
+                diff = xp.where(valid_mask, F_L - F_0, 0.0)
+                integrand_bwd = D2_3d * Gi_3d * Gj_3d * Gk * diff
+                integral_bwd = xp.sum(integrand_bwd, axis=(1, 2)) * df * df
+                out_bwd = rayleigh_coeff * (gamma ** 2 / 9.0) * integral_bwd
+
+                return out_fwd, out_bwd
+
+            else:
+                # ---- Vectorized L path ----
+                N_L = L_batch.shape[0]
+                out_fwd = xp.zeros((n_chunk, N_L), dtype=xp.float64)
+                out_bwd = xp.zeros((n_chunk, N_L), dtype=xp.float64)
+
+                Gi_4d = xp.broadcast_to(Gi_f32[xp.newaxis, :, :, xp.newaxis], (n_chunk, N_a, N_a, N_L))
+                Gj_4d = xp.broadcast_to(Gj_f32[xp.newaxis, :, :, xp.newaxis], (n_chunk, N_a, N_a, N_L))
+                D_4d = xp.broadcast_to(D_f32[xp.newaxis, :, :, xp.newaxis], (n_chunk, N_a, N_a, N_L))
+                da_4d = da_3d[:, :, :, xp.newaxis]
+                db_4d = delta_beta_3d[:, :, :, xp.newaxis]
+                Gk_4d = Gk[:, :, :, xp.newaxis]
+                alpha1_4d = alpha1_chunk[:, xp.newaxis, xp.newaxis, xp.newaxis]
+
+                # Forward
+                eta_4d = _gpu_fwm_efficiency_vec(da_4d, db_4d, L_batch)
+                eta_4d_masked = xp.where(valid_mask[:, :, :, xp.newaxis], eta_4d, 0.0)
+                integrand_fwd = (D_4d ** 2) * eta_4d_masked * Gi_4d * Gj_4d * Gk_4d
+                integral_all_fwd = xp.sum(
+                    integrand_fwd * valid_mask[:, :, :, xp.newaxis], axis=(1, 2)
+                ) * df * df
+                exp_factor = xp.exp(-alpha1_chunk[:, xp.newaxis] * L_batch[xp.newaxis, :])
+                out_fwd[:] = (gamma ** 2 / 9.0) * exp_factor * integral_all_fwd
+
+                # Backward
+                alpha1_broadcast = xp.broadcast_to(alpha1_4d, (n_chunk, N_a, N_a, N_L))
+                F_L_4d = _gpu_F_antiderivative_vec(
+                    L_fiber, 0.0, alpha1_broadcast, da_4d, db_4d, L_batch
+                )
+                F_0_4d = _gpu_F_antiderivative_vec(
+                    0.0, 0.0, alpha1_broadcast, da_4d, db_4d, L_batch
+                )
+                diff = F_L_4d - F_0_4d
+                diff_masked = xp.where(valid_mask[:, :, :, xp.newaxis], diff, 0.0)
+                integrand_bwd = (D_4d ** 2) * Gi_4d * Gj_4d * Gk_4d * diff_masked
+                integral_all_bwd = xp.sum(
+                    integrand_bwd * valid_mask[:, :, :, xp.newaxis], axis=(1, 2)
+                ) * df * df
+                out_bwd[:] = rayleigh_coeff * (gamma ** 2 / 9.0) * integral_all_bwd
+
+                return out_fwd, out_bwd
+
+        # Assemble GPU results in chunks, copy back to CPU
+        if L_arr is None:
+            out_fwd_cpu = np.zeros(n_f, dtype=np.float64)
+            out_bwd_cpu = np.zeros(n_f, dtype=np.float64)
+            for start in range(0, n_f, chunk_size):
+                end = min(start + chunk_size, n_f)
+                fwd_chunk, bwd_chunk = _gpu_batch_fwm_pair(start, end, None)
+                out_fwd_cpu[start:end] = to_host(fwd_chunk)
+                out_bwd_cpu[start:end] = to_host(bwd_chunk)
+            return out_fwd_cpu, out_bwd_cpu
+
+        N_L = L_values_arr.shape[0]
+        out_fwd_cpu = np.zeros((n_f, N_L), dtype=np.float64)
+        out_bwd_cpu = np.zeros((n_f, N_L), dtype=np.float64)
+        for start in range(0, n_f, chunk_size):
+            end = min(start + chunk_size, n_f)
+            fwd_chunk, bwd_chunk = _gpu_batch_fwm_pair(start, end, L_values_arr)
+            out_fwd_cpu[start:end, :] = to_host(fwd_chunk)
+            out_bwd_cpu[start:end, :] = to_host(bwd_chunk)
+        return out_fwd_cpu, out_bwd_cpu
