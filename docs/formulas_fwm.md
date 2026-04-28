@@ -22,9 +22,9 @@
 
 ---
 
-## 1. FWM效率因子（公式2.1.1）
+## 1. FWM系数（公式2.1.1）
 
-FWM效率因子为：
+FWM系数为：
 
 $$
 \eta = \frac{e^{-\Delta\alpha \cdot z} - 2e^{-\frac{\Delta\alpha}{2}z}\cos(\Delta\beta \cdot z) + 1}{\frac{(\Delta\alpha)^2}{4} + (\Delta\beta)^2}
@@ -149,7 +149,7 @@ $$
 
 数值验证检查项：
 - FWM噪声功率应随泵浦功率的平方增长（$P^2$ 关系）
-- FWM效率 η 随地距长度增加而下降
+- FWM系数 η 随地距长度增加而下降
 - 简并FWM（D=3）的贡献约为非简并FWM（D=6）的一半
 
 ---

@@ -202,11 +202,8 @@ def compute_noise_spectrum(
 
     if noise_type in ("fwm", "all"):
         solver_fwm = fwm_solver if fwm_solver is not None else DiscreteFWMSolver()
-        result["fwm_fwd"] = solver_fwm.compute_fwm_spectrum_conti(
-            fiber, wdm_grid, f_eval, direction="forward"
-        )
-        result["fwm_bwd"] = solver_fwm.compute_fwm_spectrum_conti(
-            fiber, wdm_grid, f_eval, direction="backward"
+        result["fwm_fwd"], result["fwm_bwd"] = solver_fwm.compute_fwm_spectrum_conti(
+            fiber, wdm_grid, f_eval, direction="both"
         )
         result["fwm"] = result["fwm_fwd"] + result["fwm_bwd"]
 

@@ -145,7 +145,7 @@ environment.yml      # conda 环境定义（引用 pyproject.toml）
 - `to_device()` / `to_host()`：CPU↔GPU 数据迁移
 - 无 CUDA 时静默回退到 NumPy，不影响 CPU 环境
 
-FWM 求解器 (`fwm_solver.py`) 在 GPU 可用时自动使用 `_gpu_fwm_efficiency_vec`。
+FWM 求解器 (`fwm_solver.py`) 在 GPU 可用时自动使用 `compute_fwm_spectrum_conti` 的 GPU 分派路径。
 
 ---
 
@@ -199,6 +199,22 @@ FWM 求解器 (`fwm_solver.py`) 在 GPU 可用时自动使用 `_gpu_fwm_efficien
 - **根本原因**：`precompute_by_channel()` 把经典信号 PSD 加入 `fwd/bwd` 全频谱，插值到量子信道时信号旁瓣污染噪声功率 → p_noise≈1 → QBER≈0.5 → SKR=0 → NaN → 图上无点
 - **修复方式**：分别存 `noise_only_fwd/bwd`（仅 FWM+SpRS）和 `fwd/bwd`（含信号，用于显示）；`compute_skr_vs_channel()` 和 `compute_skr_vs_length()` 优先读 `noise_only_*` 键（fallback 到 `fwd/bwd` 兼容旧数据）
 - **禁止**将经典信号 PSD 送入 SKR 的 noise interp
+
+### FWM Solver 优化（2026-04-28）
+
+**公共 API**：
+- `compute_fwm_spectrum_conti(fiber, grid, f_grid, direction="forward"|"backward"|"both")`
+  - `"forward"/"backward"` → 返回单方向 PSD `(N_f,)` 或 `(N_f, N_L)`
+  - `"both"` → 返回 `(fwd, bwd)` tuple，一次 chunk 遍历同时计算双向
+- `compute_fwm_spectrum_conti_pair(...)` → 薄封装，等价于 `direction="both"`
+- **调用方规范**：需要双向结果时务必使用 `direction="both"`，禁止两次单向调用
+
+**内部优化**：
+- `_integrate_psd_per_channel`：前缀和 `cumsum(psd)*df`，O(N_f + N_q) 替代逐信道 mask+sum O(N_q × N_f)
+- `_compute_noise_for_channel_vec`：预计算泵浦不变量 + `np.isin` 批量验证 n2 合法性，消除逐 n1 的 searchsorted
+- chunk 遍历仅覆盖活跃 f1 频率区间，范围外噪声严格为零
+
+**调用方已更新**：`dash_workers.py`, `dispatcher.py`
 
 ### 离散 vs 连续可视化规则
 - **频率 x 轴**（`plot_noise_dash_ch.py`）：`spec["continuous"]=False` → `mode="markers"`；`True` → `mode="lines"`；SKR 同规则（2026-04 修复 SKR traces 始终用 lines 的 bug）

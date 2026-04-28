@@ -52,8 +52,9 @@ def mp_worker_single_length(
         bwd = np.zeros(len(fgr), dtype=np.float64)
         if nt in ("fwm", "both"):
             slv = DiscreteFWMSolver()
-            fwd += slv.compute_fwm_spectrum_conti(fib, grd, fgr, direction="forward")
-            bwd += slv.compute_fwm_spectrum_conti(fib, grd, fgr, direction="backward")
+            f_fwd, f_bwd = slv.compute_fwm_spectrum_conti(fib, grd, fgr, direction="both")
+            fwd += f_fwd
+            bwd += f_bwd
         if nt in ("sprs", "both"):
             slv = DiscreteSPRSSolver()
             df = float(np.mean(np.diff(fgr)))

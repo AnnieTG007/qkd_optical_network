@@ -35,7 +35,7 @@
 | D | `D_degen` | 简并因子 | — |
 | Δα | `delta_alpha` | 衰减失配 = α₃+α₄+α₂-α₁ | 1/m |
 | Δβ | `delta_beta` | 相位失配 = β₃+β₄-β₂-β₁ | rad/m |
-| η | `eta_fwm` | FWM效率 | m² |
+| η | `eta_fwm` | FWM系数 | m² |
 | λ | `lambda_c` | 中心波长 | m |
 | c | `c_light` | 光速 | m/s |
 

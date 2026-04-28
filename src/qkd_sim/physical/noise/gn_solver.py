@@ -20,7 +20,7 @@ arXiv:1209.0394, Eq.1 + Eq.120（通用积分 + 单信道闭式）
                × ∬ G_TX(f₁) × G_TX(f₂) × G_TX(f₁+f₂-f)
                × |μ(f, f₁, f₂)|² df₁ df₂
 
-FWM 效率因子（等损耗近似 Δα = 2α）：
+FWM 系数（等损耗近似 Δα = 2α）：
     |μ|² = [exp(-2αL) - 2·exp(-αL)·cos(Δβ·L) + 1] / (α² + Δβ²)
 
 相位失配（β₂ 近似）：
@@ -45,12 +45,12 @@ from qkd_sim.physical.signal import SpectrumType, WDMGrid, validate_uniform_freq
 
 # ---- 内部辅助函数 -------------------------------------------------------
 
-def _fwm_efficiency_single_alpha(
+def _fwm_coefficient_single_alpha(
     alpha: float,
     delta_beta: np.ndarray,
     L: float,
 ) -> np.ndarray:
-    """FWM 效率因子 |μ|²（等损耗近似，Δα = 2α）。
+    """FWM 系数 |μ|²（等损耗近似，Δα = 2α）。
 
     等损耗近似下 Δα = αₖ+αᵢ+αⱼ-α₁ = 3α-α = 2α，
     代入公式 2.1.1 简化分母：(2α)²/4 + Δβ² = α² + Δβ²。
@@ -67,7 +67,7 @@ def _fwm_efficiency_single_alpha(
     Returns
     -------
     ndarray
-        |μ|² 效率因子 [m²]，形状与 delta_beta 相同
+        |μ|² 系数 [m²]，形状与 delta_beta 相同
     """
     exp_m_alpha_L = np.exp(-alpha * L)
     numerator = (
@@ -308,8 +308,8 @@ class GNModelSolver:
                     * (Fj_f32 - f_out)
                 )
 
-                # ---- FWM 效率因子 |μ|² ----
-                eta = _fwm_efficiency_single_alpha(alpha, dbeta.astype(np.float64), L)
+                # ---- FWM 系数 |μ|² ----
+                eta = _fwm_coefficient_single_alpha(alpha, dbeta.astype(np.float64), L)
                 eta_f32 = eta.astype(np.float32)
 
                 # ---- 非线性干涉积分 ----
