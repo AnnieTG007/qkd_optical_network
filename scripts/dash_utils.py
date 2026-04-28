@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
 import os
+import pickle
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -573,6 +576,29 @@ _MP_ENABLED = os.environ.get("QKD_DASH_MP", "1") != "0" and os.name != "nt"
 _PROFILE_ENABLED = os.environ.get("QKD_DASH_PROFILE", "1").lower() not in ("0", "false", "no")
 _CSV_CACHE_ENABLED = os.environ.get("QKD_DASH_CSV_CACHE", "1").lower() not in ("0", "false", "no")
 _PROFILE_INDENT = 0
+_MODEL_KEY_FILTER: list[str] | None = None
+
+
+def set_model_key_filter(model_keys: list[str] | None) -> None:
+    """Limit Dash precomputation to a subset of configured model keys."""
+    global _MODEL_KEY_FILTER
+    _MODEL_KEY_FILTER = list(model_keys) if model_keys else None
+
+
+def _apply_model_key_filter(model_keys: list[str]) -> list[str]:
+    if _MODEL_KEY_FILTER is None:
+        return model_keys
+    requested = set(_MODEL_KEY_FILTER)
+    selected = [mk for mk in model_keys if mk in requested]
+    unknown = sorted(requested - set(model_keys))
+    if unknown:
+        raise ValueError(
+            f"Unknown model key(s) for modulation {MODULATION_FORMAT!r}: {unknown}. "
+            f"Available: {model_keys}"
+        )
+    if not selected:
+        raise ValueError("Model filter selected no models")
+    return selected
 
 
 def describe_compute_device() -> str:
@@ -897,6 +923,90 @@ def _load_cached_power(noise_type: str, model_keys: list[str], index_prefix: str
                 }
     _POWER_CACHE[cache_key] = all_by_idx
     return all_by_idx, power
+
+
+def _persistent_cache_path(cache_name: str, payload: dict) -> Path:
+    """Return a parameter-hash cache path for expensive Dash precompute results."""
+    encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()[:16]
+    return _PRECOMPUTED_DIR / f"{cache_name}_{digest}.pkl"
+
+
+def _load_persistent_cache(cache_name: str, payload: dict) -> dict | None:
+    if not _CSV_CACHE_ENABLED:
+        return None
+    path = _persistent_cache_path(cache_name, payload)
+    if not path.exists():
+        return None
+    try:
+        with open(path, "rb") as f:
+            cached = pickle.load(f)
+    except Exception as exc:
+        print(f"[profile] warning: ignore unreadable persistent cache {path.name}: {exc}")
+        return None
+    print(f"[profile] persistent cache hit: {path.name}")
+    return cached
+
+
+def _save_persistent_cache(cache_name: str, payload: dict, data: dict) -> None:
+    if not _CSV_CACHE_ENABLED:
+        return
+    _PRECOMPUTED_DIR.mkdir(parents=True, exist_ok=True)
+    path = _persistent_cache_path(cache_name, payload)
+    try:
+        with open(path, "wb") as f:
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+    except PermissionError as exc:
+        print(f"[profile] warning: skip persistent cache write for {path.name}: {exc}")
+
+
+def _with_signal_cache_payload(
+    noise_type: str,
+    model_keys: list[str],
+    LENGTHS_KM: np.ndarray,
+    base_config: WDMConfig,
+    noise_f_grid: np.ndarray,
+    osa_csv_path: Path,
+    fiber_params: dict,
+    osa_center_freq_hz: float | None,
+) -> dict:
+    osa_stat = osa_csv_path.stat() if osa_csv_path.exists() else None
+    return {
+        "schema": 1,
+        "noise_type": noise_type,
+        "modulation": MODULATION_FORMAT,
+        "model_keys": list(model_keys),
+        "power_levels": [float(p) for p in PRECOMPUTE_POWER_LEVELS],
+        "lengths_km": np.asarray(LENGTHS_KM, dtype=np.float64).tolist(),
+        "noise_grid": {
+            "size": int(noise_f_grid.size),
+            "first": float(noise_f_grid[0]) if noise_f_grid.size else None,
+            "last": float(noise_f_grid[-1]) if noise_f_grid.size else None,
+            "step": float(np.mean(np.diff(noise_f_grid))) if noise_f_grid.size > 1 else None,
+        },
+        "active_threshold_db": float(ACTIVE_THRESHOLD_DB),
+        "classical_indices": list(CLASSICAL_INDICES),
+        "wdm": {
+            "start_freq": float(base_config.start_freq),
+            "start_channel": float(base_config.start_channel),
+            "end_channel": float(base_config.end_channel),
+            "channel_spacing": float(base_config.channel_spacing),
+            "B_s": float(base_config.B_s),
+            "data_rate_bps": float(base_config.data_rate_bps),
+            "P0": float(_get_P0()),
+            "beta_rolloff": float(base_config.beta_rolloff),
+            "ook_filter_order": int(base_config.ook_filter_order),
+            "quantum_channel_indices": list(base_config.quantum_channel_indices),
+            "num_channels": int(base_config.num_channels),
+        },
+        "fiber": {k: float(v) for k, v in fiber_params.items()},
+        "osa": {
+            "path": str(osa_csv_path),
+            "mtime_ns": int(osa_stat.st_mtime_ns) if osa_stat else None,
+            "size": int(osa_stat.st_size) if osa_stat else None,
+            "center_freq_hz": float(osa_center_freq_hz) if osa_center_freq_hz is not None else None,
+        },
+    }
 
 
 def _scale_precomputed_result(all_by_idx: dict, scale: float) -> dict:
@@ -1755,6 +1865,7 @@ def precompute_by_channel(
         grid_cache: dict = {}
         signal_psd_cache: dict = {}
         for model_key in model_keys:
+            spec = specs[model_key]
             if model_key == "discrete":
                 stype = SpectrumType.SINGLE_FREQ
             elif model_key == "nrz_ook":
@@ -1763,8 +1874,27 @@ def precompute_by_channel(
                 stype = SpectrumType.OSA_SAMPLED
             else:
                 stype = SpectrumType.RAISED_COSINE
+            beta_rolloff = (
+                spec["beta_rolloff"]
+                if spec.get("beta_rolloff") is not None
+                else WDM_PARAMS["beta_rolloff"]
+            )
+            model_config = WDMConfig(
+                start_freq=base_config.start_freq,
+                start_channel=base_config.start_channel,
+                end_channel=base_config.end_channel,
+                channel_spacing=base_config.channel_spacing,
+                B_s=base_config.B_s,
+                data_rate_bps=base_config.data_rate_bps,
+                P0=_get_P0(),
+                beta_rolloff=beta_rolloff,
+                ook_filter_order=base_config.ook_filter_order,
+                quantum_channel_indices=list(base_config.quantum_channel_indices),
+                channel_powers_W=base_config.channel_powers_W,
+                num_channels=int(base_config.num_channels),
+            )
             grid_kwargs = dict(
-                config=model_config_noise,
+                config=model_config,
                 spectrum_type=stype,
                 f_grid=noise_f_grid,
                 classical_channel_indices=CLASSICAL_INDICES,
@@ -2095,12 +2225,12 @@ def get_noise_model_keys(noise_type: str) -> list[str]:
     _mod_key = MODULATION_FORMAT.lower()
     if noise_type in ("fwm", "sprs"):
         group = f"fwm_noise_{_mod_key}"
-        return list(load_model_specs(group).keys())
+        return _apply_model_key_filter(list(load_model_specs(group).keys()))
 
     # only_signal / with_signal / both: same models as fwm (signal + noise combined differently)
     # Return the fwm model keys (same spectral models, different computation path)
     group = f"fwm_noise_{_mod_key}"
-    return list(load_model_specs(group).keys())
+    return _apply_model_key_filter(list(load_model_specs(group).keys()))
 
 
 # --- Startup precomputation of ALL power levels (step=5 dBm, 7 values) ---
@@ -2219,6 +2349,21 @@ def precompute_by_channel_all_powers(
         model_keys_ws = get_noise_model_keys("with_signal")
         specs_ws = {k: specs[k] for k in model_keys_ws if k in specs}
         n_l_ws = len(LENGTHS_KM)
+        cache_payload = _with_signal_cache_payload(
+            noise_type,
+            model_keys_ws,
+            LENGTHS_KM,
+            base_config,
+            noise_f_grid,
+            osa_csv_path,
+            fiber_params,
+            osa_center_freq_hz,
+        )
+        cached = _load_persistent_cache("ch_with_signal", cache_payload)
+        if cached is not None:
+            _POWER_CACHE.update(cached["power_cache"])
+            set_power_override(0.0)
+            return cached["result_all"], cached["valid_l"]
 
         # Build WDM grid and signal PSD once per model_key (independent of length and power)
         grid_cache_t4: dict = {}
@@ -2226,6 +2371,7 @@ def precompute_by_channel_all_powers(
         for mk in model_keys_ws:
             if mk not in specs_ws:
                 continue
+            spec_t4 = specs_ws[mk]
             if mk == "discrete":
                 stype_t4 = SpectrumType.SINGLE_FREQ
             elif mk == "nrz_ook":
@@ -2234,8 +2380,27 @@ def precompute_by_channel_all_powers(
                 stype_t4 = SpectrumType.OSA_SAMPLED
             else:
                 stype_t4 = SpectrumType.RAISED_COSINE
+            beta_rolloff_t4 = (
+                spec_t4["beta_rolloff"]
+                if spec_t4.get("beta_rolloff") is not None
+                else WDM_PARAMS["beta_rolloff"]
+            )
+            model_config_t4 = WDMConfig(
+                start_freq=base_config.start_freq,
+                start_channel=base_config.start_channel,
+                end_channel=base_config.end_channel,
+                channel_spacing=base_config.channel_spacing,
+                B_s=base_config.B_s,
+                data_rate_bps=base_config.data_rate_bps,
+                P0=_get_P0(),
+                beta_rolloff=beta_rolloff_t4,
+                ook_filter_order=base_config.ook_filter_order,
+                quantum_channel_indices=list(base_config.quantum_channel_indices),
+                channel_powers_W=base_config.channel_powers_W,
+                num_channels=int(base_config.num_channels),
+            )
             gkw_t4 = dict(
-                config=model_config_noise,
+                config=model_config_t4,
                 spectrum_type=stype_t4,
                 f_grid=noise_f_grid,
                 classical_channel_indices=CLASSICAL_INDICES,
@@ -2331,6 +2496,15 @@ def precompute_by_channel_all_powers(
             results[float(p)] = (all_by_idx, base_valid_l_ws)
 
         set_power_override(0.0)
+        _save_persistent_cache(
+            "ch_with_signal",
+            cache_payload,
+            {
+                "power_cache": {("ch", float(p)): results[float(p)][0] for p in PRECOMPUTE_POWER_LEVELS},
+                "result_all": results[0.0][0],
+                "valid_l": results[0.0][1],
+            },
+        )
         return results[0.0]
 
     # Sequential fast path: avoids spawn overhead for fast noise types (e.g. sprs ~1s total)

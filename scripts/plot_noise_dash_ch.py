@@ -52,6 +52,7 @@ from scripts.dash_utils import (
     print_compute_device,
     profile_scope,
     set_csv_cache_enabled,
+    set_model_key_filter,
     set_power_override,
     _POWER_CACHE,
 )
@@ -138,6 +139,16 @@ parser.add_argument("--resolution", type=float, default=1e9,
                     help="Noise frequency grid resolution [Hz]. Default: 1e9 (1 GHz).")
 parser.add_argument("--active-threshold-db", type=float, default=-50.0,
                     help="FWM active frequency bin threshold [dB]. Default: -50.0.")
+parser.add_argument(
+    "--models",
+    default=None,
+    help="Comma-separated model keys to precompute, e.g. rc_beta05,osa. Default: all configured models.",
+)
+parser.add_argument(
+    "--power-levels",
+    default=None,
+    help="Comma-separated classical power levels in dBm, e.g. -5,0,5. Default: -15,-10,-5,0,5,10,15.",
+)
 add_strategy_cli_args(parser)
 ARGS = parser.parse_args()
 NOISE_TYPE = ARGS.type
@@ -146,6 +157,16 @@ _du.MODULATION_FORMAT = ARGS.modulation.upper()
 _du.WDM_PARAMS["data_rate_bps"] = ARGS.data_rate
 _du.NOISE_GRID_RESOLUTION_HZ = ARGS.resolution
 _du.ACTIVE_THRESHOLD_DB = ARGS.active_threshold_db
+if ARGS.models:
+    selected_models = [m.strip() for m in ARGS.models.split(",") if m.strip()]
+    set_model_key_filter(selected_models)
+    print(f"Model filter: {selected_models}")
+if ARGS.power_levels:
+    PRECOMPUTE_POWER_LEVELS[:] = [float(p.strip()) for p in ARGS.power_levels.split(",") if p.strip()]
+    if 0.0 not in PRECOMPUTE_POWER_LEVELS:
+        PRECOMPUTE_POWER_LEVELS.append(0.0)
+        PRECOMPUTE_POWER_LEVELS.sort()
+    print(f"Power levels: {PRECOMPUTE_POWER_LEVELS}")
 
 # SKR model override
 if ARGS.skr_model is not None:
@@ -188,6 +209,7 @@ t0 = time.perf_counter()
 
 with profile_scope("startup: build config, frequency grid, model specs"):
     osa_csv_path, osa_center_freq_hz = _resolve_osa_csv(ARGS.modulation)
+    _get_osa_rbw(osa_csv_path)
     # base_quantum_indices: ITU G.694.1 channel numbers (1-based)
     base_quantum_indices = [
         itn
@@ -263,6 +285,7 @@ elapsed = time.perf_counter() - t0
 print(f"Precompute done in {elapsed:.1f}s. Valid selections: {len(VALID_L_INDICES)}")
 
 _CURRENT_POWER_DBM: float = 0.0  # updated by power slider callback for SKR cache lookup
+DEFAULT_POWER_INDEX = PRECOMPUTE_POWER_LEVELS.index(0.0)
 
 # Diagnostic: verify continuous vs discrete model data shapes
 l_diag = VALID_L_INDICES[0]
@@ -356,7 +379,7 @@ app.layout = html.Div(
                     min=0,
                     max=len(PRECOMPUTE_POWER_LEVELS) - 1,
                     step=1,
-                    value=3,  # 0 dBm is index 3
+                    value=DEFAULT_POWER_INDEX,
                     marks={i: f"{int(p)}" for i, p in enumerate(PRECOMPUTE_POWER_LEVELS)},
                 ),
             ],
