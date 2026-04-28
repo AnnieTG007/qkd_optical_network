@@ -237,6 +237,11 @@ class DiscreteSPRSSolver(NoiseSolver):
             传入 None 则回退到每个量子信道的 B_s。
         """
         self._noise_bandwidth_hz = noise_bandwidth_hz
+        # σ_2d cache: 同一 (f_grid, T, A_eff, df) 在一次 Dash 启动里跨 model_key
+        # 复用，避免重复做 ~6300² 个点的 Raman / phonon 插值。LRU=2 已足够覆盖
+        # forward+backward 调用对，且单份 σ_2d 在 N_f=6301 时约 302 MB。
+        self._sigma_cache: "dict[tuple, np.ndarray]" = {}
+        self._sigma_cache_max: int = 2
 
     def _prepare(
         self,
@@ -531,6 +536,58 @@ class DiscreteSPRSSolver(NoiseSolver):
 
     # --- 噪声 PSD 谱计算 — 向量化版本（全频率一次计算）-----------
 
+    def _get_sigma_2d(
+        self,
+        fiber: Fiber,
+        f_grid: np.ndarray,
+        df: float,
+    ) -> np.ndarray:
+        """返回 (N_f, N_f) 拉曼横截面矩阵 σ_2d，跨调用复用。
+
+        σ_2d 仅依赖 (f_grid, T_kelvin, A_eff, df)，与 G_pump、L、direction、
+        model_key 无关。同一次 Dash 启动里多个 model_key 都会复用同一份。
+
+        Cache key 用 f_grid 的二进制 sha1 + 标量参数；LRU 由
+        ``self._sigma_cache_max`` 控制。
+        """
+        import hashlib
+
+        f_arr = np.ascontiguousarray(f_grid, dtype=np.float64)
+        key = (
+            hashlib.sha1(f_arr.tobytes()).hexdigest(),
+            float(fiber.T_kelvin),
+            float(fiber.A_eff),
+            float(df),
+        )
+        cached = self._sigma_cache.get(key)
+        if cached is not None:
+            return cached
+
+        f1_2d = f_arr.reshape(-1, 1)
+        f2_2d = f_arr.reshape(1, -1)
+        delta_f_2d = np.abs(f1_2d - f2_2d)
+
+        g_R_2d = get_raman_gain(
+            delta_f=delta_f_2d,
+            f_pump=f2_2d,
+            A_eff=fiber.A_eff,
+        )
+        n_th_2d = _phonon_occupation(delta_f_2d, fiber.T_kelvin)
+        sigma_2d = _raman_cross_section(
+            f_q=f1_2d,
+            f_c=f2_2d,
+            g_R=g_R_2d,
+            n_th=n_th_2d,
+            delta_f=delta_f_2d,
+            noise_bandwidth=df,
+        )
+
+        if len(self._sigma_cache) >= self._sigma_cache_max:
+            # LRU 退化版：弹出最早 entry（dict 在 Python 3.7+ 保插入顺序）
+            self._sigma_cache.pop(next(iter(self._sigma_cache)))
+        self._sigma_cache[key] = sigma_2d
+        return sigma_2d
+
     def _compute_sprs_psd_batch(
         self,
         fiber: Fiber,
@@ -556,28 +613,7 @@ class DiscreteSPRSSolver(NoiseSolver):
         -------
         ndarray, shape (N_f,)  — G_sprs(f) at each f_grid point
         """
-        # ---- 构建 2D 频率矩阵 ----
-        # f1_2d[j, k] = f_grid[j] (信号频率，输出点 j)
-        # f2_2d[j, k] = f_grid[k] (泵浦频率，积分点 k)
-        f1_2d = f_grid.reshape(-1, 1)      # (N_f, 1)
-        f2_2d = f_grid.reshape(1, -1)        # (1, N_f)
-        delta_f_2d = np.abs(f1_2d - f2_2d)  # (N_f, N_f)
-
-        # ---- 拉曼参数（2D 广播）----
-        g_R_2d = get_raman_gain(
-            delta_f=delta_f_2d,
-            f_pump=f2_2d,
-            A_eff=fiber.A_eff,
-        )  # (N_f, N_f)
-        n_th_2d = _phonon_occupation(delta_f_2d, fiber.T_kelvin)  # (N_f, N_f)
-        sigma_2d = _raman_cross_section(
-            f_q=f1_2d,
-            f_c=f2_2d,
-            g_R=g_R_2d,
-            n_th=n_th_2d,
-            delta_f=delta_f_2d,
-            noise_bandwidth=df,
-        )  # (N_f, N_f)
+        sigma_2d = self._get_sigma_2d(fiber, f_grid, df)  # (N_f, N_f)
 
         # ---- 衰减系数（2D 广播）----
         alpha1_2d = fiber.get_loss_at_freq(f_grid).reshape(-1, 1)  # (N_f, 1)
@@ -645,9 +681,12 @@ class DiscreteSPRSSolver(NoiseSolver):
         if not np.any(G_pump > 0.0):
             return np.zeros_like(f_grid, dtype=np.float64)
 
-        # GPU dispatch: offload O(N_f²) propagation matrix to GPU when available
+        # GPU dispatch: offload O(N_f²) propagation matrix to GPU when available.
+        # NOTE: _get_gpu_module is defined in fwm_solver — gpu_utils only exposes
+        # has_cupy / get_array_module. The earlier import path was silently
+        # failing into the CPU branch.
         try:
-            from qkd_sim.utils.gpu_utils import _get_gpu_module
+            from qkd_sim.physical.noise.fwm_solver import _get_gpu_module
             _, is_gpu = _get_gpu_module()
             if is_gpu:
                 return self._compute_sprs_psd_batch_gpu(
@@ -681,20 +720,12 @@ class DiscreteSPRSSolver(NoiseSolver):
         (scipy.interpolate doesn't support CuPy), then sigma_2d is transferred
         to GPU for the matrix multiply and propagation integral.
         """
-        from qkd_sim.utils.gpu_utils import _get_gpu_module
+        from qkd_sim.physical.noise.fwm_solver import _get_gpu_module
         xp, _ = _get_gpu_module()
 
-        # CPU: build Raman cross-section matrix (scipy-based, must stay on CPU)
-        f1_2d = f_grid.reshape(-1, 1)
-        f2_2d = f_grid.reshape(1, -1)
-        delta_f_2d = np.abs(f1_2d - f2_2d)
-        g_R_2d = get_raman_gain(delta_f=delta_f_2d, f_pump=f2_2d, A_eff=fiber.A_eff)
-        n_th_2d = _phonon_occupation(delta_f_2d, fiber.T_kelvin)
-        sigma_2d = _raman_cross_section(
-            f_q=f1_2d, f_c=f2_2d,
-            g_R=g_R_2d, n_th=n_th_2d,
-            delta_f=delta_f_2d, noise_bandwidth=df,
-        )  # (N_f, N_f) numpy
+        # CPU: σ_2d (scipy-based interpolation must stay on CPU). Cached across
+        # repeated calls with the same (f_grid, T, A_eff, df).
+        sigma_2d = self._get_sigma_2d(fiber, f_grid, df)  # (N_f, N_f) numpy
 
         # GPU: transfer and run propagation integral
         sigma_gpu = xp.asarray(sigma_2d)
@@ -748,24 +779,20 @@ class DiscreteSPRSSolver(NoiseSolver):
         if not np.any(G_pump > 0.0):
             return np.zeros((f_grid.size, L_values.size), dtype=np.float64)
 
-        f1_2d = f_grid.reshape(-1, 1)
-        f2_2d = f_grid.reshape(1, -1)
-        delta_f_2d = np.abs(f1_2d - f2_2d)
+        # GPU dispatch: the (N_f, N_f, N_L) propagation tensor benefits hugely
+        # from offload — at N_f=6301 the CPU path is forced to batch=1.
+        try:
+            from qkd_sim.physical.noise.fwm_solver import _get_gpu_module
+            _, is_gpu = _get_gpu_module()
+            if is_gpu:
+                return self._compute_sprs_psd_batch_gpu_l_array(
+                    fiber=fiber, f_grid=f_grid, G_pump=G_pump,
+                    L_values=L_values, direction=direction, df=df,
+                )
+        except Exception:
+            pass
 
-        g_R_2d = get_raman_gain(
-            delta_f=delta_f_2d,
-            f_pump=f2_2d,
-            A_eff=fiber.A_eff,
-        )
-        n_th_2d = _phonon_occupation(delta_f_2d, fiber.T_kelvin)
-        sigma_2d = _raman_cross_section(
-            f_q=f1_2d,
-            f_c=f2_2d,
-            g_R=g_R_2d,
-            n_th=n_th_2d,
-            delta_f=delta_f_2d,
-            noise_bandwidth=df,
-        )
+        sigma_2d = self._get_sigma_2d(fiber, f_grid, df)
 
         alpha_grid = fiber.get_loss_at_freq(f_grid)
         alpha1_2d = alpha_grid.reshape(-1, 1)
@@ -774,8 +801,9 @@ class DiscreteSPRSSolver(NoiseSolver):
 
         out = np.zeros((f_grid.size, L_values.size), dtype=np.float64)
         # Limit intermediate (N_f, N_f, batch) array memory usage.
-        # Each such array uses N_f² × batch × 8 bytes.  Target ≤ 256 MB.
-        _MAX_SPRS_TMP_MB = 256
+        # Each such array uses N_f² × batch × 8 bytes.  Raised from 256 MB to
+        # 1024 MB so N_f=6301 (≈302 MB per slice) keeps batch ≥ 3 instead of 1.
+        _MAX_SPRS_TMP_MB = 1024
         _bytes_per_batch = f_grid.size * f_grid.size * 8
         max_l_batch = max(1, int((_MAX_SPRS_TMP_MB * 1024 * 1024) / max(_bytes_per_batch, 1)))
         for start in range(0, L_values.size, max_l_batch):
@@ -810,3 +838,79 @@ class DiscreteSPRSSolver(NoiseSolver):
             out[:, start:stop] = out_bin_power / df
 
         return out
+
+    def _compute_sprs_psd_batch_gpu_l_array(
+        self,
+        fiber: Fiber,
+        f_grid: np.ndarray,
+        G_pump: np.ndarray,
+        L_values: np.ndarray,
+        direction: str,
+        df: float,
+    ) -> np.ndarray:
+        """GPU-accelerated multi-length SpRS PSD batch.
+
+        Parallels ``_compute_sprs_psd_batch_gpu`` but adds a batched L axis.
+        σ_2d / α are computed on CPU (scipy interpolation), then transferred
+        to GPU; the (N_f, N_f, batch) propagation tensor is materialised
+        on-device and reduced along the pump axis. Batch size is sized to
+        roughly 40% of free GPU memory.
+        """
+        from qkd_sim.physical.noise.fwm_solver import _get_gpu_module
+        xp, _ = _get_gpu_module()
+
+        # Reuse CPU σ_2d cache (computation must stay on CPU due to scipy)
+        sigma_2d = self._get_sigma_2d(fiber, f_grid, df)
+        n_f = f_grid.size
+
+        sigma_gpu = xp.asarray(sigma_2d)
+        alpha_np = np.asarray(fiber.get_loss_at_freq(f_grid), dtype=np.float64)
+        alpha1_gpu = xp.asarray(alpha_np).reshape(-1, 1, 1)  # (N_f, 1, 1)
+        alpha2_gpu = xp.asarray(alpha_np).reshape(1, -1, 1)  # (1, N_f, 1)
+        base_gpu = xp.asarray(G_pump, dtype=xp.float64).reshape(1, -1) * sigma_gpu  # (N_f, N_f)
+        L_gpu = xp.asarray(L_values, dtype=xp.float64).reshape(1, 1, -1)            # (1, 1, N_L)
+
+        # Memory-aware batching on GPU. Each (N_f, N_f, batch) float64 tensor
+        # costs ``N_f² × batch × 8 bytes``. We materialise ~3 such tensors
+        # simultaneously (exp_m_alpha1_L, integral, batch_total), so reserve
+        # a 6× factor as headroom.
+        try:
+            free_bytes, _total = xp.cuda.runtime.memGetInfo()
+            budget = int(free_bytes * 0.4)
+        except Exception:
+            budget = 1024 * 1024 * 1024  # 1 GB fallback
+        bytes_per_unit = n_f * n_f * 8 * 6
+        max_l_batch = max(1, min(int(L_values.size), budget // max(bytes_per_unit, 1)))
+
+        out_gpu = xp.zeros((n_f, L_values.size), dtype=xp.float64)
+        if direction == "forward":
+            d_alpha = alpha2_gpu[:, :, 0:1] - alpha1_gpu[:, :, 0:1]  # (N_f, N_f, 1)
+            equal_mask = xp.abs(d_alpha) < _ALPHA_EPS
+            safe_d_alpha = xp.where(equal_mask, xp.ones_like(d_alpha), d_alpha)
+            for start in range(0, L_values.size, max_l_batch):
+                stop = min(start + max_l_batch, L_values.size)
+                L_b = L_gpu[:, :, start:stop]
+                exp_m_alpha1_L = xp.exp(-alpha1_gpu[:, :, 0:1] * L_b)
+                integral = xp.where(
+                    equal_mask,
+                    L_b,
+                    (1.0 - xp.exp(-d_alpha * L_b)) / safe_d_alpha,
+                )
+                batch_t = base_gpu[:, :, xp.newaxis] * exp_m_alpha1_L * integral
+                out_bin_power = xp.sum(batch_t, axis=1) * df  # (N_f, batch) [W]
+                out_gpu[:, start:stop] = out_bin_power / df  # [W/Hz]
+        elif direction == "backward":
+            sum_alpha = alpha1_gpu[:, :, 0:1] + alpha2_gpu[:, :, 0:1]
+            for start in range(0, L_values.size, max_l_batch):
+                stop = min(start + max_l_batch, L_values.size)
+                L_b = L_gpu[:, :, start:stop]
+                batch_t = (
+                    base_gpu[:, :, xp.newaxis]
+                    * (1.0 - xp.exp(-sum_alpha * L_b)) / sum_alpha
+                )
+                out_bin_power = xp.sum(batch_t, axis=1) * df
+                out_gpu[:, start:stop] = out_bin_power / df
+        else:
+            raise ValueError(f"Unsupported direction: {direction!r}")
+
+        return np.asarray(out_gpu.get())
