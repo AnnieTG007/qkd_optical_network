@@ -871,16 +871,26 @@ class DiscreteSPRSSolver(NoiseSolver):
         L_gpu = xp.asarray(L_values, dtype=xp.float64).reshape(1, 1, -1)            # (1, 1, N_L)
 
         # Memory-aware batching on GPU. Each (N_f, N_f, batch) float64 tensor
-        # costs ``N_f² × batch × 8 bytes``. We materialise ~3 such tensors
-        # simultaneously (exp_m_alpha1_L, integral, batch_total), so reserve
-        # a 6× factor as headroom.
+        # costs ``N_f² × batch × 8 bytes``. The peak GPU allocation is:
+        #   pre-loop (fixed): sigma_gpu + base_gpu + d_alpha + safe_d_alpha
+        #                     = 4 × N_f² × 8 bytes  (≈ 1.24 GB at N_f=6301)
+        #   forward loop:     exp + integral + batch_t = 3 × N_f² × 8 × batch
+        #   backward loop:    batch_t = 1 × N_f² × 8 × batch  (sum_alpha is pre-loop)
+        # So the per-batch marginal cost is 3 slices (forward, the worst case).
+        # We reserve ~85% of free VRAM for this budget (leaving headroom for
+        # CuPy's memory pool and any FWM allocations that may still be live).
         try:
             free_bytes, _total = xp.cuda.runtime.memGetInfo()
-            budget = int(free_bytes * 0.4)
+            budget = int(free_bytes * 0.85)
         except Exception:
             budget = 1024 * 1024 * 1024  # 1 GB fallback
-        bytes_per_unit = n_f * n_f * 8 * 6
-        max_l_batch = max(1, min(int(L_values.size), budget // max(bytes_per_unit, 1)))
+        _fixed_slices = 4  # sigma + base + d_alpha + safe_d_alpha
+        _per_batch_slices = 3  # exp + integral + batch_t (forward worst case)
+        budget_slices = budget // max(n_f * n_f * 8, 1)
+        max_l_batch = max(1, min(
+            int(L_values.size),
+            (budget_slices - _fixed_slices) // max(_per_batch_slices, 1),
+        ))
 
         out_gpu = xp.zeros((n_f, L_values.size), dtype=xp.float64)
         if direction == "forward":
