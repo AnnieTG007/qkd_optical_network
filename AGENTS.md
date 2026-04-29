@@ -117,10 +117,16 @@ environment.yml      # conda 环境定义（引用 pyproject.toml）
 
 **参数**：
 - `--type`：`fwm` / `sprs` / `both` / `only_signal` / `with_signal`
-- `--modulation`：`16qam`（默认，Raised Cosine + OSA 16QAM）/ `ook`（NRZ-OOK + OSA OOK）
+- `--modulation`：`dp-16qam`（默认，DP-16QAM Raised Cosine + OSA）/ `ook`（NRZ-OOK + OSA OOK）
+- `--skr-model`：`approx_finite`（默认）/ `infinite` / `strict_finite`（SKR 子图密钥率模型）
+- `--skr-profile`：`custom`（默认）/ `reference`（SKR 配置 profile）
+- `--data-rate`：比特率 [bps]，DP-16QAM 默认 200e9
+- `--resolution`：噪声频率网格分辨率 [Hz]，默认 1e9（1 GHz）
+- `--active-threshold-db`：FWM 活跃频率 bin 阈值 [dB]，默认 -50
 - `--export-excel` / `--export-only`：导出 Excel 后退出（不启动服务器）
+- `--profile-only`：仅跑 0 dBm profile 后退出；`--profile-length-count` 控制采样长度数
 
-详细规范见 [.Codex/plotting.md](plotting.md)。
+完整 CLI 参数（含 `--models`、`--power-levels`、经典信道策略等）见 [README.md](../README.md)；绘图规范见 [.Codex/plotting.md](plotting.md)。
 
 ---
 

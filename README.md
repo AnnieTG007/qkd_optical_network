@@ -56,7 +56,7 @@ wdm_cfg = WDMConfig(
     start_channel=1,
     end_channel=61,
     channel_spacing=100e9,
-    B_s=32e9,
+    B_s=25e9,
     P0=1e-3,
     quantum_channel_indices=[38, 39, 40, 41],  # 1-based ITU G.694.1 信道号（C38=193.8THz 等）
 )
@@ -77,18 +77,22 @@ print("SpRS 前向噪声:", noise["sprs_fwd"])
 | 参数 | 说明 |
 |------|------|
 | `--type` | 噪声类型：`fwm`, `sprs`, `both`, `only_signal`, `with_signal` |
-| `--modulation` | 调制格式：`16qam`（默认，Raised Cosine + OSA 16QAM），`ook`（NRZ-OOK + OSA OOK），`dp-16qam` |
+| `--modulation` | 调制格式：`dp-16qam`（默认，DP-16QAM Raised Cosine + OSA），`ook`（NRZ-OOK + OSA OOK） |
+| `--resolution` | 噪声频率网格分辨率 [Hz]，默认 1e9（1 GHz，仅 `plot_noise_dash_ch.py`） |
+| `--data-rate` | 比特率 [bps]，默认 200e9（DP-16QAM）/ 10.3e9（OOK） |
+| `--active-threshold-db` | FWM 活跃频率 bin 阈值 [dB]，默认 -50 |
+| `--skr-profile` | SKR 配置 profile：`custom`（默认）/ `reference` |
 | `--skr-model` | SKR 模型：`approx_finite`（默认），`infinite`，`strict_finite` |
 | `--export-excel` | 预计算后导出 Excel 文件并退出（不启动 Dash 服务器） |
 | `--export-only` | `--export-excel` 的简写 |
 
 ```bash
 # App 1: 噪声 vs 光纤长度（端口 8050）
-python scripts/plot_noise_dash_len.py --type=fwm --modulation=16qam
+python scripts/plot_noise_dash_len.py --type=fwm --modulation=dp-16qam
 python scripts/plot_noise_dash_len.py --type=fwm --modulation=ook
 
 # App 2: 噪声 vs 量子信道频率（端口 8051）
-python scripts/plot_noise_dash_ch.py --type=fwm --modulation=16qam
+python scripts/plot_noise_dash_ch.py --type=fwm --modulation=dp-16qam
 python scripts/plot_noise_dash_ch.py --type=both --modulation=ook
 
 # 导出 Excel 后直接退出
@@ -149,10 +153,10 @@ classical_channel_indices: [30, 31, 32]    # C30/C31/C32（193.0–193.2 THz）
 
 #### 调制格式
 
-通过 `--modulation ook|16qam` 参数选择，不修改 YAML：
+通过 `--modulation ook|dp-16qam` 参数选择，不修改 YAML：
 ```bash
 python scripts/plot_noise_dash_ch.py --type=fwm --modulation=ook    # OOK 场景
-python scripts/plot_noise_dash_ch.py --type=fwm --modulation=16qam  # 16QAM 场景（默认）
+python scripts/plot_noise_dash_ch.py --type=fwm --modulation=dp-16qam  # DP-16QAM 场景（默认）
 ```
 
 #### 经典信道策略配置
