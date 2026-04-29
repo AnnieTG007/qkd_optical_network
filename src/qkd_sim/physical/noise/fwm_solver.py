@@ -34,24 +34,8 @@ from qkd_sim.physical.noise.base import NoiseSolver
 # Diagnostic prints (N_active / chunk_size) only emitted when DEBUG_MODE is set.
 _DEBUG_MODE: bool = os.environ.get("DEBUG_MODE", "").lower() in ("1", "true", "yes", "on")
 
-# GPU acceleration: lazily-imported so CPU-only environments are unaffected.
-_gpu_xp: "type | None" = None
-
-
-def _get_gpu_module() -> tuple["type", bool]:
-    """Return (xp, is_gpu) where xp is cupy or numpy."""
-    global _gpu_xp
-    if _gpu_xp is None:
-        try:
-            from qkd_sim.utils.gpu_utils import get_array_module, has_cupy
-
-            if has_cupy():
-                _gpu_xp = get_array_module()
-                return _gpu_xp, True
-        except Exception:
-            pass
-        _gpu_xp = np
-    return _gpu_xp, _gpu_xp is not np
+# GPU acceleration: shared helper from gpu_utils (also used by sprs_solver).
+from qkd_sim.utils.gpu_utils import get_gpu_module as _get_gpu_module
 
 
 # =============================================================================

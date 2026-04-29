@@ -192,11 +192,8 @@ def compute_noise_spectrum(
 
     if noise_type in ("sprs", "all"):
         solver = sprs_solver if sprs_solver is not None else DiscreteSPRSSolver()
-        result["sprs_fwd"] = solver.compute_sprs_spectrum_conti(
-            fiber, wdm_grid, f_eval, direction="forward"
-        )
-        result["sprs_bwd"] = solver.compute_sprs_spectrum_conti(
-            fiber, wdm_grid, f_eval, direction="backward"
+        result["sprs_fwd"], result["sprs_bwd"] = solver.compute_sprs_spectrum_conti(
+            fiber, wdm_grid, f_eval, direction="both"
         )
         result["sprs"] = result["sprs_fwd"] + result["sprs_bwd"]
 

@@ -148,3 +148,13 @@ def to_host(arr: "ndarray | np.ndarray") -> np.ndarray:
 def has_cupy() -> bool:
     """Return True if CuPy with a functional GPU is available."""
     return _GPU_ENABLED
+
+
+def get_gpu_module() -> "tuple[type, bool]":
+    """Return ``(xp, is_gpu)`` where *xp* is ``cupy`` or ``numpy``.
+
+    Caches the result so repeated calls are cheap.  Use this instead of
+    ``get_array_module()`` when you also need the boolean ``is_gpu`` flag
+    (e.g. to decide between a CPU and a GPU code path).
+    """
+    return (xp, True) if _GPU_ENABLED else (np, False)

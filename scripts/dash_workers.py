@@ -58,8 +58,9 @@ def mp_worker_single_length(
         if nt in ("sprs", "both"):
             slv = DiscreteSPRSSolver()
             df = float(np.mean(np.diff(fgr)))
-            fwd += slv.compute_sprs_spectrum_conti(fib, grd, fgr, direction="forward") / df
-            bwd += slv.compute_sprs_spectrum_conti(fib, grd, fgr, direction="backward") / df
+            sp_fwd, sp_bwd = slv.compute_sprs_spectrum_conti(fib, grd, fgr, direction="both")
+            fwd += sp_fwd / df
+            bwd += sp_bwd / df
         return np.asarray(fwd, dtype=np.float64), np.asarray(bwd, dtype=np.float64)
 
     cfg = WDMConfig(**wdm_cfg)

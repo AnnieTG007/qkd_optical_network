@@ -1565,19 +1565,13 @@ def _compute_noise_spectrum_pair(
 
     if noise_type in ("sprs", "both"):
         solver = DiscreteSPRSSolver()
-        df_grid = float(np.mean(np.diff(f_grid)))
+        sprs_fwd, sprs_bwd = solver.compute_sprs_spectrum_conti(
+            fiber, grid, f_grid, direction="both", L_arr=L_arr,
+        )
         if L_arr is None:
-            sprs_fwd = solver.compute_sprs_spectrum_conti(fiber, grid, f_grid, direction="forward")
-            sprs_bwd = solver.compute_sprs_spectrum_conti(fiber, grid, f_grid, direction="backward")
             fwd[:, 0] += sprs_fwd
             bwd[:, 0] += sprs_bwd
         else:
-            sprs_fwd = solver.compute_sprs_spectrum_conti_l_array(
-                fiber, grid, f_grid, L_arr=L_arr, direction="forward"
-            )
-            sprs_bwd = solver.compute_sprs_spectrum_conti_l_array(
-                fiber, grid, f_grid, L_arr=L_arr, direction="backward"
-            )
             fwd += sprs_fwd
             bwd += sprs_bwd
 

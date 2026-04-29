@@ -418,6 +418,55 @@ class DiscreteSPRSSolver(NoiseSolver):
                 psd[i, :] = ch.get_psd(f_grid)
         return psd
 
+    @staticmethod
+    def _integrate_psd_per_channel(
+        psd: np.ndarray,
+        f_grid: np.ndarray,
+        df: float,
+        q_chs: list,
+    ) -> np.ndarray:
+        """对 PSD 在量子信道带宽内积分得到 per-channel 功率。
+
+        使用前缀和（prefix sum）实现 O(N_f + N_q) 复杂度。
+        f_grid 必须等间距，索引由公式直接计算无需二分查找。
+
+        Parameters
+        ----------
+        psd : ndarray, shape (N_f,) or (N_f, N_L)
+            PSD G_sprs(f) [W/Hz]
+        f_grid : ndarray, shape (N_f,)
+            评估频率网格 [Hz]，等间距
+        df : float
+            频率步长 [Hz]
+        q_chs : list[WDMChannel]
+            量子信道列表
+
+        Returns
+        -------
+        ndarray, shape (N_q,) or (N_q, N_L)
+            每个量子信道的积分噪声功率 [W]
+        """
+        n_q = len(q_chs)
+        f0 = float(f_grid[0])
+        n_f = f_grid.size
+        psd_2d = psd.ndim == 2
+
+        prefix = np.cumsum(psd, axis=0) * df
+        P = np.zeros((n_q, psd.shape[1]) if psd_2d else n_q, dtype=np.float64)
+
+        for i, ch in enumerate(q_chs):
+            f_lo = ch.f_center - ch.B_s / 2.0
+            f_hi = ch.f_center + ch.B_s / 2.0
+            idx_lo = max(0, min(n_f - 1, int(np.round((f_lo - f0) / df))))
+            idx_hi = max(0, min(n_f - 1, int(np.round((f_hi - f0) / df))))
+            if idx_hi > idx_lo:
+                P[i] = prefix[idx_hi] - prefix[idx_lo]
+            else:
+                idx = max(0, min(n_f - 1, int(np.round((ch.f_center - f0) / df))))
+                P[i] = psd[idx] * df if not psd_2d else psd[idx] * df
+
+        return P
+
     def compute_forward_conti(
         self,
         fiber: Fiber,
@@ -426,7 +475,8 @@ class DiscreteSPRSSolver(NoiseSolver):
     ) -> np.ndarray:
         """连续前向 SpRS 噪声功率 [公式 3.2.1 + 3.2.2]。
 
-        在泵浦频率 f_2 上对 G_{f,2→1} 积分。
+        复用 ``compute_sprs_spectrum_conti`` 的 PSD 结果，
+        在每个量子信道带宽内积分得到 per-channel 功率。
         当所有经典信道均为 SINGLE_FREQ 时，退化为离散模型（交叉验证极限）。
         """
         c_chs = wdm_grid.get_classical_channels()
@@ -436,45 +486,14 @@ class DiscreteSPRSSolver(NoiseSolver):
             return self.compute_forward(fiber, wdm_grid)
 
         df = self._validate_frequency_grid(f_grid)
+        f_grid = np.asarray(f_grid, dtype=np.float64)
         q_chs = wdm_grid.get_quantum_channels()
         assert len(q_chs) > 0, "WDMGrid 中无量子信道"
 
-        f_q = np.array([ch.f_center for ch in q_chs], dtype=np.float64).reshape(-1, 1)
-        f_2 = np.asarray(f_grid, dtype=np.float64).reshape(1, -1)
-
-        G_classical = self._build_classical_psd_matrix(wdm_grid, f_grid, df)
-        G_pump = G_classical.sum(axis=0, keepdims=True)  # shape (1, N_f)
-
-        alpha1 = np.asarray(fiber.get_loss_at_freq(f_q), dtype=np.float64).reshape(-1, 1)
-        alpha2 = np.asarray(fiber.get_loss_at_freq(f_2), dtype=np.float64).reshape(1, -1)
-
-        delta_f = np.abs(f_q - f_2)
-        g_R = get_raman_gain(delta_f=delta_f, f_pump=f_2, A_eff=fiber.A_eff)
-        n_th = _phonon_occupation(delta_f, fiber.T_kelvin)
-        noise_bandwidth = np.array(
-            [ch.B_s for ch in q_chs],
-            dtype=np.float64,
-        ).reshape(-1, 1)
-        sigma = _raman_cross_section(
-            f_q=f_q,
-            f_c=f_2,
-            g_R=g_R,
-            n_th=n_th,
-            delta_f=delta_f,
-            noise_bandwidth=noise_bandwidth,
+        psd = self.compute_sprs_spectrum_conti(
+            fiber, wdm_grid, f_grid, direction="forward"
         )
-
-        G_fwd = _forward_propagation(
-            sigma=sigma,
-            P_pump=G_pump,
-            alpha1=alpha1,
-            alpha2=alpha2,
-            L=fiber.L,
-        )  # shape (N_q, N_f)
-
-        P_fwd = np.sum(G_fwd, axis=1) * df  # formula 3.2.2
-        assert P_fwd.shape == (len(q_chs),)
-        return P_fwd
+        return self._integrate_psd_per_channel(psd, f_grid, df, q_chs)
 
     def compute_backward_conti(
         self,
@@ -484,7 +503,8 @@ class DiscreteSPRSSolver(NoiseSolver):
     ) -> np.ndarray:
         """连续后向 SpRS 噪声功率 [公式 3.2.3 + 3.2.4]。
 
-        在泵浦频率 f_2 上对 G_{b,2→1} 积分。
+        复用 ``compute_sprs_spectrum_conti`` 的 PSD 结果，
+        在每个量子信道带宽内积分得到 per-channel 功率。
         当所有经典信道均为 SINGLE_FREQ 时，退化为离散模型（交叉验证极限）。
         """
         c_chs = wdm_grid.get_classical_channels()
@@ -494,45 +514,14 @@ class DiscreteSPRSSolver(NoiseSolver):
             return self.compute_backward(fiber, wdm_grid)
 
         df = self._validate_frequency_grid(f_grid)
+        f_grid = np.asarray(f_grid, dtype=np.float64)
         q_chs = wdm_grid.get_quantum_channels()
         assert len(q_chs) > 0, "WDMGrid 中无量子信道"
 
-        f_q = np.array([ch.f_center for ch in q_chs], dtype=np.float64).reshape(-1, 1)
-        f_2 = np.asarray(f_grid, dtype=np.float64).reshape(1, -1)
-
-        G_classical = self._build_classical_psd_matrix(wdm_grid, f_grid, df)
-        G_pump = G_classical.sum(axis=0, keepdims=True)  # shape (1, N_f)
-
-        alpha1 = np.asarray(fiber.get_loss_at_freq(f_q), dtype=np.float64).reshape(-1, 1)
-        alpha2 = np.asarray(fiber.get_loss_at_freq(f_2), dtype=np.float64).reshape(1, -1)
-
-        delta_f = np.abs(f_q - f_2)
-        g_R = get_raman_gain(delta_f=delta_f, f_pump=f_2, A_eff=fiber.A_eff)
-        n_th = _phonon_occupation(delta_f, fiber.T_kelvin)
-        noise_bandwidth = np.array(
-            [ch.B_s for ch in q_chs],
-            dtype=np.float64,
-        ).reshape(-1, 1)
-        sigma = _raman_cross_section(
-            f_q=f_q,
-            f_c=f_2,
-            g_R=g_R,
-            n_th=n_th,
-            delta_f=delta_f,
-            noise_bandwidth=noise_bandwidth,
+        psd = self.compute_sprs_spectrum_conti(
+            fiber, wdm_grid, f_grid, direction="backward"
         )
-
-        G_bwd = _backward_propagation(
-            sigma=sigma,
-            P_pump=G_pump,
-            alpha1=alpha1,
-            alpha2=alpha2,
-            L=fiber.L,
-        )  # shape (N_q, N_f)
-
-        P_bwd = np.sum(G_bwd, axis=1) * df  # formula 3.2.4
-        assert P_bwd.shape == (len(q_chs),)
-        return P_bwd
+        return self._integrate_psd_per_channel(psd, f_grid, df, q_chs)
 
     # --- 噪声 PSD 谱计算 — 向量化版本（全频率一次计算）-----------
 
@@ -588,65 +577,229 @@ class DiscreteSPRSSolver(NoiseSolver):
         self._sigma_cache[key] = sigma_2d
         return sigma_2d
 
-    def _compute_sprs_psd_batch(
+    # ---------------------------------------------------------------------
+    # 连续谱 PSD 计算 — 统一实现（CPU / GPU，单 L / 多 L，单 / 双向）
+    # ---------------------------------------------------------------------
+
+    def _compute_sprs_psd_batch_cpu(
         self,
         fiber: Fiber,
         f_grid: np.ndarray,
         G_pump: np.ndarray,
-        direction: str,
         df: float,
-    ) -> np.ndarray:
-        """向量化计算 SpRS 噪声 PSD G_sprs(f) [W/Hz]，一次处理全部 f_grid 点。
-
-        将原来的 N_f 次循环（每次 O(N_f²)）合并为一次 O(N_f²) 操作，
-        通过 2D 广播完全消除 Python for 循环。
+        L_values: np.ndarray,
+        do_fwd: bool,
+        do_bwd: bool,
+    ):
+        """CPU vectorized SpRS PSD batch — unified over L and direction.
 
         Parameters
         ----------
         fiber : Fiber
         f_grid : ndarray, shape (N_f,)
-        G_pump : ndarray, shape (N_f,)  — 总泵浦 PSD
-        direction : {"forward", "backward"}
-        df : float  — 频率网格步长
+        G_pump : ndarray, shape (N_f,)
+        df : float
+        L_values : ndarray, shape (N_L,)
+        do_fwd : bool
+        do_bwd : bool
 
         Returns
         -------
-        ndarray, shape (N_f,)  — G_sprs(f) at each f_grid point
+        If do_fwd and do_bwd: (fwd, bwd) each (N_f, N_L)
+        Else: ndarray, shape (N_f, N_L)
         """
         sigma_2d = self._get_sigma_2d(fiber, f_grid, df)  # (N_f, N_f)
 
-        # ---- 衰减系数（2D 广播）----
-        alpha1_2d = fiber.get_loss_at_freq(f_grid).reshape(-1, 1)  # (N_f, 1)
-        alpha2_2d = fiber.get_loss_at_freq(f_grid).reshape(1, -1)  # (1, N_f)
+        alpha_grid = fiber.get_loss_at_freq(f_grid)
+        alpha1_2d = alpha_grid.reshape(-1, 1)             # (N_f, 1)
+        alpha2_2d = alpha_grid.reshape(1, -1)             # (1, N_f)
+        base_2d = np.asarray(G_pump, dtype=np.float64).reshape(1, -1) * sigma_2d  # (N_f, N_f)
 
-        # ---- 泵浦功率（2D 广播）----
-        G_pump_2d = np.asarray(G_pump, dtype=np.float64).reshape(1, -1)  # (1, N_f)
+        n_l = L_values.size
+        n_f = f_grid.size
 
-        # ---- 方向传播积分 ----
-        if direction == "forward":
-            integrand_2d = _forward_propagation(
-                sigma=sigma_2d,
-                P_pump=G_pump_2d,
-                alpha1=alpha1_2d,
-                alpha2=alpha2_2d,
-                L=fiber.L,
-            )  # (N_f, N_f)
-        elif direction == "backward":
-            integrand_2d = _backward_propagation(
-                sigma=sigma_2d,
-                P_pump=G_pump_2d,
-                alpha1=alpha1_2d,
-                alpha2=alpha2_2d,
-                L=fiber.L,
-            )  # (N_f, N_f)
+        # Memory-budgeted batch size: limit intermediate (N_f, N_f, batch) usage.
+        _MAX_SPRS_TMP_MB = 1024
+        _bytes_per_slice = n_f * n_f * 8
+        max_l_batch = max(1, int((_MAX_SPRS_TMP_MB * 1024 * 1024) / max(_bytes_per_slice, 1)))
+
+        def _forward_batch(start: int, stop: int) -> np.ndarray:
+            L_b = L_values[start:stop].reshape(1, 1, -1)
+            d_alpha = alpha2_2d - alpha1_2d
+            equal_mask = np.abs(d_alpha) < _ALPHA_EPS
+            d_alpha_3d = d_alpha[:, :, np.newaxis]
+            equal_3d = equal_mask[:, :, np.newaxis]
+            exp_m_alpha1_L = np.exp(-alpha1_2d[:, :, np.newaxis] * L_b)
+            integral = np.where(
+                equal_3d,
+                L_b,
+                (1.0 - np.exp(-d_alpha_3d * L_b)) / np.where(equal_3d, 1.0, d_alpha_3d),
+            )
+            batch_t = base_2d[:, :, np.newaxis] * exp_m_alpha1_L * integral
+            out_bin_power = np.sum(batch_t, axis=1) * df
+            return out_bin_power / df  # (N_f, batch) [W/Hz]
+
+        def _backward_batch(start: int, stop: int) -> np.ndarray:
+            L_b = L_values[start:stop].reshape(1, 1, -1)
+            sum_alpha = alpha1_2d + alpha2_2d
+            sum_alpha_3d = sum_alpha[:, :, np.newaxis]
+            batch_t = (
+                base_2d[:, :, np.newaxis]
+                * (1.0 - np.exp(-sum_alpha_3d * L_b)) / sum_alpha_3d
+            )
+            out_bin_power = np.sum(batch_t, axis=1) * df
+            return out_bin_power / df
+
+        fwd = np.zeros((n_f, n_l), dtype=np.float64) if do_fwd else None
+        bwd = np.zeros((n_f, n_l), dtype=np.float64) if do_bwd else None
+
+        for start in range(0, n_l, max_l_batch):
+            stop = min(start + max_l_batch, n_l)
+            if do_fwd:
+                fwd[:, start:stop] = _forward_batch(start, stop)
+            if do_bwd:
+                bwd[:, start:stop] = _backward_batch(start, stop)
+
+        if do_fwd and do_bwd:
+            return fwd, bwd
+        return fwd if do_fwd else bwd
+
+    def _compute_sprs_psd_batch_gpu(
+        self,
+        fiber: Fiber,
+        f_grid: np.ndarray,
+        G_pump: np.ndarray,
+        df: float,
+        L_values: np.ndarray,
+        do_fwd: bool,
+        do_bwd: bool,
+    ):
+        """GPU-accelerated SpRS PSD batch — unified over L and direction.
+
+        Raman gain / phonon / cross-section computed on CPU (scipy.interpolate
+        does not support CuPy), then sigma_2d is transferred to GPU for the
+        propagation integral.
+        """
+        from qkd_sim.utils.gpu_utils import get_gpu_module as _get_gpu_module
+        xp, _ = _get_gpu_module()
+
+        sigma_2d = self._get_sigma_2d(fiber, f_grid, df)  # np (N_f, N_f)
+        n_f = f_grid.size
+        n_l = L_values.size
+
+        sigma_gpu = xp.asarray(sigma_2d)
+        alpha_np = np.asarray(fiber.get_loss_at_freq(f_grid), dtype=np.float64)
+        alpha1_gpu = xp.asarray(alpha_np).reshape(-1, 1, 1)   # (N_f, 1, 1)
+        alpha2_gpu = xp.asarray(alpha_np).reshape(1, -1, 1)   # (1, N_f, 1)
+        base_gpu = xp.asarray(G_pump, dtype=xp.float64).reshape(1, -1) * sigma_gpu  # (N_f, N_f)
+        L_gpu = xp.asarray(L_values, dtype=xp.float64).reshape(1, 1, -1)            # (1, 1, N_L)
+
+        # Memory-aware batching
+        try:
+            free_bytes, _total = xp.cuda.runtime.memGetInfo()
+            budget = int(free_bytes * 0.85)
+        except Exception:
+            budget = 1024 * 1024 * 1024  # 1 GB fallback
+        _fixed_slices = 4   # sigma + base + d_alpha + safe_d_alpha
+        _per_batch_slices = 3  # exp + integral + batch_t (forward worst case)
+        budget_slices = budget // max(n_f * n_f * 8, 1)
+        max_l_batch = max(1, min(
+            n_l,
+            (budget_slices - _fixed_slices) // max(_per_batch_slices, 1),
+        ))
+
+        def _forward_gpu_chunk(start: int, stop: int):
+            L_b = L_gpu[:, :, start:stop]
+            d_alpha = alpha2_gpu[:, :, 0:1] - alpha1_gpu[:, :, 0:1]
+            equal_mask = xp.abs(d_alpha) < _ALPHA_EPS
+            safe_d_alpha = xp.where(equal_mask, xp.ones_like(d_alpha), d_alpha)
+            exp_m_alpha1_L = xp.exp(-alpha1_gpu[:, :, 0:1] * L_b)
+            integral = xp.where(
+                equal_mask,
+                L_b,
+                (1.0 - xp.exp(-d_alpha * L_b)) / safe_d_alpha,
+            )
+            batch_t = base_gpu[:, :, xp.newaxis] * exp_m_alpha1_L * integral
+            out_bin_power = xp.sum(batch_t, axis=1) * df
+            return out_bin_power / df  # (N_f, batch) [W/Hz]
+
+        def _backward_gpu_chunk(start: int, stop: int):
+            L_b = L_gpu[:, :, start:stop]
+            sum_alpha = alpha1_gpu[:, :, 0:1] + alpha2_gpu[:, :, 0:1]
+            batch_t = (
+                base_gpu[:, :, xp.newaxis]
+                * (1.0 - xp.exp(-sum_alpha * L_b)) / sum_alpha
+            )
+            out_bin_power = xp.sum(batch_t, axis=1) * df
+            return out_bin_power / df
+
+        fwd = xp.zeros((n_f, n_l), dtype=xp.float64) if do_fwd else None
+        bwd = xp.zeros((n_f, n_l), dtype=xp.float64) if do_bwd else None
+
+        for start in range(0, n_l, max_l_batch):
+            stop = min(start + max_l_batch, n_l)
+            if do_fwd:
+                fwd[:, start:stop] = _forward_gpu_chunk(start, stop)
+            if do_bwd:
+                bwd[:, start:stop] = _backward_gpu_chunk(start, stop)
+
+        if do_fwd and do_bwd:
+            return np.asarray(fwd.get()), np.asarray(bwd.get())
+        result = fwd if do_fwd else bwd
+        return np.asarray(result.get())
+
+    def _compute_sprs_spectrum_conti_impl(
+        self,
+        fiber: Fiber,
+        wdm_grid: WDMGrid,
+        f_grid: np.ndarray,
+        direction: str,
+        L_arr: np.ndarray | None,
+        use_gpu: bool,
+    ):
+        """Unified SpRS PSD computation (single-L, multi-L, single/both directions).
+
+        direction: "forward" | "backward" | "both"
+        """
+        do_fwd = direction in ("forward", "both")
+        do_bwd = direction in ("backward", "both")
+
+        f_grid = np.asarray(f_grid, dtype=np.float64)
+        df = self._validate_frequency_grid(f_grid)
+
+        G_classical = self._build_classical_psd_matrix(wdm_grid, f_grid, df)
+        G_pump = G_classical.sum(axis=0)
+        L_values = np.array([fiber.L]) if L_arr is None else np.asarray(L_arr, dtype=np.float64).reshape(-1)
+
+        n_f = f_grid.size
+        n_l = L_values.size
+
+        def _zeros(shape):
+            return np.zeros(shape, dtype=np.float64)
+
+        if not np.any(G_pump > 0.0):
+            if do_fwd and do_bwd:
+                shape = (n_f, n_l) if n_l > 1 else (n_f,)
+                z = _zeros(shape)
+                return z, z.copy() if L_arr is not None else (z.copy(), z.copy())
+            shape = (n_f, n_l)
+            return _zeros(shape).squeeze() if L_arr is None else _zeros(shape)
+
+        if use_gpu:
+            result = self._compute_sprs_psd_batch_gpu(
+                fiber, f_grid, G_pump, df, L_values, do_fwd, do_bwd,
+            )
         else:
-            raise ValueError(f"Unsupported direction: {direction}")
+            result = self._compute_sprs_psd_batch_cpu(
+                fiber, f_grid, G_pump, df, L_values, do_fwd, do_bwd,
+            )
 
-        # ---- 积分（沿泵浦轴求和）----
-        # 对每个信号频率 f_grid[j]，对所有泵浦频率积分
-        # integrand_2d[j, k]: f_grid[j] 作为信号、f_grid[k] 作为泵浦的贡献
-        out_bin_power = np.sum(integrand_2d, axis=1) * df  # (N_f,) [W]
-        return out_bin_power / df  # [W/Hz]
+        # Squeeze single-L dimension for backward-compatible output shape
+        if L_arr is None:
+            if do_fwd and do_bwd:
+                return result[0][:, 0], result[1][:, 0]  # (N_f,), (N_f,)
+            return result[:, 0]  # (N_f,)
+        return result
 
     def compute_sprs_spectrum_conti(
         self,
@@ -654,11 +807,9 @@ class DiscreteSPRSSolver(NoiseSolver):
         wdm_grid: WDMGrid,
         f_grid: np.ndarray,
         direction: str = "forward",
-    ) -> np.ndarray:
-        """计算 SpRS 噪声 PSD G_sprs(f) [W/Hz]，在 f_grid 每个频率点评估。
-
-        返回 shape (N_f,) 的噪声功率谱密度数组。
-        用于绘制连续噪声功率谱曲线（而非信道积分噪声标量）。
+        L_arr: np.ndarray | None = None,
+    ):
+        """计算 SpRS 噪声 PSD G_sprs(f) [W/Hz]。
 
         Parameters
         ----------
@@ -666,94 +817,22 @@ class DiscreteSPRSSolver(NoiseSolver):
         wdm_grid : WDMGrid
         f_grid : ndarray
             输出频率网格 [Hz]
-        direction : {"forward", "backward"}
+        direction : {"forward", "backward", "both"}
+            ``"both"`` 返回 ``(fwd, bwd)`` tuple。
+        L_arr : ndarray or None
+            光纤长度数组 [m]。None 时使用 ``fiber.L``。
 
         Returns
         -------
-        ndarray, shape (N_f,)
-            G_sprs(f) [W/Hz] at each f_grid point
+        ndarray, shape (N_f,) or (N_f, N_L)
+            direction="both" 时返回 ``(fwd, bwd)`` 各 shape (N_f,) or (N_f, N_L)。
         """
-        f_grid = np.asarray(f_grid, dtype=np.float64)
-        df = self._validate_frequency_grid(f_grid)
-
-        G_classical = self._build_classical_psd_matrix(wdm_grid, f_grid, df)
-        G_pump = G_classical.sum(axis=0)
-        if not np.any(G_pump > 0.0):
-            return np.zeros_like(f_grid, dtype=np.float64)
-
-        # GPU dispatch: offload O(N_f²) propagation matrix to GPU when available.
-        # NOTE: _get_gpu_module is defined in fwm_solver — gpu_utils only exposes
-        # has_cupy / get_array_module. The earlier import path was silently
-        # failing into the CPU branch.
-        try:
-            from qkd_sim.physical.noise.fwm_solver import _get_gpu_module
-            _, is_gpu = _get_gpu_module()
-            if is_gpu:
-                return self._compute_sprs_psd_batch_gpu(
-                    fiber=fiber, f_grid=f_grid, G_pump=G_pump,
-                    direction=direction, df=df,
-                )
-        except Exception:
-            pass
-
-        # CPU vectorized path: one O(N_f²) operation, no Python for loops
-        return self._compute_sprs_psd_batch(
-            fiber=fiber,
-            f_grid=f_grid,
-            G_pump=G_pump,
-            direction=direction,
-            df=df,
+        from qkd_sim.utils.gpu_utils import get_gpu_module as _get_gpu_module
+        _, is_gpu = _get_gpu_module()
+        return self._compute_sprs_spectrum_conti_impl(
+            fiber, wdm_grid, f_grid,
+            direction=direction, L_arr=L_arr, use_gpu=is_gpu,
         )
-
-    def _compute_sprs_psd_batch_gpu(
-        self,
-        fiber: Fiber,
-        f_grid: np.ndarray,
-        G_pump: np.ndarray,
-        direction: str,
-        df: float,
-    ) -> np.ndarray:
-        """GPU-accelerated SpRS PSD batch computation.
-
-        Mirrors _compute_sprs_psd_batch but moves the (N_f, N_f) propagation
-        integral to GPU. Raman gain / phonon / cross-section computed on CPU
-        (scipy.interpolate doesn't support CuPy), then sigma_2d is transferred
-        to GPU for the matrix multiply and propagation integral.
-        """
-        from qkd_sim.physical.noise.fwm_solver import _get_gpu_module
-        xp, _ = _get_gpu_module()
-
-        # CPU: σ_2d (scipy-based interpolation must stay on CPU). Cached across
-        # repeated calls with the same (f_grid, T, A_eff, df).
-        sigma_2d = self._get_sigma_2d(fiber, f_grid, df)  # (N_f, N_f) numpy
-
-        # GPU: transfer and run propagation integral
-        sigma_gpu = xp.asarray(sigma_2d)
-        G_pump_gpu = xp.asarray(G_pump, dtype=xp.float64).reshape(1, -1)
-        alpha_np = np.asarray(fiber.get_loss_at_freq(f_grid), dtype=np.float64)
-        alpha1_gpu = xp.asarray(alpha_np).reshape(-1, 1)
-        alpha2_gpu = xp.asarray(alpha_np).reshape(1, -1)
-
-        if direction == "forward":
-            d_alpha = alpha2_gpu - alpha1_gpu
-            exp_m_alpha1_L = xp.exp(-alpha1_gpu * fiber.L)
-            equal_mask = xp.abs(d_alpha) < _ALPHA_EPS
-            safe_d_alpha = xp.where(equal_mask, xp.ones_like(d_alpha), d_alpha)
-            integral = xp.where(
-                equal_mask,
-                float(fiber.L),
-                (1.0 - xp.exp(-d_alpha * fiber.L)) / safe_d_alpha,
-            )
-            integrand = G_pump_gpu * sigma_gpu * exp_m_alpha1_L * integral
-        elif direction == "backward":
-            sum_alpha = alpha1_gpu + alpha2_gpu
-            integrand = G_pump_gpu * sigma_gpu * (1.0 - xp.exp(-sum_alpha * fiber.L)) / sum_alpha
-        else:
-            raise ValueError(f"Unsupported direction: {direction!r}")
-
-        out_bin_power = xp.sum(integrand, axis=1) * df  # (N_f,) [W]
-        result = out_bin_power / df                      # (N_f,) [W/Hz]
-        return np.asarray(result.get())
 
     def compute_sprs_spectrum_conti_l_array(
         self,
@@ -765,162 +844,8 @@ class DiscreteSPRSSolver(NoiseSolver):
     ) -> np.ndarray:
         """Compute continuous SpRS spectrum for multiple fiber lengths.
 
-        This is the same formula path as ``compute_sprs_spectrum_conti``, but
-        it hoists the Raman cross-section, pump PSD, and loss matrices outside
-        the length loop. The returned array has shape ``(N_f, N_L)`` and each
-        column matches a separate call using ``fiber.L == L_arr[i]``.
+        Thin wrapper around ``compute_sprs_spectrum_conti(..., L_arr=L_arr)``.
         """
-        f_grid = np.asarray(f_grid, dtype=np.float64)
-        L_values = np.asarray(L_arr, dtype=np.float64).reshape(-1)
-        df = self._validate_frequency_grid(f_grid)
-
-        G_classical = self._build_classical_psd_matrix(wdm_grid, f_grid, df)
-        G_pump = G_classical.sum(axis=0)
-        if not np.any(G_pump > 0.0):
-            return np.zeros((f_grid.size, L_values.size), dtype=np.float64)
-
-        # GPU dispatch: the (N_f, N_f, N_L) propagation tensor benefits hugely
-        # from offload — at N_f=6301 the CPU path is forced to batch=1.
-        try:
-            from qkd_sim.physical.noise.fwm_solver import _get_gpu_module
-            _, is_gpu = _get_gpu_module()
-            if is_gpu:
-                return self._compute_sprs_psd_batch_gpu_l_array(
-                    fiber=fiber, f_grid=f_grid, G_pump=G_pump,
-                    L_values=L_values, direction=direction, df=df,
-                )
-        except Exception:
-            pass
-
-        sigma_2d = self._get_sigma_2d(fiber, f_grid, df)
-
-        alpha_grid = fiber.get_loss_at_freq(f_grid)
-        alpha1_2d = alpha_grid.reshape(-1, 1)
-        alpha2_2d = alpha_grid.reshape(1, -1)
-        base_2d = np.asarray(G_pump, dtype=np.float64).reshape(1, -1) * sigma_2d
-
-        out = np.zeros((f_grid.size, L_values.size), dtype=np.float64)
-        # Limit intermediate (N_f, N_f, batch) array memory usage.
-        # Each such array uses N_f² × batch × 8 bytes.  Raised from 256 MB to
-        # 1024 MB so N_f=6301 (≈302 MB per slice) keeps batch ≥ 3 instead of 1.
-        _MAX_SPRS_TMP_MB = 1024
-        _bytes_per_batch = f_grid.size * f_grid.size * 8
-        max_l_batch = max(1, int((_MAX_SPRS_TMP_MB * 1024 * 1024) / max(_bytes_per_batch, 1)))
-        for start in range(0, L_values.size, max_l_batch):
-            stop = min(start + max_l_batch, L_values.size)
-            L_batch = L_values[start:stop].reshape(1, 1, -1)
-
-            if direction == "forward":
-                d_alpha = alpha2_2d - alpha1_2d
-                equal_mask = np.abs(d_alpha) < _ALPHA_EPS
-                d_alpha_3d = d_alpha[:, :, np.newaxis]
-                equal_3d = equal_mask[:, :, np.newaxis]
-                exp_m_alpha1_L = np.exp(-alpha1_2d[:, :, np.newaxis] * L_batch)
-                integral = np.where(
-                    equal_3d,
-                    L_batch,
-                    (1.0 - np.exp(-d_alpha_3d * L_batch))
-                    / np.where(equal_3d, 1.0, d_alpha_3d),
-                )
-                batch = base_2d[:, :, np.newaxis] * exp_m_alpha1_L * integral
-            elif direction == "backward":
-                sum_alpha = alpha1_2d + alpha2_2d
-                sum_alpha_3d = sum_alpha[:, :, np.newaxis]
-                batch = (
-                    base_2d[:, :, np.newaxis]
-                    * (1.0 - np.exp(-sum_alpha_3d * L_batch))
-                    / sum_alpha_3d
-                )
-            else:
-                raise ValueError(f"Unsupported direction: {direction}")
-
-            out_bin_power = np.sum(batch, axis=1) * df
-            out[:, start:stop] = out_bin_power / df
-
-        return out
-
-    def _compute_sprs_psd_batch_gpu_l_array(
-        self,
-        fiber: Fiber,
-        f_grid: np.ndarray,
-        G_pump: np.ndarray,
-        L_values: np.ndarray,
-        direction: str,
-        df: float,
-    ) -> np.ndarray:
-        """GPU-accelerated multi-length SpRS PSD batch.
-
-        Parallels ``_compute_sprs_psd_batch_gpu`` but adds a batched L axis.
-        σ_2d / α are computed on CPU (scipy interpolation), then transferred
-        to GPU; the (N_f, N_f, batch) propagation tensor is materialised
-        on-device and reduced along the pump axis. Batch size is sized to
-        roughly 40% of free GPU memory.
-        """
-        from qkd_sim.physical.noise.fwm_solver import _get_gpu_module
-        xp, _ = _get_gpu_module()
-
-        # Reuse CPU σ_2d cache (computation must stay on CPU due to scipy)
-        sigma_2d = self._get_sigma_2d(fiber, f_grid, df)
-        n_f = f_grid.size
-
-        sigma_gpu = xp.asarray(sigma_2d)
-        alpha_np = np.asarray(fiber.get_loss_at_freq(f_grid), dtype=np.float64)
-        alpha1_gpu = xp.asarray(alpha_np).reshape(-1, 1, 1)  # (N_f, 1, 1)
-        alpha2_gpu = xp.asarray(alpha_np).reshape(1, -1, 1)  # (1, N_f, 1)
-        base_gpu = xp.asarray(G_pump, dtype=xp.float64).reshape(1, -1) * sigma_gpu  # (N_f, N_f)
-        L_gpu = xp.asarray(L_values, dtype=xp.float64).reshape(1, 1, -1)            # (1, 1, N_L)
-
-        # Memory-aware batching on GPU. Each (N_f, N_f, batch) float64 tensor
-        # costs ``N_f² × batch × 8 bytes``. The peak GPU allocation is:
-        #   pre-loop (fixed): sigma_gpu + base_gpu + d_alpha + safe_d_alpha
-        #                     = 4 × N_f² × 8 bytes  (≈ 1.24 GB at N_f=6301)
-        #   forward loop:     exp + integral + batch_t = 3 × N_f² × 8 × batch
-        #   backward loop:    batch_t = 1 × N_f² × 8 × batch  (sum_alpha is pre-loop)
-        # So the per-batch marginal cost is 3 slices (forward, the worst case).
-        # We reserve ~85% of free VRAM for this budget (leaving headroom for
-        # CuPy's memory pool and any FWM allocations that may still be live).
-        try:
-            free_bytes, _total = xp.cuda.runtime.memGetInfo()
-            budget = int(free_bytes * 0.85)
-        except Exception:
-            budget = 1024 * 1024 * 1024  # 1 GB fallback
-        _fixed_slices = 4  # sigma + base + d_alpha + safe_d_alpha
-        _per_batch_slices = 3  # exp + integral + batch_t (forward worst case)
-        budget_slices = budget // max(n_f * n_f * 8, 1)
-        max_l_batch = max(1, min(
-            int(L_values.size),
-            (budget_slices - _fixed_slices) // max(_per_batch_slices, 1),
-        ))
-
-        out_gpu = xp.zeros((n_f, L_values.size), dtype=xp.float64)
-        if direction == "forward":
-            d_alpha = alpha2_gpu[:, :, 0:1] - alpha1_gpu[:, :, 0:1]  # (N_f, N_f, 1)
-            equal_mask = xp.abs(d_alpha) < _ALPHA_EPS
-            safe_d_alpha = xp.where(equal_mask, xp.ones_like(d_alpha), d_alpha)
-            for start in range(0, L_values.size, max_l_batch):
-                stop = min(start + max_l_batch, L_values.size)
-                L_b = L_gpu[:, :, start:stop]
-                exp_m_alpha1_L = xp.exp(-alpha1_gpu[:, :, 0:1] * L_b)
-                integral = xp.where(
-                    equal_mask,
-                    L_b,
-                    (1.0 - xp.exp(-d_alpha * L_b)) / safe_d_alpha,
-                )
-                batch_t = base_gpu[:, :, xp.newaxis] * exp_m_alpha1_L * integral
-                out_bin_power = xp.sum(batch_t, axis=1) * df  # (N_f, batch) [W]
-                out_gpu[:, start:stop] = out_bin_power / df  # [W/Hz]
-        elif direction == "backward":
-            sum_alpha = alpha1_gpu[:, :, 0:1] + alpha2_gpu[:, :, 0:1]
-            for start in range(0, L_values.size, max_l_batch):
-                stop = min(start + max_l_batch, L_values.size)
-                L_b = L_gpu[:, :, start:stop]
-                batch_t = (
-                    base_gpu[:, :, xp.newaxis]
-                    * (1.0 - xp.exp(-sum_alpha * L_b)) / sum_alpha
-                )
-                out_bin_power = xp.sum(batch_t, axis=1) * df
-                out_gpu[:, start:stop] = out_bin_power / df
-        else:
-            raise ValueError(f"Unsupported direction: {direction!r}")
-
-        return np.asarray(out_gpu.get())
+        return self.compute_sprs_spectrum_conti(
+            fiber, wdm_grid, f_grid, direction=direction, L_arr=L_arr,
+        )
