@@ -303,7 +303,7 @@ class SKRConfig:
         mu_signal          : float  信号态平均光子数 (μ)
         e_det              : float  探测器本征误码率 (e_Det)
         f_ec               : float  纠错效率 (f_e)，典型 1.16
-        R_rep              : float  脉冲重复率 [Hz]
+        R_rep              : float  脉冲重复率 [Hz]（同时也用作信号发射率 R_0）
         q_sifting          : float  筛选效率（BB84 = 0.5）
         mu_decoy           : float  诱骗态平均光子数 (ν)
         p_signal           : float  信号态发送概率 (p_μ)
@@ -312,12 +312,10 @@ class SKRConfig:
         gamma_ks           : float  Gaussian 置信倍数 (γ_ks)，近似有限长用
         P_X_alice          : float  Alice X 基矢选取概率
         P_X_bob            : float  Bob X 基矢选取概率
-        R_0                : float  信号发射率 [Hz]（严格有限长块长计算用）
         epsilon_cor        : float  正确性参数 (ε_cor)
         epsilon_sec        : float  保密性参数 (ε_sec)
         concentration_method : str  浓度不等式方法："Hoeffding" 或 "Azuma"
         improved_serfling  : bool  是否使用改进的 Serfling 不等式（Fung et al.），默认 False
-        fix_alice          : bool  True=N_alice 固定，False=N_bob 固定，默认 True
 
     __post_init__ 计算字段:
         IL       : float  插入损耗线性值 = 10^(-IL_dB/10)
@@ -347,12 +345,10 @@ class SKRConfig:
     # 严格有限长
     P_X_alice: float
     P_X_bob: float
-    R_0: float
     epsilon_cor: float
     epsilon_sec: float
     concentration_method: str = "Hoeffding"
     improved_serfling: bool = False  # 是否使用改进的 Serfling 不等式（Fung et al.）
-    fix_alice: bool = True  # True=N_alice 固定，False=N_bob 固定
 
     # 由 __post_init__ 计算
     IL: float = field(init=False, repr=False)
@@ -369,6 +365,8 @@ class SKRConfig:
             raise ValueError(
                 f"concentration_method must be 'Hoeffding' or 'Azuma', got '{self.concentration_method}'"
             )
+        # R_0 与 R_rep 是同一物理量（光源脉冲重复率），文献中记为 R_0
+        object.__setattr__(self, "R_0", self.R_rep)
 
 
 def load_skr_config(path: str | Path, profile: str = "custom") -> SKRConfig:

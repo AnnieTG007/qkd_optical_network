@@ -319,7 +319,7 @@ def strict_finite_key_rate(
     P_Z_A = 1.0 - P_X_A
     P_Z_B = 1.0 - P_X_B
 
-    R_0 = skr_cfg.R_0
+    R_0 = skr_cfg.R_rep  # R_0 ≡ R_rep（同一物理量：脉冲重复率）
 
     # --- 信道透过率和暗计数（需先计算以便 mode=bob 使用）---
     eta_sys = (
@@ -342,7 +342,7 @@ def strict_finite_key_rate(
 
     # --- 块长解析：mode=alice 或 mode=bob ---
     bl = skr_cfg.block_length
-    if bl.mode == "alice" or skr_cfg.fix_alice:
+    if bl.mode == "alice":
         N_A = bl.N_alice
         integration_time = N_A / R_0
     else:
@@ -488,4 +488,4 @@ def strict_finite_key_rate(
 
     l_max = max(l_max, 0.0)
     skr_bps = l_max / integration_time
-    return float(skr_bps), skr_bps_to_bit_per_pulse(float(skr_bps), skr_cfg.R_0), float(qber)
+    return float(skr_bps), skr_bps_to_bit_per_pulse(float(skr_bps), skr_cfg.R_rep), float(qber)

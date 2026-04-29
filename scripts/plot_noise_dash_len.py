@@ -104,6 +104,9 @@ import scripts.dash_utils as _du
 _du.MODULATION_FORMAT = ARGS.modulation.upper()
 _du.ACTIVE_THRESHOLD_DB = ARGS.active_threshold_db
 
+# SKR zero-value sentinel: replaces ≤0 SKR on log-scale plots
+_SKR_ZERO_SENTINEL = 1e-15
+
 # SKR model override
 if ARGS.skr_model is not None:
     _du.DEFAULT_SKR_MODEL_KEY = ARGS.skr_model
@@ -333,13 +336,17 @@ def _compute_skr_y_ranges_len(skr_cache_ch: dict) -> tuple[tuple[float, float], 
         for direction in ("fwd", "bwd"):
             bps_arr, bpp_arr, _ = mkey_data.get(direction, (np.array([]), np.array([]), np.array([])))
             if len(bps_arr) > 0:
-                valid = bps_arr[bps_arr > 0]
+                valid = bps_arr[bps_arr > _SKR_ZERO_SENTINEL]
                 if len(valid) > 0:
                     bps_vals.extend(valid.tolist())
+                elif np.any(bps_arr <= 0):
+                    bps_vals.append(_SKR_ZERO_SENTINEL)
             if len(bpp_arr) > 0:
-                valid = bpp_arr[bpp_arr > 0]
+                valid = bpp_arr[bpp_arr > _SKR_ZERO_SENTINEL]
                 if len(valid) > 0:
                     bpp_vals.extend(valid.tolist())
+                elif np.any(bpp_arr <= 0):
+                    bpp_vals.append(_SKR_ZERO_SENTINEL)
     if not bps_vals:
         return (-12.0, 0.0), (-15.0, 0.0)
     bps_arr = np.asarray(bps_vals)
@@ -471,25 +478,31 @@ def _make_figure(sweep: dict, ch_idx: int) -> go.Figure:
                 if len(x_skr) != len(bps_arr):
                     x_skr = LENGTHS_KM[:len(bps_arr)]
 
-                bpp_plot = np.where(bpp_arr > 0, bpp_arr, np.nan)
-                bps_plot = np.where(bps_arr > 0, bps_arr, np.nan)
+                _bpp_pos = bpp_arr > 0
+                bpp_plot = np.where(_bpp_pos, bpp_arr, _SKR_ZERO_SENTINEL)
+                bpp_cd = np.where(_bpp_pos, bpp_arr, 0.0)
+                _bps_pos = bps_arr > 0
+                bps_plot = np.where(_bps_pos, bps_arr, _SKR_ZERO_SENTINEL)
+                bps_cd = np.where(_bps_pos, bps_arr, 0.0)
 
                 fig.add_trace(
                     go.Scatter(x=x_skr, y=bpp_plot, mode="lines+markers",
+                               customdata=bpp_cd,
                                line=dict(color=spec["color"], width=1.5, dash="solid"),
                                marker=dict(size=4, color=spec["color"]),
                                connectgaps=False, name=skr_name, legendgroup=skr_lg,
                                showlegend=True,
-                               hovertemplate=f"L=%{{x:.1f}} km<br>SKR=%{{y:.3e}} bit/pulse<extra>{skr_name}</extra>"),
+                               hovertemplate=f"L=%{{x:.1f}} km<br>SKR=%{{customdata:.3e}} bit/pulse<extra>{skr_name}</extra>"),
                     row=2, col=1,
                 )
                 fig.add_trace(
                     go.Scatter(x=x_skr, y=bps_plot, mode="lines+markers",
+                               customdata=bps_cd,
                                line=dict(color=spec["color"], width=1.5, dash="solid"),
                                marker=dict(size=4, color=spec["color"]),
                                connectgaps=False, name=skr_name, legendgroup=skr_lg,
                                showlegend=False,
-                               hovertemplate=f"L=%{{x:.1f}} km<br>SKR=%{{y:.3e}} bps<extra>{skr_name}</extra>"),
+                               hovertemplate=f"L=%{{x:.1f}} km<br>SKR=%{{customdata:.3e}} bps<extra>{skr_name}</extra>"),
                     row=2, col=2,
                 )
 

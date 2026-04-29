@@ -169,6 +169,9 @@ if ARGS.power_levels:
         PRECOMPUTE_POWER_LEVELS.sort()
     print(f"Power levels: {PRECOMPUTE_POWER_LEVELS}")
 
+# SKR zero-value sentinel: replaces ≤0 SKR on log-scale plots
+_SKR_ZERO_SENTINEL = 1e-15
+
 # SKR model override
 if ARGS.skr_model is not None:
     _du.DEFAULT_SKR_MODEL_KEY = ARGS.skr_model
@@ -458,13 +461,17 @@ def _compute_skr_y_ranges(skr_cache_l: dict) -> tuple[tuple[float, float], tuple
             for direction in ("fwd", "bwd"):
                 bps_arr, bpp_arr, _ = skr_data.get(direction, (np.array([]), np.array([]), np.array([])))
                 if len(bps_arr) > 0:
-                    valid_bps = bps_arr[bps_arr > 0]
+                    valid_bps = bps_arr[bps_arr > _SKR_ZERO_SENTINEL]
                     if len(valid_bps) > 0:
                         bps_vals.extend(valid_bps.tolist())
+                    elif np.any(bps_arr <= 0):
+                        bps_vals.append(_SKR_ZERO_SENTINEL)
                 if len(bpp_arr) > 0:
-                    valid_bpp = bpp_arr[bpp_arr > 0]
+                    valid_bpp = bpp_arr[bpp_arr > _SKR_ZERO_SENTINEL]
                     if len(valid_bpp) > 0:
                         bpp_vals.extend(valid_bpp.tolist())
+                    elif np.any(bpp_arr <= 0):
+                        bpp_vals.append(_SKR_ZERO_SENTINEL)
     if not bps_vals:
         return (-12.0, 0.0), (-15.0, 0.0)
     bps_arr = np.asarray(bps_vals, dtype=np.float64)
@@ -588,23 +595,29 @@ def _make_figure(sweep: dict, l_idx: int) -> go.Figure:
                 skr_marker = None if spec["continuous"] else dict(size=5, color=spec["color"])
 
                 # SKR [bit/pulse] — row 2, col 1
-                bpp_plot = np.where(bpp_arr > 0, bpp_arr, np.nan)
+                _bpp_pos = bpp_arr > 0
+                bpp_plot = np.where(_bpp_pos, bpp_arr, _SKR_ZERO_SENTINEL)
+                bpp_cd = np.where(_bpp_pos, bpp_arr, 0.0)
                 fig.add_trace(
                     go.Scatter(x=x_skr_thz, y=bpp_plot, mode=skr_mode,
+                               customdata=bpp_cd,
                                line=skr_line, marker=skr_marker,
                                connectgaps=False, name=skr_name, legendgroup=skr_lg,
                                showlegend=False,
-                               hovertemplate=f"f=%{{x:.4f}} THz<br>SKR=%{{y:.3e}} bit/pulse<extra>{skr_name}</extra>"),
+                               hovertemplate=f"f=%{{x:.4f}} THz<br>SKR=%{{customdata:.3e}} bit/pulse<extra>{skr_name}</extra>"),
                     row=2, col=1,
                 )
                 # SKR [bps] — row 2, col 2
-                bps_plot = np.where(bps_arr > 0, bps_arr, np.nan)
+                _bps_pos = bps_arr > 0
+                bps_plot = np.where(_bps_pos, bps_arr, _SKR_ZERO_SENTINEL)
+                bps_cd = np.where(_bps_pos, bps_arr, 0.0)
                 fig.add_trace(
                     go.Scatter(x=x_skr_thz, y=bps_plot, mode=skr_mode,
+                               customdata=bps_cd,
                                line=skr_line, marker=skr_marker,
                                connectgaps=False, name=skr_name, legendgroup=skr_lg,
                                showlegend=False,
-                               hovertemplate=f"f=%{{x:.4f}} THz<br>SKR=%{{y:.3e}} bps<extra>{skr_name}</extra>"),
+                               hovertemplate=f"f=%{{x:.4f}} THz<br>SKR=%{{customdata:.3e}} bps<extra>{skr_name}</extra>"),
                     row=2, col=2,
                 )
 

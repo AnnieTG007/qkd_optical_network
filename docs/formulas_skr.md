@@ -137,7 +137,7 @@ $$
 | $P_{X,A}$, $P_{X,B}$ | Alice/Bob 选 X 基概率 |
 | $\varepsilon_{\text{cor}}$, $\varepsilon_{\text{sec}}$ | 正确性/保密性安全参数 |
 | $N_A$ | Alice 发送总脉冲数（块长） |
-| $R_0$ | 信号发射率 [Hz] |
+| $R_0 = R_{\text{rep}}$ | 信号发射率 = 脉冲重复率 [Hz] |
 
 ### Bayes 先验权重
 
@@ -159,7 +159,7 @@ $$
 
 其中 $P_{XX} = P_{X,A} \cdot P_{X,B}$，
 $P_{\text{det},\mu} = 1 - e^{-\mu \eta_{\text{sys}}} (1 - P_{DC})$，
-$P_{DC} = \text{DCR} / R_0$。
+$P_{DC} = \text{DCR} / R_{\text{rep}}$。
 
 Z 基同理。
 
@@ -220,7 +220,7 @@ l_{\max} = s_{X,0}^- + s_{X,1}^- [1 - H_2(\lambda_X^+)]
 - 4\log_2\frac{15}{\varepsilon_{\text{sec}} \cdot 2^{1/4}}
 $$
 
-码率（bit/s）：$l_{\max} / t_{\text{integration}}$，其中 $t_{\text{integration}} = N_A / R_0$。
+码率（bit/s）：$l_{\max} / t_{\text{integration}}$，其中 $t_{\text{integration}} = N_A / R_{\text{rep}}$。
 
 ---
 

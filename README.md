@@ -249,8 +249,8 @@ block_length:
 mode=alice 和 mode=bob **互斥**，不能同时指定。`mode=alice` 时 `N_bob` 必须为 `~`（null），反之亦然。
 
 **物理含义**：
-- `mode=alice`：Alice 固定发送 N_alice 个脉冲，Bob 检测数为随机变量，积分时间 t = N_alice / R_0
-- `mode=bob`：Bob 固定检测 N_bob 个事件，Alice 发送脉冲数为随机变量，积分时间 t = N_bob / (R_0 · P_X_alice · P_X_bob · P_det)
+- `mode=alice`：Alice 固定发送 N_alice 个脉冲，Bob 检测数为随机变量，积分时间 t = N_alice / R_rep
+- `mode=bob`：Bob 固定检测 N_bob 个事件，Alice 发送脉冲数为随机变量，积分时间 t = N_bob / (R_rep · P_X_alice · P_X_bob · P_det)
 
 ## 项目结构
 
