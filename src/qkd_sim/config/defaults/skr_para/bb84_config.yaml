@@ -37,7 +37,7 @@ reference:
 
 custom:
   # 自定义参数（实际系统仿真）
-  eta_spd: 0.9               # SPD 量子效率 (η_spd)
+  eta_spd: 0.25               # SPD 量子效率 (η_spd)
   IL_dB: 0.0                 # 插入损耗 [dB]（不含光纤衰减）
   dark_count_prob: 1.0e-9   # 暗计数概率/脉冲 (p_dark)
   noise_count_prob: 0.0      # 噪声光子计数概率/脉冲 (p_noise)，可由 SpRS 噪声模型填入
@@ -45,7 +45,7 @@ custom:
   mu_decoy: 0.1             # 诱骗态平均光子数 (ν)，须 < mu_signal
   e_det: 0.01               # 探测器本征误码率 (e_Det)
   f_ec: 1.16                # 纠错效率 (f_e)
-  R_rep: 1.0e+9             # 脉冲重复率 [Hz]（同时也用作信号发射率 R_0）
+  R_rep: 5.0e+7             # 脉冲重复率 [Hz]（同时也用作信号发射率 R_0）
   q_sifting: 0.5            # 筛选效率（BB84 = 0.5）
   p_signal: 0.7             # 信号态发送概率 (p_μ)
   p_decoy: 0.3              # 诱骗态发送概率 (p_ν)
