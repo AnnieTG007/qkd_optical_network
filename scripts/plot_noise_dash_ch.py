@@ -40,6 +40,7 @@ from scripts.dash_utils import (
     adaptive_linear_ticks,
     adaptive_log_ticks,
     add_strategy_cli_args,
+    compute_skr_cache_for_power,
     compute_skr_vs_channel,
     ensure_port_free,
     export_noise_vs_frequency_csv,
@@ -268,8 +269,13 @@ _SKR_CACHE_CH: dict[float, dict[int, dict]] = {}  # power_dbm -> l_idx -> skr_re
 
 def _build_ch_skr_cache(power_dbm: float, sweep_at_l: dict, l_idx: int) -> dict:
     """Build SKR cache for a single (power, length) combo."""
-    dist_m = float(ACTIVE_LENGTHS_KM[l_idx] * 1000.0)
-    return compute_skr_vs_channel(sweep_at_l, dist_m, quantum_center_freqs_hz, _FIBER_CFG, _SKR_CFG, optimize=False)
+    return compute_skr_cache_for_power(
+        power_dbm, sweep_at_l, l_idx,
+        float(ACTIVE_LENGTHS_KM[l_idx]),
+        quantum_center_freqs_hz,
+        _FIBER_CFG,
+        _SKR_CFG,
+    )
 
 
 with profile_scope("startup: SKR cache (per-channel)"):

@@ -509,6 +509,46 @@ def compute_skr_vs_channel(
     return skr_result
 
 
+def compute_skr_cache_for_power(
+    power_dbm: float,
+    sweep_at_l: dict,
+    l_idx: int,
+    length_km: float,
+    quantum_center_freqs_hz: np.ndarray,
+    fiber_cfg,
+    skr_cfg,
+) -> dict:
+    """Build SKR cache for a single (power, length) combination.
+
+    Fully parameterized, no closures — suitable for ProcessPoolExecutor
+    on all platforms. Thin wrapper around ``compute_skr_vs_channel``.
+
+    Parameters
+    ----------
+    power_dbm : float
+        Classical channel power (for logging / future use).
+    sweep_at_l : dict
+        Precomputed noise sweep at one (power, length) combo.
+    l_idx : int
+        Length index (for caller bookkeeping).
+    length_km : float
+        Fiber length [km].
+    quantum_center_freqs_hz : ndarray
+        Quantum channel center frequencies [Hz].
+    fiber_cfg : FiberConfig
+    skr_cfg : SKRConfig
+
+    Returns
+    -------
+    dict — same format as ``compute_skr_vs_channel``.
+    """
+    dist_m = float(length_km * 1000.0)
+    return compute_skr_vs_channel(
+        sweep_at_l, dist_m, quantum_center_freqs_hz,
+        fiber_cfg, skr_cfg, optimize=False,
+    )
+
+
 def compute_skr_vs_length(
     sweep: dict,
     ch_idx: int,
@@ -864,8 +904,11 @@ def _cache_precomputed_result(
     if not all_by_idx:
         return
     first_key = min(all_by_idx.keys())
+    # Only process model keys actually present in the data (model_keys may
+    # include entries filtered out by --models, etc.)
+    available = [mk for mk in model_keys if mk in all_by_idx[first_key]]
 
-    for mk in model_keys:
+    for mk in available:
         ref_shape = all_by_idx[first_key][mk]["fwd"].shape
         if not all(all_by_idx[k][mk]["fwd"].shape == ref_shape for k in all_by_idx):
             continue  # Skip mixed-shape models
@@ -1473,6 +1516,8 @@ def _compute_noise_power_pair(
     fiber,
     grid,
     continuous: bool,
+    fwm_solver=None,
+    sprs_solver=None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """计算 FWM/SpRS 噪声积分功率 (N_q,)。
 
@@ -1484,6 +1529,8 @@ def _compute_noise_power_pair(
         fiber: Fiber instance
         grid: WDMGrid
         continuous: 是否为连续模型
+        fwm_solver: pre-constructed DiscreteFWMSolver (created once, reused across calls)
+        sprs_solver: pre-constructed DiscreteSPRSSolver (created once, reused across calls)
 
     Returns
     -------
@@ -1510,13 +1557,13 @@ def _compute_noise_power_pair(
         )
 
     if noise_type in ("fwm", "both"):
-        solver = DiscreteFWMSolver(active_threshold_db=ACTIVE_THRESHOLD_DB)
+        solver = fwm_solver if fwm_solver is not None else DiscreteFWMSolver(active_threshold_db=ACTIVE_THRESHOLD_DB)
         f_i, b_i = _call_solver(solver)
         fwd += f_i
         bwd += b_i
 
     if noise_type in ("sprs", "both"):
-        solver = DiscreteSPRSSolver()
+        solver = sprs_solver if sprs_solver is not None else DiscreteSPRSSolver()
         f_i, b_i = _call_solver(solver)
         fwd += f_i
         bwd += b_i
@@ -1530,6 +1577,8 @@ def _compute_noise_spectrum_pair(
     grid,
     f_grid: np.ndarray,
     L_arr: np.ndarray | None = None,
+    fwm_solver=None,
+    sprs_solver=None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """返回完整 PSD 数组，适用于连续模型。
 
@@ -1539,6 +1588,9 @@ def _compute_noise_spectrum_pair(
     fwm: compute_fwm_spectrum_conti
     sprs: compute_sprs_spectrum_conti
     both: 两者逐点相加
+
+    fwm_solver / sprs_solver: pre-constructed solver instances (created once
+    and reused across model_keys to preserve internal caches).
 
     Returns
     -------
@@ -1552,7 +1604,7 @@ def _compute_noise_spectrum_pair(
     bwd = np.zeros((n_f, n_l), dtype=np.float64)
 
     if noise_type in ("fwm", "both"):
-        solver = DiscreteFWMSolver(active_threshold_db=ACTIVE_THRESHOLD_DB)
+        solver = fwm_solver if fwm_solver is not None else DiscreteFWMSolver(active_threshold_db=ACTIVE_THRESHOLD_DB)
         fwm_fwd, fwm_bwd = solver.compute_fwm_spectrum_conti_pair(
             fiber, grid, f_grid, L_arr=L_arr
         )
@@ -1564,7 +1616,7 @@ def _compute_noise_spectrum_pair(
             bwd += fwm_bwd
 
     if noise_type in ("sprs", "both"):
-        solver = DiscreteSPRSSolver()
+        solver = sprs_solver if sprs_solver is not None else DiscreteSPRSSolver()
         sprs_fwd, sprs_bwd = solver.compute_sprs_spectrum_conti(
             fiber, grid, f_grid, direction="both", L_arr=L_arr,
         )
@@ -1823,6 +1875,7 @@ def precompute_by_channel(
     if noise_type == "with_signal":
         # Continuous PSD: noise (FWM+SpRS) + signal, output (N_f,) per length
         from qkd_sim.physical.signal import SpectrumType
+        from qkd_sim.physical.noise import DiscreteFWMSolver, DiscreteSPRSSolver
 
         df = float(np.mean(np.diff(noise_f_grid)))
         all_by_ch = {
@@ -1906,12 +1959,16 @@ def precompute_by_channel(
                     signal_psd += ch.get_psd(noise_f_grid)
             signal_psd_cache[model_key] = signal_psd
 
+        _ws_fwm = DiscreteFWMSolver(active_threshold_db=ACTIVE_THRESHOLD_DB)
+        _ws_sprs = DiscreteSPRSSolver()
+
         for li, length_km in enumerate(LENGTHS_KM):
             fiber = _make_fiber(fiber_params, length_km)
             for model_key in model_keys:
                 grid_model = grid_cache[model_key]
                 noise_fwd_psd, noise_bwd_psd = _compute_noise_spectrum_pair(
-                    "both", fiber, grid_model, noise_f_grid
+                    "both", fiber, grid_model, noise_f_grid,
+                    fwm_solver=_ws_fwm, sprs_solver=_ws_sprs,
                 )
                 signal_psd = signal_psd_cache[model_key]
                 total_fwd = (noise_fwd_psd + signal_psd) * df
@@ -2067,6 +2124,12 @@ def precompute_by_channel(
     # Cache: grid depends only on model_key (not on q_idx or li)
     grid_cache: dict[str, object] = {}
 
+    # Create solver instances once for continuous models (shared across model_keys
+    # to preserve SpRS sigma cache and FWM topology cache).
+    from qkd_sim.physical.noise import DiscreteFWMSolver, DiscreteSPRSSolver
+    _cont_fwm = DiscreteFWMSolver(active_threshold_db=ACTIVE_THRESHOLD_DB) if noise_type in ("fwm", "both") else None
+    _cont_sprs = DiscreteSPRSSolver() if noise_type in ("sprs", "both") else None
+
     for model_key in model_keys:
         spec = specs[model_key]
         if not spec["continuous"]:
@@ -2096,7 +2159,8 @@ def precompute_by_channel(
             t_fiber += time.perf_counter() - _t
             _t = time.perf_counter()
             fwd_psd_all, bwd_psd_all = _compute_noise_spectrum_pair(
-                noise_type, fiber, grid, noise_f_grid, L_arr=L_arr
+                noise_type, fiber, grid, noise_f_grid, L_arr=L_arr,
+                fwm_solver=_cont_fwm, sprs_solver=_cont_sprs,
             )  # shape (N_f, N_L)
             t_solver += time.perf_counter() - _t
             if fwd_psd_all.ndim == 1:
@@ -2119,7 +2183,8 @@ def precompute_by_channel(
                 t_fiber += time.perf_counter() - _t
                 _t = time.perf_counter()
                 fwd_psd, bwd_psd = _compute_noise_spectrum_pair(
-                    noise_type, fiber, grid, noise_f_grid
+                    noise_type, fiber, grid, noise_f_grid,
+                    fwm_solver=_cont_fwm, sprs_solver=_cont_sprs,
                 )  # shape (N_f,)
                 t_solver += time.perf_counter() - _t
                 _t = time.perf_counter()
@@ -2138,55 +2203,71 @@ def precompute_by_channel(
                 f"solver={t_solver:.3f}s, store={t_store:.3f}s"
             )
 
-    # Discrete model: grid per (model_key, q_idx), reuse grid_cache for same model_key
+    # Discrete model: build ONE grid with ALL quantum channels per model_key.
+    # Both DiscreteFWMSolver and DiscreteSPRSSolver already support multi-
+    # quantum-channel computation natively — calling once with N_q channels
+    # produces the same result as N_q individual calls with 1 channel each.
+    if any(not spec["continuous"] for spec in specs.values()):
+        from qkd_sim.physical.noise import DiscreteFWMSolver, DiscreteSPRSSolver
+        _disc_fwm = DiscreteFWMSolver(active_threshold_db=ACTIVE_THRESHOLD_DB) if noise_type in ("fwm", "both") else None
+        _disc_sprs = DiscreteSPRSSolver() if noise_type in ("sprs", "both") else None
+        # Build one multi-quantum grid with ALL quantum channels
+        _multi_q_config = _build_wdm_config(quantum_indices)
+    else:
+        _disc_fwm = None
+        _disc_sprs = None
+        _multi_q_config = None
+
     for model_key in model_keys:
         spec = specs[model_key]
         if spec["continuous"]:
             continue  # Already handled above
         t_grid = 0.0
-        t_fiber = 0.0
         t_solver = 0.0
         t_store = 0.0
-        solver_calls = 0
-        # Build one grid per q_idx (quantum channel changes which channel is "quantum")
-        q_idx_to_grid: dict[int, object] = {}
-        for q_local_idx, q_idx in enumerate(quantum_indices):
-            if q_idx not in q_idx_to_grid:
-                _t = time.perf_counter()
-                q_idx_to_grid[q_idx] = _build_model_grid(
-                    model_key,
-                    spec,
-                    _build_wdm_config([q_idx]),
-                    noise_f_grid,
-                    osa_csv_path,
-                    osa_center_freq_hz,
-                )
-                t_grid += time.perf_counter() - _t
+
+        _t = time.perf_counter()
+        grid_multi = _build_model_grid(
+            model_key, spec, _multi_q_config,
+            noise_f_grid, osa_csv_path, osa_center_freq_hz,
+        )
+        t_grid = time.perf_counter() - _t
+
+        # Precompute SpRS for all lengths via L_arr (sigma computed once)
+        _sprs_fwd_all = None
+        _sprs_bwd_all = None
+        if _disc_sprs is not None:
+            _L_arr_m = np.asarray(LENGTHS_KM, dtype=np.float64) * 1e3
+            _fiber_base = _make_fiber(fiber_params, float(LENGTHS_KM[0]))
+            _sprs_fwd_all = _disc_sprs.compute_forward_l_array(_fiber_base, grid_multi, _L_arr_m)
+            _sprs_bwd_all = _disc_sprs.compute_backward_l_array(_fiber_base, grid_multi, _L_arr_m)
 
         for li, length_km in enumerate(LENGTHS_KM):
-            _t = time.perf_counter()
             fiber = _make_fiber(fiber_params, length_km)
-            t_fiber += time.perf_counter() - _t
-            fwd_arr = np.zeros(n_q, dtype=np.float64)
-            bwd_arr = np.zeros(n_q, dtype=np.float64)
-            for q_local_idx, q_idx in enumerate(quantum_indices):
-                grid = q_idx_to_grid[q_idx]
-                _t = time.perf_counter()
-                fwd, bwd = _compute_noise_power_pair(
-                    noise_type,
-                    fiber,
-                    grid,
-                    continuous=False,
+            _t = time.perf_counter()
+            if _disc_sprs is not None and _disc_fwm is not None:
+                # noise_type == "both": FWM per-length + SpRS from L_arr
+                fwd_fwm, bwd_fwm = _compute_noise_power_pair(
+                    "fwm", fiber, grid_multi, continuous=False,
+                    fwm_solver=_disc_fwm,
                 )
-                t_solver += time.perf_counter() - _t
-                solver_calls += 1
-                if len(fwd) > 0:
-                    fwd_arr[q_local_idx] = float(fwd[0])
-                    bwd_arr[q_local_idx] = float(bwd[0])
+                fwd = fwd_fwm + _sprs_fwd_all[:, li]
+                bwd = bwd_fwm + _sprs_bwd_all[:, li]
+            elif _disc_sprs is not None:
+                # noise_type == "sprs": from L_arr
+                fwd = _sprs_fwd_all[:, li]
+                bwd = _sprs_bwd_all[:, li]
+            else:
+                # noise_type == "fwm": per-length only
+                fwd, bwd = _compute_noise_power_pair(
+                    noise_type, fiber, grid_multi, continuous=False,
+                    fwm_solver=_disc_fwm,
+                )
+            t_solver += time.perf_counter() - _t
             _t = time.perf_counter()
             all_by_ch[li][model_key] = {
-                "fwd": np.asarray(fwd_arr, dtype=np.float64),
-                "bwd": np.asarray(bwd_arr, dtype=np.float64),
+                "fwd": np.asarray(fwd, dtype=np.float64),
+                "bwd": np.asarray(bwd, dtype=np.float64),
                 "x": np.asarray(q_center_freqs, dtype=np.float64),
                 "x_kind": "channel_center",
                 "y_kind": "channel_power",
@@ -2195,8 +2276,8 @@ def precompute_by_channel(
         if _PROFILE_ENABLED:
             print(
                 "[profile]   discrete "
-                f"model={model_key}: grid={t_grid:.3f}s, fiber={t_fiber:.3f}s, "
-                f"solver={t_solver:.3f}s, store={t_store:.3f}s, solver_calls={solver_calls}"
+                f"model={model_key}: grid={t_grid:.3f}s, "
+                f"solver={t_solver:.3f}s, store={t_store:.3f}s, solver_calls={n_l}"
             )
 
     valid_l_indices = [
@@ -2323,6 +2404,7 @@ def precompute_by_channel_all_powers(
             "with_signal: FWM(P^3) + SpRS(P^1) + signal(P^1) scaling from 0 dBm base"
         )
         from qkd_sim.physical.signal import SpectrumType
+        from qkd_sim.physical.noise import DiscreteFWMSolver, DiscreteSPRSSolver
         set_power_override(0.0)
         classical_set = set(CLASSICAL_INDICES)
         df = float(np.mean(np.diff(noise_f_grid)))
@@ -2425,6 +2507,8 @@ def precompute_by_channel_all_powers(
             x_base_ws: dict = {mk: np.asarray(noise_f_grid, dtype=np.float64) for mk in model_keys_ws}
             L_arr_ws = np.asarray(LENGTHS_KM, dtype=np.float64) * 1e3  # (N_L,)
             fiber_t4 = _make_fiber(fiber_params, float(LENGTHS_KM[0]))  # L only for metadata; actual lengths via L_arr
+            _ws2_fwm = DiscreteFWMSolver(active_threshold_db=ACTIVE_THRESHOLD_DB)
+            _ws2_sprs = DiscreteSPRSSolver()
 
             for mk in model_keys_ws:
                 if mk not in grid_cache_t4:
@@ -2433,11 +2517,13 @@ def precompute_by_channel_all_powers(
 
                 with profile_scope(f"FWM L_arr batch [{mk}]"):
                     fwm_fwd_all, fwm_bwd_all = _compute_noise_spectrum_pair(
-                        "fwm", fiber_t4, grid_t4, noise_f_grid, L_arr=L_arr_ws
+                        "fwm", fiber_t4, grid_t4, noise_f_grid, L_arr=L_arr_ws,
+                        fwm_solver=_ws2_fwm, sprs_solver=_ws2_sprs,
                     )  # (N_f, N_L)
                 with profile_scope(f"SpRS L_arr batch [{mk}]"):
                     sprs_fwd_all, sprs_bwd_all = _compute_noise_spectrum_pair(
-                        "sprs", fiber_t4, grid_t4, noise_f_grid, L_arr=L_arr_ws
+                        "sprs", fiber_t4, grid_t4, noise_f_grid, L_arr=L_arr_ws,
+                        fwm_solver=_ws2_fwm, sprs_solver=_ws2_sprs,
                     )  # (N_f, N_L)
 
                 for li in range(n_l_ws):

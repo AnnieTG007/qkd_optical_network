@@ -132,7 +132,7 @@ def _forward_propagation(
     P_pump: np.ndarray,
     alpha1: np.ndarray,
     alpha2: np.ndarray,
-    L: float,
+    L: float | np.ndarray,
 ) -> np.ndarray:
     """前向 SpRS 噪声功率（单泵浦→单量子信道贡献矩阵）。
 
@@ -154,25 +154,38 @@ def _forward_propagation(
         量子信道衰减系数 [1/m]
     alpha2 : ndarray, shape (1, N_c)
         经典信道衰减系数 [1/m]
-    L : float
-        光纤长度 [m]
+    L : float or ndarray
+        光纤长度 [m]。标量时返回 (N_q, N_c)；数组 (N_L,) 时返回 (N_q, N_c, N_L)
 
     Returns
     -------
-    ndarray, shape (N_q, N_c)
+    ndarray, shape (N_q, N_c) or (N_q, N_c, N_L)
         各泵浦信道对各量子信道的前向噪声贡献 [W]
     """
     d_alpha = alpha2 - alpha1  # shape (N_q, N_c)，广播
-    exp_m_alpha1_L = np.exp(-alpha1 * L)  # shape (N_q, 1)
+    L_arr = np.asarray(L, dtype=np.float64)
+    scalar_L = L_arr.ndim == 0
 
-    # 分支选择
-    equal_mask = np.abs(d_alpha) < _ALPHA_EPS
+    equal_mask = np.abs(d_alpha) < _ALPHA_EPS  # (N_q, N_c)
+    if scalar_L:
+        exp_m_alpha1_L = np.exp(-alpha1 * L_arr)  # (N_q, 1)
+        integral = np.where(
+            equal_mask,
+            L_arr,  # scalar
+            (1.0 - np.exp(-d_alpha * L_arr)) / np.where(equal_mask, 1.0, d_alpha),
+        )
+        return P_pump * sigma * exp_m_alpha1_L * integral  # (N_q, N_c)
+
+    # L_arr path: broadcast sigma and P_pump to (N_q, N_c, 1) for (N_q, N_c, N_L) output
+    L_arr = L_arr.reshape(1, 1, -1)  # (1, 1, N_L)
+    exp_m_alpha1_L = np.exp(-alpha1[..., np.newaxis] * L_arr)  # (N_q, 1, N_L)
     integral = np.where(
-        equal_mask,
-        L,  # 洛必达极限：[1 - exp(-(α₂-α₁)L)] / (α₂-α₁) → L，当 α₂→α₁
-        (1.0 - np.exp(-d_alpha * L)) / np.where(equal_mask, 1.0, d_alpha),
+        equal_mask[..., np.newaxis],
+        L_arr,  # (1, 1, N_L) → broadcasts
+        (1.0 - np.exp(-d_alpha[..., np.newaxis] * L_arr)) / np.where(equal_mask[..., np.newaxis], 1.0, d_alpha[..., np.newaxis]),
     )
-    return P_pump * sigma * exp_m_alpha1_L * integral
+    return (P_pump[..., np.newaxis] * sigma[..., np.newaxis]
+            * exp_m_alpha1_L * integral)  # (N_q, N_c, N_L)
 
 
 def _backward_propagation(
@@ -180,7 +193,7 @@ def _backward_propagation(
     P_pump: np.ndarray,
     alpha1: np.ndarray,
     alpha2: np.ndarray,
-    L: float,
+    L: float | np.ndarray,
 ) -> np.ndarray:
     """后向 SpRS 噪声功率（单泵浦→单量子信道贡献矩阵）。
 
@@ -197,16 +210,23 @@ def _backward_propagation(
         量子信道衰减系数 [1/m]
     alpha2 : ndarray, shape (1, N_c)
         经典信道衰减系数 [1/m]
-    L : float
-        光纤长度 [m]
+    L : float or ndarray
+        光纤长度 [m]。标量时返回 (N_q, N_c)；数组 (N_L,) 时返回 (N_q, N_c, N_L)
 
     Returns
     -------
-    ndarray, shape (N_q, N_c)
+    ndarray, shape (N_q, N_c) or (N_q, N_c, N_L)
         各泵浦信道对各量子信道的后向噪声贡献 [W]
     """
     sum_alpha = alpha1 + alpha2  # shape (N_q, N_c)
-    return P_pump * sigma * (1.0 - np.exp(-sum_alpha * L)) / sum_alpha
+    L_arr = np.asarray(L, dtype=np.float64)
+    if L_arr.ndim == 0:
+        return P_pump * sigma * (1.0 - np.exp(-sum_alpha * L_arr)) / sum_alpha
+    # L_arr path: broadcast over new trailing dimension
+    L_arr = L_arr.reshape(1, 1, -1)  # (1, 1, N_L)
+    return (P_pump[..., np.newaxis] * sigma[..., np.newaxis]
+            * (1.0 - np.exp(-sum_alpha[..., np.newaxis] * L_arr))
+            / sum_alpha[..., np.newaxis])  # (N_q, N_c, N_L)
 
 
 class DiscreteSPRSSolver(NoiseSolver):
@@ -374,6 +394,40 @@ class DiscreteSPRSSolver(NoiseSolver):
         P_bwd = P_bwd_matrix.sum(axis=1)  # shape (N_q,)
         assert P_bwd.shape == (f_q.shape[0],)
         return P_bwd
+
+    def compute_forward_l_array(
+        self, fiber: Fiber, wdm_grid: WDMGrid, L_arr: np.ndarray,
+    ) -> np.ndarray:
+        """Compute forward SpRS noise for multiple fiber lengths.
+
+        Computes sigma (L-independent) once, then propagates for all lengths
+        in a single vectorized call.
+
+        Returns
+        -------
+        ndarray, shape (N_q, N_L)
+        """
+        f_q, f_c, P_pump, alpha1, alpha2 = self._prepare(fiber, wdm_grid)
+        sigma = self._compute_sigma(f_q, f_c, fiber, wdm_grid)
+        P_fwd_matrix = _forward_propagation(sigma, P_pump, alpha1, alpha2, L_arr)
+        return P_fwd_matrix.sum(axis=1)  # (N_q, N_L)
+
+    def compute_backward_l_array(
+        self, fiber: Fiber, wdm_grid: WDMGrid, L_arr: np.ndarray,
+    ) -> np.ndarray:
+        """Compute backward SpRS noise for multiple fiber lengths.
+
+        Computes sigma (L-independent) once, then propagates for all lengths
+        in a single vectorized call.
+
+        Returns
+        -------
+        ndarray, shape (N_q, N_L)
+        """
+        f_q, f_c, P_pump, alpha1, alpha2 = self._prepare(fiber, wdm_grid)
+        sigma = self._compute_sigma(f_q, f_c, fiber, wdm_grid)
+        P_bwd_matrix = _backward_propagation(sigma, P_pump, alpha1, alpha2, L_arr)
+        return P_bwd_matrix.sum(axis=1)  # (N_q, N_L)
 
     # --- 连续模型方法 -------------------------------------------------------
 
