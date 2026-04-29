@@ -1349,6 +1349,7 @@ def _build_model_grid(
 
     mod_fmt = _modulation_format_for_model(model_key, spec)
     if spec["spectrum_type"] == SpectrumType.OSA_SAMPLED:
+        band_limit_hz = 2.0 * float(base_config.B_s)  # 2 × symbol rate
         return build_wdm_grid(
             config=model_config,
             spectrum_type=spec["spectrum_type"],
@@ -1356,6 +1357,7 @@ def _build_model_grid(
             osa_csv_path=osa_csv_path,
             osa_rbw=_get_osa_rbw(osa_csv_path),
             osa_center_freq_hz=osa_center_freq_hz,
+            osa_band_limit_hz=band_limit_hz,
             classical_channel_indices=CLASSICAL_INDICES,
             modulation_format=mod_fmt,
         )
@@ -1427,6 +1429,7 @@ def _build_all_classical_grid(
     mod_fmt = _modulation_format_for_model(model_key, spec)
     # Do NOT pass classical_channel_indices — derive it as complement of quantum_channel_indices
     if spec["spectrum_type"] == SpectrumType.OSA_SAMPLED:
+        band_limit_hz = 2.0 * float(base_config.B_s)  # 2 × symbol rate
         return build_wdm_grid(
             config=model_config,
             spectrum_type=spec["spectrum_type"],
@@ -1434,6 +1437,7 @@ def _build_all_classical_grid(
             osa_csv_path=osa_csv_path,
             osa_rbw=_get_osa_rbw(osa_csv_path),
             osa_center_freq_hz=osa_center_freq_hz,
+            osa_band_limit_hz=band_limit_hz,
             modulation_format=mod_fmt,
         )
     return build_wdm_grid(
@@ -1950,6 +1954,7 @@ def precompute_by_channel(
             if stype == SpectrumType.OSA_SAMPLED:
                 grid_kwargs["osa_csv_path"] = osa_csv_path
                 grid_kwargs["osa_rbw"] = _get_osa_rbw(osa_csv_path)
+                grid_kwargs["osa_band_limit_hz"] = 2.0 * float(model_config.B_s)
             grid_model = build_wdm_grid(**grid_kwargs)
             grid_cache[model_key] = grid_model
             # Signal PSD: sum ONLY over classical channels (C39/C40/C41)
@@ -2486,6 +2491,7 @@ def precompute_by_channel_all_powers(
                 gkw_t4["osa_csv_path"] = osa_csv_path
                 gkw_t4["osa_rbw"] = _get_osa_rbw(osa_csv_path)
                 gkw_t4["osa_center_freq_hz"] = osa_center_freq_hz
+                gkw_t4["osa_band_limit_hz"] = 2.0 * float(model_config_t4.B_s)
             grid_t4 = build_wdm_grid(**gkw_t4)
             grid_cache_t4[mk] = grid_t4
             sig_base = np.zeros_like(noise_f_grid, dtype=np.float64)

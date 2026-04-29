@@ -357,6 +357,7 @@ def build_wdm_grid(
     osa_csv_path: str | Path | None = None,
     osa_rbw: float | None = None,
     osa_center_freq_hz: float | None = None,
+    osa_band_limit_hz: float | None = None,
     classical_channel_indices: list[int] | None = None,
     modulation_format: str = "OOK",
 ) -> WDMGrid:
@@ -384,6 +385,7 @@ def build_wdm_grid(
     OSA_SAMPLED 谱型：
       - 从 osa_csv_path 加载模板后，将峰值平移对齐到每个经典信道的 f_center
       - 再归一化到 P0（由 normalize_psd_to_power 保证 sum(G*df)=P0）
+      - osa_band_limit_hz 不为 None 时，截断模板频率偏移至 ±band_limit/2
 
     Parameters
     ----------
@@ -397,6 +399,9 @@ def build_wdm_grid(
         OSA CSV 文件路径（OSA_SAMPLED 类型必需）
     osa_rbw : float or None
         OSA 分辨率带宽 [Hz]（OSA_SAMPLED 类型必需）
+    osa_band_limit_hz : float or None
+        OSA 模板频率截断带宽 [Hz]，截断 |offset| > band_limit/2 的部分。
+        None 时保留完整模板（向后兼容）。典型值：2 × 符号速率。
     classical_channel_indices : list[int] or None
         显式指定经典信道 ITU 信道号（1-based），如 [39, 40, 41] 表示 C39/C40/C41。
         为 None 时：classical = all_indices - quantum。
@@ -461,6 +466,13 @@ def build_wdm_grid(
             template_center = float(osa_f_raw[int(np.argmax(osa_psd_raw))])
         osa_offsets = osa_f_raw - template_center  # 相对偏移
         osa_template_psd = osa_psd_raw
+
+        if osa_band_limit_hz is not None and osa_band_limit_hz > 0:
+            half = float(osa_band_limit_hz) / 2.0
+            mask = np.abs(osa_offsets) <= half
+            if np.sum(mask) >= 2:
+                osa_offsets = osa_offsets[mask]
+                osa_template_psd = osa_template_psd[mask]
 
     channels: list[WDMChannel] = []
     for pos in range(num_channels):
