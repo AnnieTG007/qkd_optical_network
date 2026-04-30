@@ -346,9 +346,11 @@ def strict_finite_key_rate(
         N_A = bl.N_alice
         integration_time = N_A / R_0
     else:
-        # fixed-N_bob: n_bob = t * R_0 * P_XX * P_det_1
-        # => t = n_bob / (R_0 * P_XX * P_det_1)
-        integration_time = bl.N_bob / (R_0 * P_XX * P_det_1)
+        # fixed-N_bob: N_bob = t * R_0 * P_XX * (P_mu_1*P_det_1 + P_mu_2*P_det_2)
+        # => t = N_bob / (R_0 * P_XX * (P_mu_1*P_det_1 + P_mu_2*P_det_2))
+        # 参考：qkdsimulator.py bob-mode branch（与论文 arXiv:2405.16578 一致）
+        R_XX_total = R_0 * P_XX * (P_mu_1 * P_det_1 + P_mu_2 * P_det_2)
+        integration_time = bl.N_bob / R_XX_total
         N_A = integration_time * R_0  # 等效 Alice 发送脉冲数（用于统计涨落）
 
     epsilon_cor = skr_cfg.epsilon_cor

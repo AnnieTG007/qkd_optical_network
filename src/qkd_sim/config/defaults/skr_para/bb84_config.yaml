@@ -33,7 +33,7 @@ reference:
   epsilon_cor: 1.0e-12      # 正确性安全参数 (ε_cor)
   epsilon_sec: 1.0e-12      # 保密性安全参数 (ε_sec)
   concentration_method: "Hoeffding"
-  improved_serfling: false  # 是否使用改进的 Serfling 不等式
+  improved_serfling: true   # 是否使用改进的 Serfling 不等式（论文改进版，arXiv:2405.16578）
   optimize_params: true     # 严格有限长密钥参数优化（μ, ν, p_μ, P_X）
 
 custom:
@@ -60,5 +60,5 @@ custom:
   epsilon_cor: 1.0e-12     # 正确性安全参数 (ε_cor)
   epsilon_sec: 1.0e-12     # 保密性安全参数 (ε_sec)
   concentration_method: "Hoeffding"
-  improved_serfling: false  # 是否使用改进的 Serfling 不等式
+  improved_serfling: true   # 是否使用改进的 Serfling 不等式（论文改进版，arXiv:2405.16578）
   optimize_params: true     # 严格有限长密钥参数优化（μ, ν, p_μ, P_X）
