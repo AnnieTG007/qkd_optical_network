@@ -37,6 +37,7 @@ from scripts.dash_utils import (
     _get_osa_rbw,
     _init_skr_model_registry,
     _resolve_osa_csv,
+    _to_dbm,
     adaptive_linear_ticks,
     adaptive_log_ticks,
     add_strategy_cli_args,
@@ -57,13 +58,6 @@ from scripts.dash_utils import (
     set_power_override,
     _POWER_CACHE,
 )
-
-
-def _to_dbm(values_w: np.ndarray) -> np.ndarray:
-    out = np.full_like(values_w, np.nan, dtype=np.float64)
-    mask = values_w > 0
-    out[mask] = 10.0 * np.log10(values_w[mask] / 1e-3)
-    return out
 
 
 def _global_ranges(all_data: dict, model_keys: list[str]) -> tuple[tuple[float, float], tuple[float, float]]:

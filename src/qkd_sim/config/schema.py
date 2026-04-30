@@ -107,6 +107,8 @@ class WDMConfig:
         比特速率 [bps]。DP-16QAM: 200 Gbps; NRZ-OOK: 10.3 Gbps
     P0 : float
         单信道发射功率 [W]
+    B_q : float
+        量子信道接收带宽 [Hz]。默认 20 GHz，用于 SKR 噪声功率积分
     beta_rolloff : float
         升余弦滚降因子 [0, 1]，0 = 矩形谱
     quantum_channel_indices : list[int]
@@ -122,6 +124,7 @@ class WDMConfig:
     B_s: float
     data_rate_bps: float
     P0: float
+    B_q: float = 20e9
     beta_rolloff: float = 0.0
     ook_filter_order: int = 1          # NRZ-OOK Butterworth 滤波器阶数（m=1 退化为 Lorentzian）
     ook_f3db_hz: float | None = None   # NRZ-OOK -3dB 截止频率 [Hz]；None = 从 sinc² 严格计算
@@ -134,6 +137,8 @@ class WDMConfig:
             raise ValueError("channel_spacing must be positive")
         if self.B_s <= 0.0:
             raise ValueError("B_s must be positive")
+        if self.B_q <= 0.0:
+            raise ValueError("B_q must be positive")
         if self.data_rate_bps <= 0.0:
             raise ValueError("data_rate_bps must be positive")
         if self.P0 < 0.0:
@@ -349,6 +354,7 @@ class SKRConfig:
     epsilon_sec: float
     concentration_method: str = "Hoeffding"
     improved_serfling: bool = False  # 是否使用改进的 Serfling 不等式（Fung et al.）
+    optimize_params: bool = True    # 严格有限长：是否优化 μ, ν, p_μ, P_X（Nelder-Mead）
 
     # 由 __post_init__ 计算
     IL: float = field(init=False, repr=False)

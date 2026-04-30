@@ -34,6 +34,7 @@ reference:
   epsilon_sec: 1.0e-12      # 保密性安全参数 (ε_sec)
   concentration_method: "Hoeffding"
   improved_serfling: false  # 是否使用改进的 Serfling 不等式
+  optimize_params: true     # 严格有限长密钥参数优化（μ, ν, p_μ, P_X）
 
 custom:
   # 自定义参数（实际系统仿真）
@@ -50,9 +51,9 @@ custom:
   p_signal: 0.7             # 信号态发送概率 (p_μ)
   p_decoy: 0.3              # 诱骗态发送概率 (p_ν)
   block_length:
-    mode: "alice"
-    N_alice: 1.0e+10
-    N_bob: ~
+    mode: "bob"
+    N_alice: ~
+    N_bob: 1.0e+10
   gamma_ks: 5.0             # Gaussian 置信倍数 (γ_ks)
   P_X_alice: 0.9            # Alice X 基矢选取概率
   P_X_bob: 0.9              # Bob X 基矢选取概率
@@ -60,3 +61,4 @@ custom:
   epsilon_sec: 1.0e-12     # 保密性安全参数 (ε_sec)
   concentration_method: "Hoeffding"
   improved_serfling: false  # 是否使用改进的 Serfling 不等式
+  optimize_params: true     # 严格有限长密钥参数优化（μ, ν, p_μ, P_X）

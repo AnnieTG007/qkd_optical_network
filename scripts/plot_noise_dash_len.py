@@ -37,6 +37,7 @@ from scripts.dash_utils import (
     _display_channel_label,
     _init_skr_model_registry,
     _resolve_osa_csv,
+    _to_dbm,
     adaptive_linear_ticks,
     adaptive_log_ticks,
     add_strategy_cli_args,
@@ -53,13 +54,6 @@ from scripts.dash_utils import (
     set_power_override,
     _POWER_CACHE,
 )
-
-
-def _to_dbm(values_w: np.ndarray) -> np.ndarray:
-    out = np.full_like(values_w, np.nan, dtype=np.float64)
-    mask = values_w > 0
-    out[mask] = 10.0 * np.log10(values_w[mask] / 1e-3)
-    return out
 
 
 def _global_ranges(all_data: dict, model_keys: list[str]) -> tuple[tuple[float, float], tuple[float, float]]:
@@ -172,7 +166,7 @@ _SKR_CACHE_LEN: dict[float, dict[int, dict]] = {}  # power_dbm -> ch_idx -> skr_
 
 def _build_len_skr_cache(power_dbm: float, sweep_at_ch: dict, ch_idx: int) -> dict:
     """Build SKR cache for a single (power, channel) combo."""
-    return compute_skr_vs_length(sweep_at_ch, ch_idx, LENGTHS_KM, _FIBER_CFG, _SKR_CFG, optimize=False)
+    return compute_skr_vs_length(sweep_at_ch, ch_idx, LENGTHS_KM, _FIBER_CFG, _SKR_CFG, optimize=_SKR_CFG.optimize_params)
 
 
 print("[SKR] Building SKR cache for all power levels and channels...")

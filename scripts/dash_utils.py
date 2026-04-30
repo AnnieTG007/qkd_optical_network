@@ -43,6 +43,7 @@ def _load_wdm_params() -> dict:
         end_channel=cfg.end_channel,
         channel_spacing=cfg.channel_spacing,
         B_s=cfg.B_s,
+        B_q=cfg.B_q,
         data_rate_bps=cfg.data_rate_bps,
         P0=cfg.P0,
         beta_rolloff=cfg.beta_rolloff,
@@ -395,6 +396,14 @@ def _build_caption() -> str:
     )
 
 
+def _to_dbm(values_w: np.ndarray) -> np.ndarray:
+    """Convert power [W] to dBm with NaN for non-positive values."""
+    out = np.full_like(values_w, np.nan, dtype=np.float64)
+    mask = values_w > 0
+    out[mask] = 10.0 * np.log10(values_w[mask] / 1e-3)
+    return out
+
+
 # =============================================================================
 # SKR utility functions
 # =============================================================================
@@ -465,24 +474,32 @@ def compute_skr_vs_channel(
 
     for model_key, entry in sweep.items():
         # Prefer noise_only_* (pure FWM+SpRS, no classical signal) for SKR computation.
-        # with_signal stores these separately; other noise types fall back to fwd/bwd.
-        fwd_w = np.asarray(entry.get("noise_only_fwd", entry.get("fwd", [])), dtype=np.float64)
-        bwd_w = np.asarray(entry.get("noise_only_bwd", entry.get("bwd", [])), dtype=np.float64)
-        x_data = np.asarray(entry.get("x", []), dtype=np.float64)
-        x_kind = entry.get("x_kind", "")
+        # with_signal stores per-channel integrated values; other noise types fall back to fwd/bwd.
+        noise_only_fwd = entry.get("noise_only_fwd")
+        noise_only_bwd = entry.get("noise_only_bwd")
 
-        if len(x_data) == 0 or len(fwd_w) == 0:
-            continue
-
-        # Interpolate noise power at each quantum channel center frequency
-        if x_kind == "frequency_grid" and len(x_data) > 1:
-            fwd_interp = np.interp(quantum_center_freqs_hz, x_data, fwd_w)
-            bwd_interp = np.interp(quantum_center_freqs_hz, x_data, bwd_w)
-        elif len(x_data) == n_ch:
-            fwd_interp = fwd_w.copy()
-            bwd_interp = bwd_w.copy()
+        if noise_only_fwd is not None and noise_only_bwd is not None and len(np.asarray(noise_only_fwd)) == n_ch:
+            # Per-channel integrated noise power (B_q-bandwidth integration)
+            fwd_interp = np.asarray(noise_only_fwd, dtype=np.float64)
+            bwd_interp = np.asarray(noise_only_bwd, dtype=np.float64)
         else:
-            continue
+            # Fallback: interpolate from frequency grid or use channel-center point values
+            fwd_w = np.asarray(noise_only_fwd if noise_only_fwd is not None else entry.get("fwd", []), dtype=np.float64)
+            bwd_w = np.asarray(noise_only_bwd if noise_only_bwd is not None else entry.get("bwd", []), dtype=np.float64)
+            x_data = np.asarray(entry.get("x", []), dtype=np.float64)
+            x_kind = entry.get("x_kind", "")
+
+            if len(x_data) == 0 or len(fwd_w) == 0:
+                continue
+
+            if x_kind == "frequency_grid" and len(x_data) > 1:
+                fwd_interp = np.interp(quantum_center_freqs_hz, x_data, fwd_w)
+                bwd_interp = np.interp(quantum_center_freqs_hz, x_data, bwd_w)
+            elif len(x_data) == n_ch:
+                fwd_interp = fwd_w.copy()
+                bwd_interp = bwd_w.copy()
+            else:
+                continue
 
         for direction, noise_arr in [("fwd", fwd_interp), ("bwd", bwd_interp)]:
             for ch_i in range(n_ch):
@@ -545,7 +562,7 @@ def compute_skr_cache_for_power(
     dist_m = float(length_km * 1000.0)
     return compute_skr_vs_channel(
         sweep_at_l, dist_m, quantum_center_freqs_hz,
-        fiber_cfg, skr_cfg, optimize=False,
+        fiber_cfg, skr_cfg, optimize=skr_cfg.optimize_params,
     )
 
 
@@ -1637,19 +1654,52 @@ def _compute_noise_spectrum_pair(
     return np.asarray(fwd, dtype=np.float64), np.asarray(bwd, dtype=np.float64)
 
 
-def _compute_nli_pair(fiber, grid) -> tuple[np.ndarray, np.ndarray]:
-    try:
-        from qkd_sim.physical.noise import GNModelSolver
-        gn_solver = GNModelSolver()
-    except ImportError:
-        n_ch = len(grid.channels)
-        return np.zeros(n_ch, dtype=np.float64), np.zeros(n_ch, dtype=np.float64)
+def _integrate_psd_per_quantum_channel(
+    psd: np.ndarray,
+    f_grid: np.ndarray,
+    q_center_freqs: np.ndarray,
+    bandwidth: float,
+    df: float,
+) -> np.ndarray:
+    """Integrate PSD over [f_q - B_q/2, f_q + B_q/2] for each quantum channel.
 
-    result = gn_solver.compute_nli_per_channel(fiber, grid, grid.f_grid)
-    return (
-        np.asarray(result["nli_fwd"], dtype=np.float64),
-        np.asarray(result["nli_bwd"], dtype=np.float64),
-    )
+    Parameters
+    ----------
+    psd : ndarray, shape (N_f,) or (N_f, N_L)
+        Noise PSD [W/Hz].
+    f_grid : ndarray, shape (N_f,)
+        Frequency grid [Hz].
+    q_center_freqs : ndarray, shape (N_q,)
+        Quantum channel center frequencies [Hz].
+    bandwidth : float
+        Integration bandwidth B_q [Hz].
+    df : float
+        Frequency grid spacing [Hz].
+
+    Returns
+    -------
+    ndarray, shape (N_q,) or (N_q, N_L)
+        Integrated noise power [W] per quantum channel.
+    """
+    n_q = len(q_center_freqs)
+    scalar_input = psd.ndim == 1
+    if scalar_input:
+        psd = psd[:, np.newaxis]  # (N_f, 1)
+    n_l = psd.shape[1]
+    result = np.zeros((n_q, n_l), dtype=np.float64)
+    half_bw = bandwidth / 2.0
+    for qi, f_q in enumerate(q_center_freqs):
+        in_band = (f_grid >= f_q - half_bw) & (f_grid <= f_q + half_bw)
+        n_pts = np.sum(in_band)
+        if n_pts == 0:
+            continue
+        if n_pts == 1:
+            result[qi, :] = psd[in_band, :].ravel() * df
+        else:
+            result[qi, :] = np.trapezoid(psd[in_band, :], f_grid[in_band], axis=0)
+    if scalar_input:
+        return result.ravel()  # (N_q,)
+    return result  # (N_q, N_L)
 
 
 def precompute_by_length(
@@ -1705,6 +1755,7 @@ VALID_Q_INDICES: list of q_idx that have non-zero noise for at least one model
             end_channel=base_config.end_channel,
             channel_spacing=base_config.channel_spacing,
             B_s=base_config.B_s,
+            B_q=base_config.B_q,
             data_rate_bps=base_config.data_rate_bps,
             P0=_get_P0(),
             beta_rolloff=WDM_PARAMS["beta_rolloff"],
@@ -1734,20 +1785,34 @@ VALID_Q_INDICES: list of q_idx that have non-zero noise for at least one model
             # idx is zero-based position; ITU channel number = idx+1
             if (idx + 1) in classical_set:
                 signal_psd += ch.get_psd(noise_f_grid)
+        # Quantum channel center frequencies and per-channel noise integration
+        q_itn_list = list(base_config.quantum_channel_indices)
+        q_center_freqs_len = np.array(
+            [base_config.start_freq + (itn - base_config.start_channel) * base_config.channel_spacing
+             for itn in q_itn_list],
+            dtype=np.float64,
+        )
+        B_q_len = float(base_config.B_q)
+        noise_only_fwd_by_q = _integrate_psd_per_quantum_channel(
+            noise_fwd_psd_all, noise_f_grid, q_center_freqs_len, B_q_len, df,
+        )  # (N_q, N_L)
+        noise_only_bwd_by_q = _integrate_psd_per_quantum_channel(
+            noise_bwd_psd_all, noise_f_grid, q_center_freqs_len, B_q_len, df,
+        )  # (N_q, N_L)
         for model_key in model_keys:
             for li in range(n_l):
                 noise_fwd_psd = noise_fwd_psd_all[:, li]
                 noise_bwd_psd = noise_bwd_psd_all[:, li]
                 total_fwd_power = float(np.sum(noise_fwd_psd + signal_psd) * df)
                 total_bwd_power = float(np.sum(noise_bwd_psd + signal_psd) * df)
-                # T1: store pure noise integrals for SKR (no signal contamination)
-                noise_only_fwd_power = float(np.sum(noise_fwd_psd) * df)
-                noise_only_bwd_power = float(np.sum(noise_bwd_psd) * df)
                 for ch_idx in range(n_ch):
                     all_by_len[ch_idx][model_key]["fwd"][li] = total_fwd_power
                     all_by_len[ch_idx][model_key]["bwd"][li] = total_bwd_power
-                    all_by_len[ch_idx][model_key]["noise_only_fwd"][li] = noise_only_fwd_power
-                    all_by_len[ch_idx][model_key]["noise_only_bwd"][li] = noise_only_bwd_power
+                # Per-channel noise: integrate PSD over B_q bandwidth per quantum channel
+                for qi, itn in enumerate(q_itn_list):
+                    ch_idx = int(itn) - 1  # ITU → 0-based
+                    all_by_len[ch_idx][model_key]["noise_only_fwd"][li] = float(noise_only_fwd_by_q[qi, li])
+                    all_by_len[ch_idx][model_key]["noise_only_bwd"][li] = float(noise_only_bwd_by_q[qi, li])
 
         valid_indices = [
             ch_idx
@@ -1882,12 +1947,20 @@ def precompute_by_channel(
         from qkd_sim.physical.noise import DiscreteFWMSolver, DiscreteSPRSSolver
 
         df = float(np.mean(np.diff(noise_f_grid)))
+        # Quantum channel center frequencies for per-channel noise integration
+        q_center_freqs = np.array(
+            [base_config.start_freq + (itn - base_config.start_channel) * base_config.channel_spacing
+             for itn in quantum_indices],
+            dtype=np.float64,
+        )
+        B_q = float(base_config.B_q)
         all_by_ch = {
             li: {mk: {
                 "fwd": np.zeros(len(noise_f_grid)),
                 "bwd": np.zeros(len(noise_f_grid)),
-                "noise_only_fwd": np.zeros(len(noise_f_grid)),
-                "noise_only_bwd": np.zeros(len(noise_f_grid)),
+                "noise_only_fwd": np.zeros(n_q),
+                "noise_only_bwd": np.zeros(n_q),
+                "noise_only_x": q_center_freqs,
                 "x": np.asarray(noise_f_grid, dtype=np.float64),
                 "x_kind": "frequency_grid",
                 "y_kind": "power_per_bin",
@@ -1980,9 +2053,13 @@ def precompute_by_channel(
                 total_bwd = (noise_bwd_psd + signal_psd) * df
                 all_by_ch[li][model_key]["fwd"] = np.asarray(total_fwd, dtype=np.float64)
                 all_by_ch[li][model_key]["bwd"] = np.asarray(total_bwd, dtype=np.float64)
-                # T1: store pure noise (FWM+SpRS, no signal) separately for SKR input
-                all_by_ch[li][model_key]["noise_only_fwd"] = np.asarray(noise_fwd_psd * df, dtype=np.float64)
-                all_by_ch[li][model_key]["noise_only_bwd"] = np.asarray(noise_bwd_psd * df, dtype=np.float64)
+                # T1: integrate pure noise PSD over B_q bandwidth per quantum channel
+                all_by_ch[li][model_key]["noise_only_fwd"] = _integrate_psd_per_quantum_channel(
+                    noise_fwd_psd, noise_f_grid, q_center_freqs, B_q, df,
+                )
+                all_by_ch[li][model_key]["noise_only_bwd"] = _integrate_psd_per_quantum_channel(
+                    noise_bwd_psd, noise_f_grid, q_center_freqs, B_q, df,
+                )
 
         valid_l_indices = [
             li
@@ -2545,6 +2622,15 @@ def precompute_by_channel_all_powers(
             )
         ]
 
+        # Quantum channel center frequencies and bandwidth for per-channel noise integration
+        quantum_indices_ws = list(base_config.quantum_channel_indices)
+        q_center_freqs_ws = np.array(
+            [base_config.start_freq + (itn - base_config.start_channel) * base_config.channel_spacing
+             for itn in quantum_indices_ws],
+            dtype=np.float64,
+        )
+        B_q_ws = float(base_config.B_q)
+
         results: dict[float, tuple[dict, list]] = {}
         for p in PRECOMPUTE_POWER_LEVELS:
             fwm_scale = _power_scaling_factor("fwm", float(p))   # P³
@@ -2564,13 +2650,21 @@ def precompute_by_channel_all_powers(
                     sig_psd = signal_base_cache.get(mk, np.zeros(len(noise_f_grid)))
                     sig_scaled = sig_scale * sig_psd * df  # [W/bin]
 
-                    noise_only_fwd = fwm_scale * fwm_fwd + sprs_scale * sprs_fwd
-                    noise_only_bwd = fwm_scale * fwm_bwd + sprs_scale * sprs_bwd
+                    noise_only_fwd_bin = fwm_scale * fwm_fwd + sprs_scale * sprs_fwd
+                    noise_only_bwd_bin = fwm_scale * fwm_bwd + sprs_scale * sprs_bwd
+                    # Integrate per-bin noise over B_q bandwidth per quantum channel
+                    noise_only_fwd = _integrate_psd_per_quantum_channel(
+                        noise_only_fwd_bin / df, noise_f_grid, q_center_freqs_ws, B_q_ws, df,
+                    )
+                    noise_only_bwd = _integrate_psd_per_quantum_channel(
+                        noise_only_bwd_bin / df, noise_f_grid, q_center_freqs_ws, B_q_ws, df,
+                    )
                     all_by_idx[li][mk] = {
-                        "fwd": noise_only_fwd + sig_scaled,
-                        "bwd": noise_only_bwd + sig_scaled,
+                        "fwd": noise_only_fwd_bin + sig_scaled,
+                        "bwd": noise_only_bwd_bin + sig_scaled,
                         "noise_only_fwd": noise_only_fwd,
                         "noise_only_bwd": noise_only_bwd,
+                        "noise_only_x": q_center_freqs_ws,
                         "x": x_base_ws[mk],
                         "x_kind": "frequency_grid",
                         "y_kind": "power_per_bin",

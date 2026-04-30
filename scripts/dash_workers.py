@@ -57,10 +57,9 @@ def mp_worker_single_length(
             bwd += f_bwd
         if nt in ("sprs", "both"):
             slv = DiscreteSPRSSolver()
-            df = float(np.mean(np.diff(fgr)))
             sp_fwd, sp_bwd = slv.compute_sprs_spectrum_conti(fib, grd, fgr, direction="both")
-            fwd += sp_fwd / df
-            bwd += sp_bwd / df
+            fwd += sp_fwd
+            bwd += sp_bwd
         return np.asarray(fwd, dtype=np.float64), np.asarray(bwd, dtype=np.float64)
 
     cfg = WDMConfig(**wdm_cfg)
@@ -77,6 +76,7 @@ def mp_worker_single_length(
             end_channel=cfg.end_channel,
             channel_spacing=cfg.channel_spacing,
             B_s=cfg.B_s,
+            B_q=cfg.B_q,
             P0=p0,
             beta_rolloff=0.0,
             ook_filter_order=cfg.ook_filter_order,
@@ -93,6 +93,14 @@ def mp_worker_single_length(
         )
         fiber = _make_fiber(fiber_params, length_km)
         n_fwd, n_bwd = _noise_pair("both", fiber, grid_noise, noise_f_grid)
+        # Quantum channel center frequencies for per-channel noise integration
+        quantum_itn = list(cfg.quantum_channel_indices)
+        q_center_freqs_mp = np.array(
+            [cfg.start_freq + (itn - cfg.start_channel) * cfg.channel_spacing
+             for itn in quantum_itn],
+            dtype=np.float64,
+        )
+        B_q_mp = float(cfg.B_q)
         for mk in model_keys:
             sig_psd = np.zeros(n_f, dtype=np.float64)
             for idx, ch in enumerate(grid_noise.channels):
@@ -101,8 +109,19 @@ def mp_worker_single_length(
                     sig_psd += ch.get_psd(noise_f_grid)
             fwd = (n_fwd + sig_psd) * df
             bwd = (n_bwd + sig_psd) * df
+            # Per-channel noise: integrate PSD over B_q bandwidth per quantum channel
+            from scripts.dash_utils import _integrate_psd_per_quantum_channel
+            noise_only_fwd_mp = _integrate_psd_per_quantum_channel(
+                n_fwd, noise_f_grid, q_center_freqs_mp, B_q_mp, df,
+            )
+            noise_only_bwd_mp = _integrate_psd_per_quantum_channel(
+                n_bwd, noise_f_grid, q_center_freqs_mp, B_q_mp, df,
+            )
             results.append({
                 "fwd": fwd, "bwd": bwd,
+                "noise_only_fwd": noise_only_fwd_mp,
+                "noise_only_bwd": noise_only_bwd_mp,
+                "noise_only_x": q_center_freqs_mp,
                 "x": np.asarray(noise_f_grid, dtype=np.float64),
                 "x_kind": "frequency_grid",
                 "y_kind": "power_per_bin",
