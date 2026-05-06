@@ -107,6 +107,7 @@ _SKR_ZERO_SENTINEL = 1e-15
 # SKR model override
 if ARGS.skr_model is not None:
     _du.DEFAULT_SKR_MODEL_KEY = ARGS.skr_model
+DEFAULT_SKR_MODEL_KEY = _du.DEFAULT_SKR_MODEL_KEY
 
 _du.WDM_PARAMS["data_rate_bps"] = ARGS.data_rate
 

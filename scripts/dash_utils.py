@@ -428,6 +428,24 @@ def noise_power_to_p_noise(P_w: float, f_hz: float, R_rep: float) -> float:
     return float(1.0 - np.exp(-mu))
 
 
+def noise_power_to_p_noise_array(
+    P_w: np.ndarray | float,
+    f_hz: np.ndarray | float,
+    R_rep: float,
+) -> np.ndarray:
+    """Vectorized noise power [W] to per-pulse noise probability."""
+    P_arr, f_arr = np.broadcast_arrays(
+        np.asarray(P_w, dtype=np.float64),
+        np.asarray(f_hz, dtype=np.float64),
+    )
+    out = np.zeros_like(P_arr, dtype=np.float64)
+    if R_rep <= 0.0:
+        return out
+    valid = (P_arr > 0.0) & (f_arr > 0.0)
+    out[valid] = 1.0 - np.exp(-P_arr[valid] / (_PLANCK_H * f_arr[valid] * R_rep))
+    return out
+
+
 def compute_skr_point(noise_w: float, distance_m: float, f_hz: float, fiber_cfg, skr_cfg,
                       optimize: bool = False, model_keys: list[str] | None = None) -> dict:
     """Compute SKR at a single (noise, distance, frequency) point.
@@ -452,6 +470,55 @@ def compute_skr_point(noise_w: float, distance_m: float, f_hz: float, fiber_cfg,
         except Exception:
             results[mkey] = (0.0, 0.0, float("nan"))
     return results
+
+
+def compute_skr_arrays_for_model(
+    model_key: str,
+    noise_w: np.ndarray | float,
+    distance_m: np.ndarray | float,
+    f_hz: np.ndarray | float,
+    fiber_cfg,
+    skr_cfg,
+    optimize: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute one SKR model for array-like inputs.
+
+    ``approx_finite`` uses a NumPy vectorized formula. Other models keep the
+    scalar path for compatibility with optimizers and extra branches.
+    """
+    noise_arr, dist_arr, freq_arr = np.broadcast_arrays(
+        np.asarray(noise_w, dtype=np.float64),
+        np.asarray(distance_m, dtype=np.float64),
+        np.asarray(f_hz, dtype=np.float64),
+    )
+    shape = noise_arr.shape
+
+    if model_key == "approx_finite":
+        from qkd_sim.physical.skr.skr_decoy_bb84 import approx_finite_key_rate_array
+
+        try:
+            p_noise = noise_power_to_p_noise_array(noise_arr, freq_arr, skr_cfg.R_rep)
+            return approx_finite_key_rate_array(dist_arr, fiber_cfg, skr_cfg, p_noise)
+        except Exception:
+            return (
+                np.zeros(shape, dtype=np.float64),
+                np.zeros(shape, dtype=np.float64),
+                np.full(shape, np.nan, dtype=np.float64),
+            )
+
+    flat_noise = noise_arr.ravel()
+    flat_dist = dist_arr.ravel()
+    flat_freq = freq_arr.ravel()
+    bps = np.zeros(flat_noise.size, dtype=np.float64)
+    bpp = np.zeros(flat_noise.size, dtype=np.float64)
+    qber = np.full(flat_noise.size, np.nan, dtype=np.float64)
+    for i in range(flat_noise.size):
+        skr_d = compute_skr_point(
+            float(flat_noise[i]), float(flat_dist[i]), float(flat_freq[i]),
+            fiber_cfg, skr_cfg, optimize, model_keys=[model_key],
+        )
+        bps[i], bpp[i], qber[i] = skr_d.get(model_key, (0.0, 0.0, float("nan")))
+    return bps.reshape(shape), bpp.reshape(shape), qber.reshape(shape)
 
 
 def compute_skr_vs_channel(
@@ -515,18 +582,16 @@ def compute_skr_vs_channel(
                 continue
 
         for direction, noise_arr in [("fwd", fwd_interp), ("bwd", bwd_interp)]:
-            for ch_i in range(n_ch):
-                skr_d = compute_skr_point(
-                    float(noise_arr[ch_i]), dist_m,
-                    float(quantum_center_freqs_hz[ch_i]), fiber_cfg, skr_cfg, optimize,
-                    model_keys=skr_keys,
+            for mkey in skr_keys:
+                skr_result[model_key][mkey][direction] = compute_skr_arrays_for_model(
+                    mkey,
+                    np.asarray(noise_arr, dtype=np.float64),
+                    float(dist_m),
+                    quantum_center_freqs_hz,
+                    fiber_cfg,
+                    skr_cfg,
+                    optimize,
                 )
-                for mkey in skr_keys:
-                    bps, bpp, qber = skr_d.get(mkey, (0.0, 0.0, float("nan")))
-                    lists = skr_result[model_key][mkey][direction]
-                    lists[0].append(bps)
-                    lists[1].append(bpp)
-                    lists[2].append(qber)
 
     # Convert lists to arrays
     for model_key in skr_result:
@@ -619,18 +684,18 @@ def compute_skr_vs_length(
 
         skr_by_model: dict = {}
         for mkey in skr_keys:
-            fwd_bps, fwd_bpp, fwd_qber = [], [], []
-            bwd_bps, bwd_bpp, bwd_qber = [], [], []
-            for li in range(n_len):
-                fwd_d = compute_skr_point(float(fwd_w[li]), float(lengths_km[li] * 1000), f_q_hz, fiber_cfg, skr_cfg, optimize, model_keys=skr_keys)
-                bwd_d = compute_skr_point(float(bwd_w[li]), float(lengths_km[li] * 1000), f_q_hz, fiber_cfg, skr_cfg, optimize, model_keys=skr_keys)
-                bps_f, bpp_f, q_f = fwd_d.get(mkey, (0.0, 0.0, float("nan")))
-                bps_b, bpp_b, q_b = bwd_d.get(mkey, (0.0, 0.0, float("nan")))
-                fwd_bps.append(bps_f); fwd_bpp.append(bpp_f); fwd_qber.append(q_f)
-                bwd_bps.append(bps_b); bwd_bpp.append(bpp_b); bwd_qber.append(q_b)
+            distances_m = np.asarray(lengths_km[:n_len], dtype=np.float64) * 1000.0
+            fwd_bps, fwd_bpp, fwd_qber = compute_skr_arrays_for_model(
+                mkey, fwd_w[:n_len], distances_m, f_q_hz,
+                fiber_cfg, skr_cfg, optimize,
+            )
+            bwd_bps, bwd_bpp, bwd_qber = compute_skr_arrays_for_model(
+                mkey, bwd_w[:n_len], distances_m, f_q_hz,
+                fiber_cfg, skr_cfg, optimize,
+            )
             skr_by_model[mkey] = {
-                "fwd": (np.array(fwd_bps), np.array(fwd_bpp), np.array(fwd_qber)),
-                "bwd": (np.array(bwd_bps), np.array(bwd_bpp), np.array(bwd_qber)),
+                "fwd": (np.asarray(fwd_bps), np.asarray(fwd_bpp), np.asarray(fwd_qber)),
+                "bwd": (np.asarray(bwd_bps), np.asarray(bwd_bpp), np.asarray(bwd_qber)),
             }
         skr_result[model_key] = skr_by_model
 

@@ -169,6 +169,7 @@ _SKR_ZERO_SENTINEL = 1e-15
 # SKR model override
 if ARGS.skr_model is not None:
     _du.DEFAULT_SKR_MODEL_KEY = ARGS.skr_model
+DEFAULT_SKR_MODEL_KEY = _du.DEFAULT_SKR_MODEL_KEY
 
 # Fail fast if a stale Dash instance is still holding 8051 — otherwise app.run
 # would OSError after the full precompute and the browser would keep reading

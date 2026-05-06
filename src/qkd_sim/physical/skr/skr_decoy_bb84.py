@@ -28,6 +28,13 @@ def H2(x: float) -> float:
     return -x * math.log2(x) - (1.0 - x) * math.log2(1.0 - x)
 
 
+def H2_array(x: np.ndarray | float) -> np.ndarray:
+    """Vectorized binary entropy matching ``H2`` clipping behavior."""
+    x_arr = np.asarray(x, dtype=np.float64)
+    x_clip = np.clip(x_arr, 1e-15, 1.0 - 1e-15)
+    return -x_clip * np.log2(x_clip) - (1.0 - x_clip) * np.log2(1.0 - x_clip)
+
+
 def _clip(lo: float, hi: float, x: float) -> float:
     return max(lo, min(hi, x))
 
@@ -72,6 +79,30 @@ def _channel_quantities(
     Q_mu = float(Y0 + 1.0 - exp_term)
     E_mu = float((e0 * Y0 + skr_cfg.e_det * (1.0 - exp_term)) / max(Q_mu, 1e-30))
     return float(eta), float(Y0), Q_mu, E_mu
+
+
+def _channel_quantities_array(
+    distance_m: np.ndarray | float,
+    fiber_cfg: FiberConfig,
+    skr_cfg: SKRConfig,
+    mu: float,
+    p_noise: np.ndarray | float = 0.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Vectorized channel quantities for approximate finite-key SKR."""
+    distance_arr, p_noise_arr = np.broadcast_arrays(
+        np.asarray(distance_m, dtype=np.float64),
+        np.asarray(p_noise, dtype=np.float64),
+    )
+    eta = skr_cfg.eta_spd * np.exp(-fiber_cfg.alpha * distance_arr) * skr_cfg.IL
+    p_noise_total = skr_cfg.noise_count_prob + p_noise_arr
+    Y0 = 1.0 - (1.0 - skr_cfg.dark_count_prob - p_noise_total) ** 2
+    Y0 = np.maximum(Y0, 0.0)
+
+    e0 = 0.5
+    exp_term = np.exp(-mu * eta)
+    Q_mu = Y0 + 1.0 - exp_term
+    E_mu = (e0 * Y0 + skr_cfg.e_det * (1.0 - exp_term)) / np.maximum(Q_mu, 1e-30)
+    return eta, Y0, Q_mu, E_mu
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +226,78 @@ def approx_finite_key_rate(
     )
     skr_bps = float(max(0.0, skr)) * float(skr_cfg.R_rep)
     return skr_bps, skr_bps_to_bit_per_pulse(skr_bps, skr_cfg.R_rep), float(E_mu)
+
+
+def approx_finite_key_rate_array(
+    distance_m: np.ndarray | float,
+    fiber_cfg: FiberConfig,
+    skr_cfg: SKRConfig,
+    p_noise: np.ndarray | float = 0.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Vectorized approximate finite-key BB84 rate.
+
+    Mirrors ``approx_finite_key_rate`` while accepting array-like distance
+    and/or external noise probability. Computation stays in float64 and scalar
+    early-return branches are preserved via masks.
+    """
+    mu = skr_cfg.mu_signal
+    nu = skr_cfg.mu_decoy
+    p_mu = skr_cfg.p_signal
+    p_nu = skr_cfg.p_decoy
+    N = skr_cfg.block_length.N_alice
+    if N is None:
+        N = skr_cfg.block_length.N_bob
+    gamma = skr_cfg.gamma_ks
+    e0 = 0.5
+
+    distance_arr, p_noise_arr = np.broadcast_arrays(
+        np.asarray(distance_m, dtype=np.float64),
+        np.asarray(p_noise, dtype=np.float64),
+    )
+
+    _, Y0, Q_mu, E_mu = _channel_quantities_array(
+        distance_arr, fiber_cfg, skr_cfg, mu, p_noise_arr,
+    )
+    _, _, Q_nu, E_nu = _channel_quantities_array(
+        distance_arr, fiber_cfg, skr_cfg, nu, p_noise_arr,
+    )
+
+    denom_Q = np.maximum(p_nu * Q_nu * N / 2.0, 1e-30)
+    Q_nu_L = Q_nu * (1.0 - gamma / np.sqrt(denom_Q))
+    Q_nu_L = np.maximum(Q_nu_L, 0.0)
+
+    EnuQnu = E_nu * Q_nu
+    denom_E = np.maximum(p_nu * EnuQnu * N / 2.0, 1e-30)
+    EnuQnu_U = EnuQnu * (1.0 + gamma / np.sqrt(denom_E))
+    EnuQnu_U = np.maximum(EnuQnu_U, 0.0)
+
+    denom_Y1 = mu * nu - nu ** 2
+    if abs(denom_Y1) < 1e-30:
+        zeros = np.zeros_like(E_mu, dtype=np.float64)
+        return zeros, zeros.copy(), E_mu.astype(np.float64)
+
+    Y1_L = (mu / denom_Y1) * (
+        Q_nu_L * math.exp(nu)
+        - (nu ** 2 / mu ** 2) * Q_mu * math.exp(mu)
+        - (mu ** 2 - nu ** 2) / mu ** 2 * Y0
+    )
+    Y1_L = np.maximum(Y1_L, 0.0)
+    active = Y1_L >= 1e-30
+
+    Q1_L = Y1_L * mu * math.exp(-mu)
+    e1_U = (EnuQnu_U * math.exp(nu) - e0 * Y0) / (nu * np.maximum(Y1_L, 1e-30))
+    e1_U = np.clip(e1_U, 0.0, 0.5)
+
+    skr = p_mu * skr_cfg.q_sifting * (
+        -Q_mu * skr_cfg.f_ec * H2_array(E_mu) + Q1_L * (1.0 - H2_array(e1_U))
+    )
+    skr = np.where(active, np.maximum(skr, 0.0), 0.0)
+    skr_bps = skr.astype(np.float64) * float(skr_cfg.R_rep)
+    if skr_cfg.R_rep > 0.0:
+        skr_bpp = skr_bps / float(skr_cfg.R_rep)
+    else:
+        skr_bpp = np.zeros_like(skr_bps, dtype=np.float64)
+    return skr_bps, skr_bpp, E_mu.astype(np.float64)
 
 
 # ---------------------------------------------------------------------------
