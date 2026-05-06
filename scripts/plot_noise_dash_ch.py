@@ -130,8 +130,8 @@ parser.add_argument(
 )
 parser.add_argument("--skr-profile", choices=["custom", "reference"], default="custom",
                     help="SKR config profile to use for SKR subplots and CSV export.")
-parser.add_argument("--resolution", type=float, default=1e9,
-                    help="Noise frequency grid resolution [Hz]. Default: 1e9 (1 GHz).")
+parser.add_argument("--resolution", type=float, default=1e8,
+                    help="Noise frequency grid resolution [Hz]. Default: 1e8 (0.1 GHz).")
 parser.add_argument("--active-threshold-db", type=float, default=-50.0,
                     help="FWM active frequency bin threshold [dB]. Default: -50.0.")
 parser.add_argument(
@@ -142,7 +142,7 @@ parser.add_argument(
 parser.add_argument(
     "--power-levels",
     default=None,
-    help="Comma-separated classical power levels in dBm, e.g. -5,0,5. Default: -15,-10,-5,0,5,10,15.",
+    help="Comma-separated classical power levels in dBm, e.g. -5,0,5. Default: -15,-14,...,0.",
 )
 add_strategy_cli_args(parser)
 ARGS = parser.parse_args()

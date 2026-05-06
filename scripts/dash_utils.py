@@ -262,7 +262,7 @@ def override_strategy_from_cli(strategy_name, num_classical, reference_channel):
 
 WDM_PARAMS = _load_wdm_params()
 CLASSICAL_INDICES = _load_classical_indices()
-NOISE_GRID_RESOLUTION_HZ = 1e9
+NOISE_GRID_RESOLUTION_HZ = 1e8
 ACTIVE_THRESHOLD_DB = -50.0  # FWM active frequency bin threshold [dB]
 NOISE_FLOOR_W = 1e-23
 FREQ_GRID_PADDING_FACTOR = 1.5
@@ -849,8 +849,8 @@ def _precompute_channel_worker(
     return float(power_dbm), all_by_idx, valid_l
 
 
-# --- Power levels for startup precomputation (step=5 dBm, 7 values) ---
-PRECOMPUTE_POWER_LEVELS = [-15.0, -10.0, -5.0, 0.0, 5.0, 10.0, 15.0]
+# --- Power levels for startup precomputation (step=1 dBm, -15 to 0 dBm) ---
+PRECOMPUTE_POWER_LEVELS = [float(p) for p in range(-15, 1)]
 
 
 # --- Clear stale CSV cache ---

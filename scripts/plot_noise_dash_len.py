@@ -89,6 +89,8 @@ parser.add_argument(
 )
 parser.add_argument("--skr-profile", choices=["custom", "reference"], default="custom",
                     help="SKR config profile to use for SKR subplots and CSV export.")
+parser.add_argument("--resolution", type=float, default=1e8,
+                    help="Noise frequency grid resolution [Hz]. Default: 1e8 (0.1 GHz).")
 parser.add_argument("--active-threshold-db", type=float, default=-50.0,
                     help="FWM active frequency bin threshold [dB]. Default: -50.0.")
 add_strategy_cli_args(parser)
@@ -96,6 +98,7 @@ ARGS = parser.parse_args()
 NOISE_TYPE = ARGS.type
 import scripts.dash_utils as _du
 _du.MODULATION_FORMAT = ARGS.modulation.upper()
+_du.NOISE_GRID_RESOLUTION_HZ = ARGS.resolution
 _du.ACTIVE_THRESHOLD_DB = ARGS.active_threshold_db
 
 # SKR zero-value sentinel: replaces ≤0 SKR on log-scale plots
