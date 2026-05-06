@@ -166,7 +166,9 @@ _SKR_CACHE_LEN: dict[float, dict[int, dict]] = {}  # power_dbm -> ch_idx -> skr_
 
 def _build_len_skr_cache(power_dbm: float, sweep_at_ch: dict, ch_idx: int) -> dict:
     """Build SKR cache for a single (power, channel) combo."""
-    return compute_skr_vs_length(sweep_at_ch, ch_idx, LENGTHS_KM, _FIBER_CFG, _SKR_CFG, optimize=_SKR_CFG.optimize_params)
+    return compute_skr_vs_length(sweep_at_ch, ch_idx, LENGTHS_KM, _FIBER_CFG, _SKR_CFG,
+                               optimize=_SKR_CFG.optimize_params,
+                               model_keys=[DEFAULT_SKR_MODEL_KEY])
 
 
 print("[SKR] Building SKR cache for all power levels and channels...")
@@ -273,7 +275,7 @@ app.layout = html.Div(
                     min=0,
                     max=len(VALID_INDICES) - 1,
                     step=1,
-                    value=min(len(VALID_INDICES) // 2, len(VALID_INDICES) - 1),
+                    value=0,
                     marks=slider_marks,
                 ),
             ],

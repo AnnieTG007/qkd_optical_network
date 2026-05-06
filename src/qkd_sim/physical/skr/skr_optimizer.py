@@ -143,8 +143,6 @@ class SKROptimizer:
             options={"maxiter": 100000, "adaptive": True, "fatol": 1e-8},
         )
 
-        print(f"  -> distance={distance_m/1e3:.1f}km nfev={result.nfev} success={result.success}")
-
         mu_decoy, mu_signal, p_signal, px_alice = self._decode_params(result.x)
         p_decoy = 1.0 - p_signal
 

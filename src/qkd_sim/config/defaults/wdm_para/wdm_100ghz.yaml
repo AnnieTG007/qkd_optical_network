@@ -12,7 +12,7 @@ start_channel: 1               # 起始信道号（C01）
 end_channel: 61                # 终止信道号（C61 = 196.1 THz）
 channel_spacing: 1.0e+11       # 信道间隔 [Hz]（100 GHz）
 B_s: 2.5e+10                  # 符号速率（波特率）[Hz]（25 GBaud，适用于 DP-16QAM）
-B_q: 2.0e+10                  # 量子信道接收带宽 [Hz]（20 GHz）
+B_q: 1.0e+9                  # 量子信道接收带宽 [Hz]（1 GHz）
 data_rate_bps: 2.0e+11       # 比特速率 [bps]（200 Gbps DP-16QAM；NRZ-OOK 为 10.3 Gbps）
                               # DP-16QAM: data_rate = 8 × B_s（4 bits/symbol × 2 polarizations）
                               # NRZ-OOK: data_rate = B_s（1 bit/symbol）；带宽 B ≈ 2 × data_rate（sinc² 主瓣）

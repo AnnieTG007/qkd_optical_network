@@ -141,4 +141,4 @@ model_groups:
 # 默认 SKR 模型（SKR 子图使用的密钥率模型）
 # 可选值: infinite, approx_finite, strict_finite
 # =============================================================================
-default_skr_model: "approx_finite"
+default_skr_model: "strict_finite"

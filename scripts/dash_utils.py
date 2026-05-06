@@ -428,15 +428,25 @@ def noise_power_to_p_noise(P_w: float, f_hz: float, R_rep: float) -> float:
     return float(1.0 - np.exp(-mu))
 
 
-def compute_skr_point(noise_w: float, distance_m: float, f_hz: float, fiber_cfg, skr_cfg, optimize: bool = False) -> dict:
-    """Compute SKR for all 3 models at a single (noise, distance, frequency) point.
+def compute_skr_point(noise_w: float, distance_m: float, f_hz: float, fiber_cfg, skr_cfg,
+                      optimize: bool = False, model_keys: list[str] | None = None) -> dict:
+    """Compute SKR at a single (noise, distance, frequency) point.
+
+    Parameters
+    ----------
+    model_keys : list[str] | None
+        SKR model keys to compute. None = compute all three.
+        Dash callers should pass [DEFAULT_SKR_MODEL_KEY] to avoid wasted
+        strict_finite optimizer calls when only approx_finite is needed.
 
     Returns dict: {model_key: (skr_bps, skr_bit_per_pulse, qber)}
     """
     p_noise = noise_power_to_p_noise(noise_w, f_hz, skr_cfg.R_rep)
     skr_fns = _init_skr_model_registry()
+    keys = model_keys if model_keys is not None else list(skr_fns.keys())
     results: dict = {}
-    for mkey, (fn, _) in skr_fns.items():
+    for mkey in keys:
+        fn, _ = skr_fns[mkey]
         try:
             results[mkey] = fn(distance_m, fiber_cfg, skr_cfg, p_noise, optimize_params=optimize)
         except Exception:
@@ -451,22 +461,25 @@ def compute_skr_vs_channel(
     fiber_cfg,
     skr_cfg,
     optimize: bool = False,
+    model_keys: list[str] | None = None,
 ) -> dict:
     """Compute SKR vs quantum channel for a single fiber length.
 
     sweep: dict[model_key] = {fwd, bwd, x, x_kind, y_kind}
     quantum_center_freqs_hz: array of quantum channel center frequencies [Hz]
+    model_keys: SKR models to compute (None = all three)
 
     Returns: dict[model_key][skr_model][direction] = (np.array(bps), np.array(bpp), np.array(qber))
     """
     skr_fns = _init_skr_model_registry()
+    skr_keys = model_keys if model_keys is not None else list(skr_fns.keys())
     n_ch = len(quantum_center_freqs_hz)
 
     # Initialize result structure
     skr_result: dict = {}
     for model_key in sweep:
         skr_result[model_key] = {}
-        for mkey in skr_fns:
+        for mkey in skr_keys:
             skr_result[model_key][mkey] = {
                 "fwd": ([], [], []),  # bps, bpp, qber
                 "bwd": ([], [], []),
@@ -506,8 +519,9 @@ def compute_skr_vs_channel(
                 skr_d = compute_skr_point(
                     float(noise_arr[ch_i]), dist_m,
                     float(quantum_center_freqs_hz[ch_i]), fiber_cfg, skr_cfg, optimize,
+                    model_keys=skr_keys,
                 )
-                for mkey in skr_fns:
+                for mkey in skr_keys:
                     bps, bpp, qber = skr_d.get(mkey, (0.0, 0.0, float("nan")))
                     lists = skr_result[model_key][mkey][direction]
                     lists[0].append(bps)
@@ -534,6 +548,7 @@ def compute_skr_cache_for_power(
     quantum_center_freqs_hz: np.ndarray,
     fiber_cfg,
     skr_cfg,
+    model_keys: list[str] | None = None,
 ) -> dict:
     """Build SKR cache for a single (power, length) combination.
 
@@ -554,6 +569,8 @@ def compute_skr_cache_for_power(
         Quantum channel center frequencies [Hz].
     fiber_cfg : FiberConfig
     skr_cfg : SKRConfig
+    model_keys : list[str] | None
+        SKR model keys to compute (None = all three).
 
     Returns
     -------
@@ -563,6 +580,7 @@ def compute_skr_cache_for_power(
     return compute_skr_vs_channel(
         sweep_at_l, dist_m, quantum_center_freqs_hz,
         fiber_cfg, skr_cfg, optimize=skr_cfg.optimize_params,
+        model_keys=model_keys,
     )
 
 
@@ -573,15 +591,18 @@ def compute_skr_vs_length(
     fiber_cfg,
     skr_cfg,
     optimize: bool = False,
+    model_keys: list[str] | None = None,
 ) -> dict:
     """Compute SKR vs fiber length for a single quantum channel.
 
     sweep: dict[model_key] = {fwd, bwd, x, x_kind, y_kind} where y is per-length
     ch_idx: ITU G.694.1 channel index
+    model_keys: SKR models to compute (None = all three)
 
     Returns: dict[model_key][skr_model][direction] = (np.array(bps), np.array(bpp), np.array(qber)) per length
     """
     skr_fns = _init_skr_model_registry()
+    skr_keys = model_keys if model_keys is not None else list(skr_fns.keys())
     skr_result: dict = {}
 
     # Get channel center frequency
@@ -597,12 +618,12 @@ def compute_skr_vs_length(
             continue
 
         skr_by_model: dict = {}
-        for mkey in skr_fns:
+        for mkey in skr_keys:
             fwd_bps, fwd_bpp, fwd_qber = [], [], []
             bwd_bps, bwd_bpp, bwd_qber = [], [], []
             for li in range(n_len):
-                fwd_d = compute_skr_point(float(fwd_w[li]), float(lengths_km[li] * 1000), f_q_hz, fiber_cfg, skr_cfg, optimize)
-                bwd_d = compute_skr_point(float(bwd_w[li]), float(lengths_km[li] * 1000), f_q_hz, fiber_cfg, skr_cfg, optimize)
+                fwd_d = compute_skr_point(float(fwd_w[li]), float(lengths_km[li] * 1000), f_q_hz, fiber_cfg, skr_cfg, optimize, model_keys=skr_keys)
+                bwd_d = compute_skr_point(float(bwd_w[li]), float(lengths_km[li] * 1000), f_q_hz, fiber_cfg, skr_cfg, optimize, model_keys=skr_keys)
                 bps_f, bpp_f, q_f = fwd_d.get(mkey, (0.0, 0.0, float("nan")))
                 bps_b, bpp_b, q_b = bwd_d.get(mkey, (0.0, 0.0, float("nan")))
                 fwd_bps.append(bps_f); fwd_bpp.append(bpp_f); fwd_qber.append(q_f)
@@ -1052,6 +1073,7 @@ def _with_signal_cache_payload(
             "end_channel": float(base_config.end_channel),
             "channel_spacing": float(base_config.channel_spacing),
             "B_s": float(base_config.B_s),
+            "B_q": float(base_config.B_q),
             "data_rate_bps": float(base_config.data_rate_bps),
             "P0": float(_get_P0()),
             "beta_rolloff": float(base_config.beta_rolloff),
@@ -1539,6 +1561,7 @@ def _compute_noise_power_pair(
     continuous: bool,
     fwm_solver=None,
     sprs_solver=None,
+    sprs_noise_bandwidth_hz: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """计算 FWM/SpRS 噪声积分功率 (N_q,)。
 
@@ -1584,7 +1607,9 @@ def _compute_noise_power_pair(
         bwd += b_i
 
     if noise_type in ("sprs", "both"):
-        solver = sprs_solver if sprs_solver is not None else DiscreteSPRSSolver()
+        solver = sprs_solver if sprs_solver is not None else DiscreteSPRSSolver(
+            noise_bandwidth_hz=sprs_noise_bandwidth_hz,
+        )
         f_i, b_i = _call_solver(solver)
         fwd += f_i
         bwd += b_i
@@ -1600,6 +1625,7 @@ def _compute_noise_spectrum_pair(
     L_arr: np.ndarray | None = None,
     fwm_solver=None,
     sprs_solver=None,
+    sprs_noise_bandwidth_hz: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """返回完整 PSD 数组，适用于连续模型。
 
@@ -1637,7 +1663,9 @@ def _compute_noise_spectrum_pair(
             bwd += fwm_bwd
 
     if noise_type in ("sprs", "both"):
-        solver = sprs_solver if sprs_solver is not None else DiscreteSPRSSolver()
+        solver = sprs_solver if sprs_solver is not None else DiscreteSPRSSolver(
+            noise_bandwidth_hz=sprs_noise_bandwidth_hz,
+        )
         sprs_fwd, sprs_bwd = solver.compute_sprs_spectrum_conti(
             fiber, grid, f_grid, direction="both", L_arr=L_arr,
         )
@@ -1773,7 +1801,8 @@ VALID_Q_INDICES: list of q_idx that have non-zero noise for at least one model
         )
         # Vectorize over all lengths at once
         noise_fwd_psd_all, noise_bwd_psd_all = _compute_noise_spectrum_pair(
-            "both", fiber_base, grid_noise, noise_f_grid, L_arr=L_arr
+            "both", fiber_base, grid_noise, noise_f_grid, L_arr=L_arr,
+            sprs_noise_bandwidth_hz=base_config.B_q,
         )  # shape (N_f, N_L) or (N_f,) when n_l==1
         # Guard: if n_l==1, result is 1D; expand to 2D for [:, li] indexing
         if noise_fwd_psd_all.ndim == 1:
@@ -1891,6 +1920,7 @@ VALID_Q_INDICES: list of q_idx that have non-zero noise for at least one model
                     fiber,
                     grid,
                     continuous=bool(spec["continuous"]),
+                    sprs_noise_bandwidth_hz=base_config.B_q,
                 )
                 if len(fwd) > 0:
                     # single_q_config contains exactly one quantum channel, so the
@@ -2038,7 +2068,7 @@ def precompute_by_channel(
             signal_psd_cache[model_key] = signal_psd
 
         _ws_fwm = DiscreteFWMSolver(active_threshold_db=ACTIVE_THRESHOLD_DB)
-        _ws_sprs = DiscreteSPRSSolver()
+        _ws_sprs = DiscreteSPRSSolver(noise_bandwidth_hz=B_q)
 
         for li, length_km in enumerate(LENGTHS_KM):
             fiber = _make_fiber(fiber_params, length_km)
@@ -2590,8 +2620,9 @@ def precompute_by_channel_all_powers(
             x_base_ws: dict = {mk: np.asarray(noise_f_grid, dtype=np.float64) for mk in model_keys_ws}
             L_arr_ws = np.asarray(LENGTHS_KM, dtype=np.float64) * 1e3  # (N_L,)
             fiber_t4 = _make_fiber(fiber_params, float(LENGTHS_KM[0]))  # L only for metadata; actual lengths via L_arr
+            B_q_ws = float(base_config.B_q)
             _ws2_fwm = DiscreteFWMSolver(active_threshold_db=ACTIVE_THRESHOLD_DB)
-            _ws2_sprs = DiscreteSPRSSolver()
+            _ws2_sprs = DiscreteSPRSSolver(noise_bandwidth_hz=B_q_ws)
 
             for mk in model_keys_ws:
                 if mk not in grid_cache_t4:

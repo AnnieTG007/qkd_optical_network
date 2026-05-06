@@ -151,10 +151,9 @@ def approx_finite_key_rate(
     nu = skr_cfg.mu_decoy
     p_mu = skr_cfg.p_signal
     p_nu = skr_cfg.p_decoy
-    # approx_finite_key_rate 仅支持 mode=alice
-    if skr_cfg.block_length.mode != "alice":
-        raise ValueError("approx_finite_key_rate 仅支持 block_length.mode='alice'，请使用 strict_finite_key_rate")
     N = skr_cfg.block_length.N_alice
+    if N is None:
+        N = skr_cfg.block_length.N_bob
     gamma = skr_cfg.gamma_ks
     e0 = 0.5
 

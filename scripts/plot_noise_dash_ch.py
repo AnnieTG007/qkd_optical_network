@@ -272,15 +272,19 @@ def _build_ch_skr_cache(power_dbm: float, sweep_at_l: dict, l_idx: int) -> dict:
         quantum_center_freqs_hz,
         _FIBER_CFG,
         _SKR_CFG,
+        model_keys=[DEFAULT_SKR_MODEL_KEY],
     )
 
 
 with profile_scope("startup: SKR cache (per-channel)"):
     if NOISE_TYPE == "with_signal":
-        for p in PRECOMPUTE_POWER_LEVELS:
+        n_pl = len(PRECOMPUTE_POWER_LEVELS)
+        for pi, p in enumerate(PRECOMPUTE_POWER_LEVELS):
             cache_key = ("ch", p)
             data = _POWER_CACHE.get(cache_key, _POWER_CACHE.get(("ch", 0.0), {}))
             _SKR_CACHE_CH[p] = {}
+            n_l = len(data)
+            print(f"[SKR cache] power={p:+.0f} dBm ({pi+1}/{n_pl}): computing {n_l} lengths × {len(base_quantum_indices)} channels...")
             for l_idx in sorted(data.keys()):
                 _SKR_CACHE_CH[p][l_idx] = _build_ch_skr_cache(p, data[l_idx], l_idx)
 
@@ -367,7 +371,7 @@ app.layout = html.Div(
                     min=0,
                     max=len(VALID_L_INDICES) - 1,
                     step=1,
-                    value=min(len(VALID_L_INDICES) // 2, len(VALID_L_INDICES) - 1),
+                    value=0,
                     marks=slider_marks,
                 ),
             ],
