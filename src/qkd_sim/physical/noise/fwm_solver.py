@@ -24,6 +24,7 @@ GPU 加速
 from __future__ import annotations
 
 import os
+import time
 
 import numpy as np
 
@@ -579,23 +580,35 @@ class DiscreteFWMSolver(NoiseSolver):
         L_arr: np.ndarray | None,
         use_gpu: bool,
     ):
-        """Unified FWM spectrum computation (CPU or GPU).
+        """Exact sparse-triplet continuous FWM backend.
 
-        direction: "forward" | "backward" | "both"
+        This keeps the same active i/j pump selection as the dense backend and
+        keeps every grid-aligned k with G_tx[k] > 0. It avoids evaluating the
+        expensive FWM coefficients for invalid k triplets while preserving the
+        dense path's floating-point formulation.
         """
+        t_total = time.perf_counter()
         do_fwd = direction in ("forward", "both")
         do_bwd = direction in ("backward", "both")
 
         if use_gpu:
             from qkd_sim.utils.gpu_utils import to_host
             xp, _ = _get_gpu_module()
+
+            def _sync():
+                try:
+                    xp.cuda.Stream.null.synchronize()
+                except Exception:
+                    pass
         else:
             xp = np
             to_host = lambda a: np.asarray(a)
 
+            def _sync():
+                return None
+
         f_grid_cpu = np.asarray(f_grid, dtype=np.float64)
         self._validate_frequency_grid(f_grid_cpu)
-
         df = float(np.mean(np.diff(f_grid_cpu)))
         G_tx_cpu = self._build_total_classical_psd(wdm_grid, f_grid_cpu, df)
         alpha_grid_cpu = np.asarray(fiber.get_loss_at_freq(f_grid_cpu), dtype=np.float64)
@@ -616,34 +629,37 @@ class DiscreteFWMSolver(NoiseSolver):
             return (z, z.copy()) if direction == "both" else z
 
         if use_gpu:
-            f_grid = xp.asarray(f_grid_cpu, dtype=xp.float64)
+            f_grid_x = xp.asarray(f_grid_cpu, dtype=xp.float64)
             G_tx = xp.asarray(G_tx_cpu, dtype=xp.float64)
             alpha_grid = xp.asarray(alpha_grid_cpu, dtype=xp.float64)
-            active = xp.asarray(active_cpu)
         else:
-            f_grid = f_grid_cpu
+            f_grid_x = f_grid_cpu
             G_tx = G_tx_cpu
             alpha_grid = alpha_grid_cpu
-            active = active_cpu
 
-        f_active = f_grid[active]
-        G_active = G_tx[active]
-        alpha_active = alpha_grid[active]
         active_idx_cpu = np.flatnonzero(active_cpu).astype(np.int64)
         active_idx = xp.asarray(active_idx_cpu, dtype=xp.int64) if use_gpu else active_idx_cpu
+        f_active = f_grid_x[active_idx]
+        G_active = G_tx[active_idx]
+        alpha_active = alpha_grid[active_idx]
+
+        idx_i, idx_j = xp.meshgrid(active_idx, active_idx, indexing="ij")
+        pair_sum = (idx_i + idx_j).reshape(-1)
 
         Fi, Fj = xp.meshgrid(f_active, f_active, indexing="ij")
         Gi, Gj = xp.meshgrid(G_active, G_active, indexing="ij")
         alpha_i, alpha_j = xp.meshgrid(alpha_active, alpha_active, indexing="ij")
         D = xp.where(xp.abs(Fi - Fj) <= 0.5 * df, 3.0, 6.0)
-        idx_i, idx_j = xp.meshgrid(active_idx, active_idx, indexing="ij")
-        Fk_idx_ij = idx_i + idx_j
 
-        N_a = Fi.shape[0]
-        N_pairs = N_a * N_a
+        pair_weight = ((D ** 2) * Gi * Gj).astype(xp.float64).reshape(-1)
+        pair_alpha = (alpha_i + alpha_j).astype(xp.float64).reshape(-1)
+        pair_f3 = Fi.astype(xp.float64).reshape(-1)
+        pair_f4 = Fj.astype(xp.float64).reshape(-1)
+
+        N_a = int(active_idx_cpu.size)
+        N_pairs = int(N_a * N_a)
         N_L_for_chunk = int(np.asarray(L_arr).size) if L_arr is not None else 1
 
-        # Dynamic chunk_size
         if use_gpu:
             try:
                 import cupy as cp
@@ -651,21 +667,12 @@ class DiscreteFWMSolver(NoiseSolver):
                 free_bytes, total_bytes = cp.cuda.Device().mem_info
                 min_budget = int(total_bytes * 0.35)
                 budget_bytes = max(int(free_bytes * 0.4), min_budget)
-                bytes_per_chunk_unit = N_a * N_a * max(N_L_for_chunk, 1) * 8 * 6
+                bytes_per_chunk_unit = N_pairs * 8 * 6
                 chunk_size = max(1, min(50, int(budget_bytes / max(bytes_per_chunk_unit, 1))))
             except Exception:
-                chunk_size = 10 if N_pairs * N_a > 50_000_000 else 50
+                chunk_size = 10 if N_pairs > 250_000 else 50
         else:
-            chunk_size = 10 if N_pairs * N_a > 50_000_000 else 50
-
-        if _DEBUG_MODE:
-            N_L_diag = N_L_for_chunk
-            gpu_tag = "gpu" if use_gpu else "cpu"
-            print(
-                f"[fwm-{gpu_tag}] {direction} N_active={N_a}/{n_f} "
-                f"({100.0 * N_a / max(n_f, 1):.1f}%) "
-                f"N_L={N_L_diag} chunk_size={chunk_size}"
-            )
+            chunk_size = 10 if N_pairs > 250_000 else 50
 
         D_c = float(fiber._D_c)
         D_slope = float(fiber._D_slope)
@@ -676,175 +683,151 @@ class DiscreteFWMSolver(NoiseSolver):
             xp.asarray(L_arr, dtype=xp.float64).reshape(-1) if L_arr is not None else None
         )
 
-        Fi_f = Fi.astype(xp.float64)
-        Fj_f = Fj.astype(xp.float64)
-        Gi_f = Gi.astype(xp.float64)
-        Gj_f = Gj.astype(xp.float64)
-        alpha_i_f = alpha_i.astype(xp.float64)
-        alpha_j_f = alpha_j.astype(xp.float64)
-        D_f = D.astype(xp.float64)
-        pair_weight_f = ((D_f ** 2) * Gi_f * Gj_f).astype(xp.float64)
+        f1_lo = 2.0 * float(np.min(f_grid_cpu[active_idx_cpu])) - float(np.max(f_grid_cpu[active_idx_cpu]))
+        f1_hi = 2.0 * float(np.max(f_grid_cpu[active_idx_cpu])) - float(np.min(f_grid_cpu[active_idx_cpu]))
+        idx_lo = max(0, int(np.searchsorted(f_grid_cpu, f1_lo)))
+        idx_hi = min(n_f, int(np.searchsorted(f_grid_cpu, f1_hi, side="right")))
 
-        pump_G_f = G_tx.astype(xp.float64)
-        alpha_grid_f = alpha_grid.astype(xp.float64)
-
-        # Valid f1 range: beyond this, Fk = Fi+Fj-f1 can never fall on a pump bin
-        f1_lo = 2.0 * float(xp.min(f_active)) - float(xp.max(f_active))
-        f1_hi = 2.0 * float(xp.max(f_active)) - float(xp.min(f_active))
-        idx_lo = max(0, int(xp.searchsorted(f_grid, f1_lo)))
-        idx_hi = min(n_f, int(xp.searchsorted(f_grid, f1_hi, side="right")))
-
-        # ---- inner _batch_fwm: shared prep + direction-branched integration ----
-        def _batch_fwm(chunk_start: int, chunk_end: int):
-            n_chunk = chunk_end - chunk_start
-            alpha1_chunk = alpha_grid_f[chunk_start:chunk_end]
-
-            # Fk = Fi + Fj - f1  →  (n_chunk, N_a, N_a)
-            f1_idx_chunk = xp.arange(chunk_start, chunk_end, dtype=xp.int64)
-            k_idx = Fk_idx_ij[xp.newaxis, :, :] - f1_idx_chunk[:, xp.newaxis, xp.newaxis]
-            in_grid = (k_idx >= 0) & (k_idx < n_f)
-            k_idx_safe = xp.clip(k_idx, 0, n_f - 1)
-
-            Gk = pump_G_f[k_idx_safe].astype(xp.float64)
-            alpha_k = alpha_grid_f[k_idx_safe].astype(xp.float64)
-
-            f2_3d = f_grid[k_idx_safe].astype(xp.float64)
-            f3_3d = xp.broadcast_to(Fi_f[xp.newaxis, :, :], (n_chunk, N_a, N_a))
-            f4_3d = xp.broadcast_to(Fj_f[xp.newaxis, :, :], (n_chunk, N_a, N_a))
-            delta_beta_3d = _phase_mismatch(f2_3d, f3_3d, f4_3d, D_c, D_slope, xp=xp)
-
-            valid_mask = in_grid & (Gk > 0.0)
-
-            da_3d = (
-                alpha_k
-                + xp.broadcast_to(alpha_i_f, (n_chunk, N_a, N_a))
-                + xp.broadcast_to(alpha_j_f, (n_chunk, N_a, N_a))
-                - alpha1_chunk[:, xp.newaxis, xp.newaxis]
+        _sync()
+        if _DEBUG_MODE:
+            gpu_tag = "gpu" if use_gpu else "cpu"
+            print(
+                f"[fwm-{gpu_tag}-sparse_exact] {direction} N_active={N_a}/{n_f} "
+                f"({100.0 * N_a / max(n_f, 1):.1f}%) N_L={N_L_for_chunk} "
+                f"chunk_size={chunk_size} setup={time.perf_counter() - t_total:.3f}s"
             )
 
-            pair_weight_3d = pair_weight_f[xp.newaxis, :, :]
+        total_slots = 0
+        total_valid = 0
+
+        def _batch_sparse(chunk_start: int, chunk_end: int):
+            nonlocal total_slots, total_valid
+            n_chunk = chunk_end - chunk_start
+            f1_idx = xp.arange(chunk_start, chunk_end, dtype=xp.int64)
+            k_idx = pair_sum[xp.newaxis, :] - f1_idx[:, xp.newaxis]
+            in_grid = (k_idx >= 0) & (k_idx < n_f)
+            k_idx_safe = xp.clip(k_idx, 0, n_f - 1)
+            valid_mask = in_grid & (G_tx[k_idx_safe] > 0.0)
+            f1_pos, pair_pos = xp.nonzero(valid_mask)
+
+            n_valid = int(f1_pos.size)
+            total_slots += int(n_chunk * N_pairs)
+            total_valid += n_valid
+
+            if n_valid == 0:
+                if L_values_arr is None:
+                    z = xp.zeros(n_chunk, dtype=xp.float64)
+                    return (z, z.copy()) if direction == "both" else z
+                z = xp.zeros((n_chunk, L_values_arr.shape[0]), dtype=xp.float64)
+                return (z, z.copy()) if direction == "both" else z
+
+            k_v = k_idx_safe[f1_pos, pair_pos]
+            alpha1_v = alpha_grid[chunk_start + f1_pos]
+            alpha_k_v = alpha_grid[k_v]
+            Gk_v = G_tx[k_v]
+            da_v = alpha_k_v + pair_alpha[pair_pos] - alpha1_v
+            db_v = _phase_mismatch(
+                f_grid_x[k_v], pair_f3[pair_pos], pair_f4[pair_pos],
+                D_c, D_slope, xp=xp,
+            )
+            base_v = pair_weight[pair_pos] * Gk_v
 
             if L_values_arr is None:
-                # ---- scalar L ----
                 fwd_res = None
                 bwd_res = None
-
                 if do_fwd:
-                    eta = _fwm_coefficient(da_3d, delta_beta_3d, L_fiber, xp=xp)
-                    eta_m = xp.where(valid_mask, eta, 0.0)
-                    exp_a1 = xp.exp(-alpha1_chunk * L_fiber)
-                    integrand = pair_weight_3d * eta_m * Gk
-                    integral = xp.sum(integrand, axis=(1, 2)) * df * df
-                    fwd_res = (gamma ** 2 / 9.0) * exp_a1 * integral
-
+                    eta = _fwm_coefficient(da_v, db_v, L_fiber, xp=xp)
+                    contrib = base_v * eta
+                    sums = xp.bincount(f1_pos, weights=contrib, minlength=n_chunk) * df * df
+                    exp_a1 = xp.exp(-alpha_grid[chunk_start:chunk_end] * L_fiber)
+                    fwd_res = (gamma ** 2 / 9.0) * exp_a1 * sums
                 if do_bwd:
                     F_L = _F_antiderivative(
-                        xp.full_like(da_3d, L_fiber), 0.0, alpha1_chunk,
-                        da_3d, delta_beta_3d, L_fiber, xp=xp,
+                        xp.full_like(da_v, L_fiber), 0.0, alpha1_v,
+                        da_v, db_v, L_fiber, xp=xp,
                     )
                     F_0 = _F_antiderivative(
-                        xp.zeros_like(da_3d), 0.0, alpha1_chunk,
-                        da_3d, delta_beta_3d, L_fiber, xp=xp,
+                        xp.zeros_like(da_v), 0.0, alpha1_v,
+                        da_v, db_v, L_fiber, xp=xp,
                     )
-                    diff = xp.where(valid_mask, F_L - F_0, 0.0)
-                    integrand = pair_weight_3d * Gk * diff
-                    integral = xp.sum(integrand, axis=(1, 2)) * df * df
-                    bwd_res = rayleigh_coeff * (gamma ** 2 / 9.0) * integral
+                    contrib = base_v * (F_L - F_0)
+                    sums = xp.bincount(f1_pos, weights=contrib, minlength=n_chunk) * df * df
+                    bwd_res = rayleigh_coeff * (gamma ** 2 / 9.0) * sums
+                return (fwd_res, bwd_res) if direction == "both" else (fwd_res if do_fwd else bwd_res)
 
-                if direction == "both":
-                    return fwd_res, bwd_res
-                return fwd_res if do_fwd else bwd_res
-
-            else:
-                # ---- vectorized L ----
-                N_L = L_values_arr.shape[0]
-                fwd_res = None
-                bwd_res = None
-
-                Gk_4d = Gk[:, :, :, xp.newaxis]
-                da_4d = da_3d[:, :, :, xp.newaxis]
-                db_4d = delta_beta_3d[:, :, :, xp.newaxis]
-                pair_weight_4d = pair_weight_f[xp.newaxis, :, :, xp.newaxis]
-
+            N_L = L_values_arr.shape[0]
+            fwd_res = xp.zeros((n_chunk, N_L), dtype=xp.float64) if do_fwd else None
+            bwd_res = xp.zeros((n_chunk, N_L), dtype=xp.float64) if do_bwd else None
+            for li in range(N_L):
+                L_val = L_values_arr[li]
                 if do_fwd:
-                    eta_4d = _fwm_coefficient(da_4d, db_4d, L_values_arr, xp=xp)
-                    eta_4d_m = xp.where(valid_mask[:, :, :, xp.newaxis], eta_4d, 0.0)
-                    integrand = pair_weight_4d * eta_4d_m * Gk_4d
-                    integral = xp.sum(integrand, axis=(1, 2)) * df * df
-                    exp_f = xp.exp(-alpha1_chunk[:, xp.newaxis] * L_values_arr[xp.newaxis, :])
-                    fwd_res = (gamma ** 2 / 9.0) * exp_f * integral
-
+                    eta = _fwm_coefficient(da_v, db_v, L_val, xp=xp)
+                    contrib = base_v * eta
+                    sums = xp.bincount(f1_pos, weights=contrib, minlength=n_chunk) * df * df
+                    exp_a1 = xp.exp(-alpha_grid[chunk_start:chunk_end] * L_val)
+                    fwd_res[:, li] = (gamma ** 2 / 9.0) * exp_a1 * sums
                 if do_bwd:
-                    a1_4d = alpha1_chunk[:, xp.newaxis, xp.newaxis, xp.newaxis]
-                    a1_bc = xp.broadcast_to(a1_4d, (n_chunk, N_a, N_a, N_L))
-                    F_L_4d = _F_antiderivative(
-                        L_values_arr, 0.0, a1_bc, da_4d, db_4d, L_values_arr, xp=xp,
+                    F_L = _F_antiderivative(
+                        xp.full_like(da_v, L_val), 0.0, alpha1_v,
+                        da_v, db_v, L_val, xp=xp,
                     )
-                    F_0_4d = _F_antiderivative(
-                        0.0, 0.0, a1_bc, da_4d, db_4d, L_values_arr, xp=xp,
+                    F_0 = _F_antiderivative(
+                        xp.zeros_like(da_v), 0.0, alpha1_v,
+                        da_v, db_v, L_val, xp=xp,
                     )
-                    diff = F_L_4d - F_0_4d
-                    diff_m = xp.where(valid_mask[:, :, :, xp.newaxis], diff, 0.0)
-                    integrand = pair_weight_4d * Gk_4d * diff_m
-                    integral = xp.sum(integrand, axis=(1, 2)) * df * df
-                    bwd_res = rayleigh_coeff * (gamma ** 2 / 9.0) * integral
+                    contrib = base_v * (F_L - F_0)
+                    sums = xp.bincount(f1_pos, weights=contrib, minlength=n_chunk) * df * df
+                    bwd_res[:, li] = rayleigh_coeff * (gamma ** 2 / 9.0) * sums
+            return (fwd_res, bwd_res) if direction == "both" else (fwd_res if do_fwd else bwd_res)
 
-                if direction == "both":
-                    return fwd_res, bwd_res
-                return fwd_res if do_fwd else bwd_res
-
-        # ---- assemble results in chunks ----
         if direction == "both":
             if L_arr is None:
                 out_fwd = _zeros(n_f)
                 out_bwd = _zeros(n_f)
                 for start in range(idx_lo, idx_hi, chunk_size):
                     end = min(start + chunk_size, idx_hi)
-                    fwd_c, bwd_c = _batch_fwm(start, end)
-                    if use_gpu:
-                        out_fwd[start:end] = to_host(fwd_c)
-                        out_bwd[start:end] = to_host(bwd_c)
-                    else:
-                        out_fwd[start:end] = fwd_c
-                        out_bwd[start:end] = bwd_c
-                # Fill inactive f1 range with zeros (already zero from _zeros)
-                return out_fwd, out_bwd
+                    fwd_c, bwd_c = _batch_sparse(start, end)
+                    out_fwd[start:end] = to_host(fwd_c) if use_gpu else fwd_c
+                    out_bwd[start:end] = to_host(bwd_c) if use_gpu else bwd_c
             else:
                 N_L = L_values_arr.shape[0]
                 out_fwd = _zeros((n_f, N_L))
                 out_bwd = _zeros((n_f, N_L))
                 for start in range(idx_lo, idx_hi, chunk_size):
                     end = min(start + chunk_size, idx_hi)
-                    fwd_c, bwd_c = _batch_fwm(start, end)
-                    if use_gpu:
-                        out_fwd[start:end, :] = to_host(fwd_c)
-                        out_bwd[start:end, :] = to_host(bwd_c)
-                    else:
-                        out_fwd[start:end, :] = fwd_c
-                        out_bwd[start:end, :] = bwd_c
-                return out_fwd, out_bwd
+                    fwd_c, bwd_c = _batch_sparse(start, end)
+                    out_fwd[start:end, :] = to_host(fwd_c) if use_gpu else fwd_c
+                    out_bwd[start:end, :] = to_host(bwd_c) if use_gpu else bwd_c
+            _sync()
+            if _DEBUG_MODE:
+                ratio = 100.0 * total_valid / max(total_slots, 1)
+                print(
+                    f"[fwm-sparse_exact] done slots={total_slots:,} valid={total_valid:,} "
+                    f"({ratio:.2f}%) elapsed={time.perf_counter() - t_total:.3f}s"
+                )
+            return out_fwd, out_bwd
 
-        # Single direction
         if L_arr is None:
             out = _zeros(n_f)
             for start in range(idx_lo, idx_hi, chunk_size):
                 end = min(start + chunk_size, idx_hi)
-                chunk_res = _batch_fwm(start, end)
-                if use_gpu:
-                    out[start:end] = to_host(chunk_res)
-                else:
-                    out[start:end] = chunk_res
-            return out
+                chunk_res = _batch_sparse(start, end)
+                out[start:end] = to_host(chunk_res) if use_gpu else chunk_res
+        else:
+            N_L = L_values_arr.shape[0]
+            out = _zeros((n_f, N_L))
+            for start in range(idx_lo, idx_hi, chunk_size):
+                end = min(start + chunk_size, idx_hi)
+                chunk_res = _batch_sparse(start, end)
+                out[start:end, :] = to_host(chunk_res) if use_gpu else chunk_res
 
-        N_L = L_values_arr.shape[0]
-        out = _zeros((n_f, N_L))
-        for start in range(idx_lo, idx_hi, chunk_size):
-            end = min(start + chunk_size, idx_hi)
-            chunk_res = _batch_fwm(start, end)
-            if use_gpu:
-                out[start:end, :] = to_host(chunk_res)
-            else:
-                out[start:end, :] = chunk_res
+        _sync()
+        if _DEBUG_MODE:
+            ratio = 100.0 * total_valid / max(total_slots, 1)
+            print(
+                f"[fwm-sparse_exact] done slots={total_slots:,} valid={total_valid:,} "
+                f"({ratio:.2f}%) elapsed={time.perf_counter() - t_total:.3f}s"
+            )
         return out
 
     def compute_fwm_spectrum_conti_pair(
