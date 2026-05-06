@@ -521,6 +521,38 @@ def compute_skr_arrays_for_model(
     return bps.reshape(shape), bpp.reshape(shape), qber.reshape(shape)
 
 
+def validate_skr_cache_model(
+    cache: dict,
+    expected_model_key: str,
+    *,
+    context: str = "SKR cache",
+) -> None:
+    """Fail fast if an SKR cache is missing the selected model layer."""
+    if not expected_model_key:
+        raise RuntimeError(f"{context}: empty SKR model key")
+
+    missing: list[str] = []
+    malformed: list[str] = []
+    for noise_model_key, by_skr_model in cache.items():
+        if not isinstance(by_skr_model, dict):
+            malformed.append(str(noise_model_key))
+            continue
+        if expected_model_key not in by_skr_model:
+            missing.append(str(noise_model_key))
+            continue
+        selected = by_skr_model[expected_model_key]
+        if not isinstance(selected, dict) or "fwd" not in selected or "bwd" not in selected:
+            malformed.append(f"{noise_model_key}.{expected_model_key}")
+
+    if missing or malformed:
+        parts: list[str] = []
+        if missing:
+            parts.append(f"missing {expected_model_key!r} for noise models {missing}")
+        if malformed:
+            parts.append(f"malformed entries {malformed}")
+        raise RuntimeError(f"{context}: invalid SKR cache model layout: " + "; ".join(parts))
+
+
 def compute_skr_vs_channel(
     sweep: dict,
     dist_m: float,

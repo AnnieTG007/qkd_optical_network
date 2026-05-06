@@ -52,6 +52,7 @@ from scripts.dash_utils import (
     precompute_by_length_all_powers,
     print_compute_device,
     set_power_override,
+    validate_skr_cache_model,
     _POWER_CACHE,
 )
 
@@ -108,6 +109,7 @@ _SKR_ZERO_SENTINEL = 1e-15
 if ARGS.skr_model is not None:
     _du.DEFAULT_SKR_MODEL_KEY = ARGS.skr_model
 DEFAULT_SKR_MODEL_KEY = _du.DEFAULT_SKR_MODEL_KEY
+print(f"SKR model: {DEFAULT_SKR_MODEL_KEY} | profile: {ARGS.skr_profile}")
 
 _du.WDM_PARAMS["data_rate_bps"] = ARGS.data_rate
 
@@ -170,9 +172,15 @@ _SKR_CACHE_LEN: dict[float, dict[int, dict]] = {}  # power_dbm -> ch_idx -> skr_
 
 def _build_len_skr_cache(power_dbm: float, sweep_at_ch: dict, ch_idx: int) -> dict:
     """Build SKR cache for a single (power, channel) combo."""
-    return compute_skr_vs_length(sweep_at_ch, ch_idx, LENGTHS_KM, _FIBER_CFG, _SKR_CFG,
-                               optimize=_SKR_CFG.optimize_params,
-                               model_keys=[DEFAULT_SKR_MODEL_KEY])
+    cache = compute_skr_vs_length(sweep_at_ch, ch_idx, LENGTHS_KM, _FIBER_CFG, _SKR_CFG,
+                                  optimize=_SKR_CFG.optimize_params,
+                                  model_keys=[DEFAULT_SKR_MODEL_KEY])
+    validate_skr_cache_model(
+        cache,
+        DEFAULT_SKR_MODEL_KEY,
+        context=f"length SKR cache power={power_dbm:+.0f} dBm channel={ch_idx}",
+    )
+    return cache
 
 
 print("[SKR] Building SKR cache for all power levels and channels...")
@@ -461,7 +469,7 @@ def _make_figure(sweep: dict, ch_idx: int) -> go.Figure:
             if model_key not in skr_cache_ch:
                 continue
             for direction in ("fwd", "bwd"):
-                skr_data = skr_cache_ch.get(model_key, {}).get(direction)
+                skr_data = skr_cache_ch.get(model_key, {}).get(skr_model_key, {}).get(direction)
                 if skr_data is None:
                     continue
                 bps_arr, bpp_arr, _qber_arr = skr_data

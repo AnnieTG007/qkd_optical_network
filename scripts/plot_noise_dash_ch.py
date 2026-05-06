@@ -56,6 +56,7 @@ from scripts.dash_utils import (
     set_csv_cache_enabled,
     set_model_key_filter,
     set_power_override,
+    validate_skr_cache_model,
     _POWER_CACHE,
 )
 
@@ -170,6 +171,7 @@ _SKR_ZERO_SENTINEL = 1e-15
 if ARGS.skr_model is not None:
     _du.DEFAULT_SKR_MODEL_KEY = ARGS.skr_model
 DEFAULT_SKR_MODEL_KEY = _du.DEFAULT_SKR_MODEL_KEY
+print(f"SKR model: {DEFAULT_SKR_MODEL_KEY} | profile: {ARGS.skr_profile}")
 
 # Fail fast if a stale Dash instance is still holding 8051 — otherwise app.run
 # would OSError after the full precompute and the browser would keep reading
@@ -267,7 +269,7 @@ _SKR_CACHE_CH: dict[float, dict[int, dict]] = {}  # power_dbm -> l_idx -> skr_re
 
 def _build_ch_skr_cache(power_dbm: float, sweep_at_l: dict, l_idx: int) -> dict:
     """Build SKR cache for a single (power, length) combo."""
-    return compute_skr_cache_for_power(
+    cache = compute_skr_cache_for_power(
         power_dbm, sweep_at_l, l_idx,
         float(ACTIVE_LENGTHS_KM[l_idx]),
         quantum_center_freqs_hz,
@@ -275,6 +277,12 @@ def _build_ch_skr_cache(power_dbm: float, sweep_at_l: dict, l_idx: int) -> dict:
         _SKR_CFG,
         model_keys=[DEFAULT_SKR_MODEL_KEY],
     )
+    validate_skr_cache_model(
+        cache,
+        DEFAULT_SKR_MODEL_KEY,
+        context=f"channel SKR cache power={power_dbm:+.0f} dBm length_idx={l_idx}",
+    )
+    return cache
 
 
 with profile_scope("startup: SKR cache (per-channel)"):
