@@ -629,12 +629,15 @@ class DiscreteFWMSolver(NoiseSolver):
         f_active = f_grid[active]
         G_active = G_tx[active]
         alpha_active = alpha_grid[active]
+        active_idx_cpu = np.flatnonzero(active_cpu).astype(np.int64)
+        active_idx = xp.asarray(active_idx_cpu, dtype=xp.int64) if use_gpu else active_idx_cpu
 
         Fi, Fj = xp.meshgrid(f_active, f_active, indexing="ij")
         Gi, Gj = xp.meshgrid(G_active, G_active, indexing="ij")
         alpha_i, alpha_j = xp.meshgrid(alpha_active, alpha_active, indexing="ij")
         D = xp.where(xp.abs(Fi - Fj) <= 0.5 * df, 3.0, 6.0)
-        Fk_ij = Fi + Fj
+        idx_i, idx_j = xp.meshgrid(active_idx, active_idx, indexing="ij")
+        Fk_idx_ij = idx_i + idx_j
 
         N_a = Fi.shape[0]
         N_pairs = N_a * N_a
@@ -680,9 +683,8 @@ class DiscreteFWMSolver(NoiseSolver):
         alpha_i_f = alpha_i.astype(xp.float64)
         alpha_j_f = alpha_j.astype(xp.float64)
         D_f = D.astype(xp.float64)
-        Fk_ij_f = (Fi_f + Fj_f).astype(xp.float64)
+        pair_weight_f = ((D_f ** 2) * Gi_f * Gj_f).astype(xp.float64)
 
-        pump_grid_f = f_grid.astype(xp.float64)
         pump_G_f = G_tx.astype(xp.float64)
         alpha_grid_f = alpha_grid.astype(xp.float64)
 
@@ -694,36 +696,24 @@ class DiscreteFWMSolver(NoiseSolver):
 
         # ---- inner _batch_fwm: shared prep + direction-branched integration ----
         def _batch_fwm(chunk_start: int, chunk_end: int):
-            f1_chunk = f_grid[chunk_start:chunk_end]
             n_chunk = chunk_end - chunk_start
             alpha1_chunk = alpha_grid_f[chunk_start:chunk_end]
 
             # Fk = Fi + Fj - f1  →  (n_chunk, N_a, N_a)
-            Fk = Fk_ij_f[:, :, xp.newaxis] - f1_chunk[xp.newaxis, xp.newaxis, :]
-            Fk_T = Fk.transpose(2, 0, 1).reshape(n_chunk, -1)
+            f1_idx_chunk = xp.arange(chunk_start, chunk_end, dtype=xp.int64)
+            k_idx = Fk_idx_ij[xp.newaxis, :, :] - f1_idx_chunk[:, xp.newaxis, xp.newaxis]
+            in_grid = (k_idx >= 0) & (k_idx < n_f)
+            k_idx_safe = xp.clip(k_idx, 0, n_f - 1)
 
-            sorted_idx = xp.clip(
-                xp.searchsorted(pump_grid_f, Fk_T), 1, len(pump_grid_f) - 1
-            )
-            x0 = pump_grid_f[sorted_idx - 1]
-            x1 = pump_grid_f[sorted_idx]
-            y0 = pump_G_f[sorted_idx - 1]
-            y1 = pump_G_f[sorted_idx]
-            t = xp.clip((Fk_T - x0) / (x1 - x0), 0.0, 1.0)
-            Gk_T = (y0 + (y1 - y0) * t).astype(xp.float64)
-            a0 = alpha_grid_f[sorted_idx - 1]
-            a1_arr = alpha_grid_f[sorted_idx]
-            alpha_k_T = (a0 + (a1_arr - a0) * t).astype(xp.float64)
+            Gk = pump_G_f[k_idx_safe].astype(xp.float64)
+            alpha_k = alpha_grid_f[k_idx_safe].astype(xp.float64)
 
-            Gk = Gk_T.reshape(n_chunk, N_a, N_a)
-            alpha_k = alpha_k_T.reshape(n_chunk, N_a, N_a)
-
-            f2_3d = Fk.transpose(2, 0, 1)
+            f2_3d = f_grid[k_idx_safe].astype(xp.float64)
             f3_3d = xp.broadcast_to(Fi_f[xp.newaxis, :, :], (n_chunk, N_a, N_a))
             f4_3d = xp.broadcast_to(Fj_f[xp.newaxis, :, :], (n_chunk, N_a, N_a))
             delta_beta_3d = _phase_mismatch(f2_3d, f3_3d, f4_3d, D_c, D_slope, xp=xp)
 
-            valid_mask = Gk > 0.0
+            valid_mask = in_grid & (Gk > 0.0)
 
             da_3d = (
                 alpha_k
@@ -732,9 +722,7 @@ class DiscreteFWMSolver(NoiseSolver):
                 - alpha1_chunk[:, xp.newaxis, xp.newaxis]
             )
 
-            Gi_3d = xp.broadcast_to(Gi_f[xp.newaxis, :, :], (n_chunk, N_a, N_a))
-            Gj_3d = xp.broadcast_to(Gj_f[xp.newaxis, :, :], (n_chunk, N_a, N_a))
-            D2_3d = xp.broadcast_to((D_f ** 2)[xp.newaxis, :, :], (n_chunk, N_a, N_a))
+            pair_weight_3d = pair_weight_f[xp.newaxis, :, :]
 
             if L_values_arr is None:
                 # ---- scalar L ----
@@ -745,7 +733,7 @@ class DiscreteFWMSolver(NoiseSolver):
                     eta = _fwm_coefficient(da_3d, delta_beta_3d, L_fiber, xp=xp)
                     eta_m = xp.where(valid_mask, eta, 0.0)
                     exp_a1 = xp.exp(-alpha1_chunk * L_fiber)
-                    integrand = D2_3d * eta_m * Gi_3d * Gj_3d * Gk
+                    integrand = pair_weight_3d * eta_m * Gk
                     integral = xp.sum(integrand, axis=(1, 2)) * df * df
                     fwd_res = (gamma ** 2 / 9.0) * exp_a1 * integral
 
@@ -759,7 +747,7 @@ class DiscreteFWMSolver(NoiseSolver):
                         da_3d, delta_beta_3d, L_fiber, xp=xp,
                     )
                     diff = xp.where(valid_mask, F_L - F_0, 0.0)
-                    integrand = D2_3d * Gi_3d * Gj_3d * Gk * diff
+                    integrand = pair_weight_3d * Gk * diff
                     integral = xp.sum(integrand, axis=(1, 2)) * df * df
                     bwd_res = rayleigh_coeff * (gamma ** 2 / 9.0) * integral
 
@@ -776,24 +764,17 @@ class DiscreteFWMSolver(NoiseSolver):
                 Gk_4d = Gk[:, :, :, xp.newaxis]
                 da_4d = da_3d[:, :, :, xp.newaxis]
                 db_4d = delta_beta_3d[:, :, :, xp.newaxis]
+                pair_weight_4d = pair_weight_f[xp.newaxis, :, :, xp.newaxis]
 
                 if do_fwd:
-                    Gi_4d = xp.broadcast_to(Gi_f[xp.newaxis, :, :, xp.newaxis], (n_chunk, N_a, N_a, N_L))
-                    Gj_4d = xp.broadcast_to(Gj_f[xp.newaxis, :, :, xp.newaxis], (n_chunk, N_a, N_a, N_L))
-                    D_4d = xp.broadcast_to(D_f[xp.newaxis, :, :, xp.newaxis], (n_chunk, N_a, N_a, N_L))
                     eta_4d = _fwm_coefficient(da_4d, db_4d, L_values_arr, xp=xp)
                     eta_4d_m = xp.where(valid_mask[:, :, :, xp.newaxis], eta_4d, 0.0)
-                    integrand = (D_4d ** 2) * eta_4d_m * Gi_4d * Gj_4d * Gk_4d
-                    integral = xp.sum(
-                        integrand * valid_mask[:, :, :, xp.newaxis], axis=(1, 2)
-                    ) * df * df
+                    integrand = pair_weight_4d * eta_4d_m * Gk_4d
+                    integral = xp.sum(integrand, axis=(1, 2)) * df * df
                     exp_f = xp.exp(-alpha1_chunk[:, xp.newaxis] * L_values_arr[xp.newaxis, :])
                     fwd_res = (gamma ** 2 / 9.0) * exp_f * integral
 
                 if do_bwd:
-                    Gi_4d = xp.broadcast_to(Gi_f[xp.newaxis, :, :, xp.newaxis], (n_chunk, N_a, N_a, N_L))
-                    Gj_4d = xp.broadcast_to(Gj_f[xp.newaxis, :, :, xp.newaxis], (n_chunk, N_a, N_a, N_L))
-                    D_4d = xp.broadcast_to(D_f[xp.newaxis, :, :, xp.newaxis], (n_chunk, N_a, N_a, N_L))
                     a1_4d = alpha1_chunk[:, xp.newaxis, xp.newaxis, xp.newaxis]
                     a1_bc = xp.broadcast_to(a1_4d, (n_chunk, N_a, N_a, N_L))
                     F_L_4d = _F_antiderivative(
@@ -804,10 +785,8 @@ class DiscreteFWMSolver(NoiseSolver):
                     )
                     diff = F_L_4d - F_0_4d
                     diff_m = xp.where(valid_mask[:, :, :, xp.newaxis], diff, 0.0)
-                    integrand = (D_4d ** 2) * Gi_4d * Gj_4d * Gk_4d * diff_m
-                    integral = xp.sum(
-                        integrand * valid_mask[:, :, :, xp.newaxis], axis=(1, 2)
-                    ) * df * df
+                    integrand = pair_weight_4d * Gk_4d * diff_m
+                    integral = xp.sum(integrand, axis=(1, 2)) * df * df
                     bwd_res = rayleigh_coeff * (gamma ** 2 / 9.0) * integral
 
                 if direction == "both":
