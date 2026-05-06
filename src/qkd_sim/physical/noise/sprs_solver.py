@@ -257,9 +257,8 @@ class DiscreteSPRSSolver(NoiseSolver):
             传入 None 则回退到每个量子信道的 B_s。
         """
         self._noise_bandwidth_hz = noise_bandwidth_hz
-        # σ_2d cache: 同一 (f_grid, T, A_eff, df) 在一次 Dash 启动里跨 model_key
-        # 复用，避免重复做 ~6300² 个点的 Raman / phonon 插值。LRU=2 已足够覆盖
-        # forward+backward 调用对，且单份 σ_2d 在 N_f=6301 时约 302 MB。
+        # Continuous SpRS caches sigma only for active pump frequency columns;
+        # this avoids N_f^2 memory at fine frequency resolution.
         self._sigma_cache: "dict[tuple, np.ndarray]" = {}
         self._sigma_cache_max: int = 2
 
@@ -583,6 +582,7 @@ class DiscreteSPRSSolver(NoiseSolver):
         self,
         fiber: Fiber,
         f_grid: np.ndarray,
+        pump_freqs: np.ndarray,
         df: float,
     ) -> np.ndarray:
         """返回 (N_f, N_f) 拉曼横截面矩阵 σ_2d，跨调用复用。
@@ -593,11 +593,14 @@ class DiscreteSPRSSolver(NoiseSolver):
         Cache key 用 f_grid 的二进制 sha1 + 标量参数；LRU 由
         ``self._sigma_cache_max`` 控制。
         """
+        # Actual shape is (N_f, N_active_pump); pump_freqs is part of cache key.
         import hashlib
 
         f_arr = np.ascontiguousarray(f_grid, dtype=np.float64)
+        pump_arr = np.ascontiguousarray(pump_freqs, dtype=np.float64)
         key = (
             hashlib.sha1(f_arr.tobytes()).hexdigest(),
+            hashlib.sha1(pump_arr.tobytes()).hexdigest(),
             float(fiber.T_kelvin),
             float(fiber.A_eff),
             float(df),
@@ -607,7 +610,7 @@ class DiscreteSPRSSolver(NoiseSolver):
             return cached
 
         f1_2d = f_arr.reshape(-1, 1)
-        f2_2d = f_arr.reshape(1, -1)
+        f2_2d = pump_arr.reshape(1, -1)
         delta_f_2d = np.abs(f1_2d - f2_2d)
 
         g_R_2d = get_raman_gain(
@@ -662,19 +665,23 @@ class DiscreteSPRSSolver(NoiseSolver):
         If do_fwd and do_bwd: (fwd, bwd) each (N_f, N_L)
         Else: ndarray, shape (N_f, N_L)
         """
-        sigma_2d = self._get_sigma_2d(fiber, f_grid, df)  # (N_f, N_f)
+        active_idx = np.flatnonzero(np.asarray(G_pump, dtype=np.float64) > 0.0)
+        pump_freqs = f_grid[active_idx]
+        pump_psd = np.asarray(G_pump, dtype=np.float64)[active_idx]
+        sigma_2d = self._get_sigma_2d(fiber, f_grid, pump_freqs, df)  # (N_f, N_p)
 
         alpha_grid = fiber.get_loss_at_freq(f_grid)
         alpha1_2d = alpha_grid.reshape(-1, 1)             # (N_f, 1)
-        alpha2_2d = alpha_grid.reshape(1, -1)             # (1, N_f)
-        base_2d = np.asarray(G_pump, dtype=np.float64).reshape(1, -1) * sigma_2d  # (N_f, N_f)
+        alpha2_2d = alpha_grid[active_idx].reshape(1, -1)  # (1, N_p)
+        base_2d = pump_psd.reshape(1, -1) * sigma_2d       # (N_f, N_p)
 
         n_l = L_values.size
         n_f = f_grid.size
+        n_p = active_idx.size
 
-        # Memory-budgeted batch size: limit intermediate (N_f, N_f, batch) usage.
+        # Memory-budgeted batch size: limit intermediate (N_f, N_p, batch) usage.
         _MAX_SPRS_TMP_MB = 1024
-        _bytes_per_slice = n_f * n_f * 8
+        _bytes_per_slice = n_f * n_p * 8
         max_l_batch = max(1, int((_MAX_SPRS_TMP_MB * 1024 * 1024) / max(_bytes_per_slice, 1)))
 
         def _forward_batch(start: int, stop: int) -> np.ndarray:
@@ -737,15 +744,19 @@ class DiscreteSPRSSolver(NoiseSolver):
         from qkd_sim.utils.gpu_utils import get_gpu_module as _get_gpu_module
         xp, _ = _get_gpu_module()
 
-        sigma_2d = self._get_sigma_2d(fiber, f_grid, df)  # np (N_f, N_f)
+        active_idx = np.flatnonzero(np.asarray(G_pump, dtype=np.float64) > 0.0)
+        pump_freqs = f_grid[active_idx]
+        pump_psd = np.asarray(G_pump, dtype=np.float64)[active_idx]
+        sigma_2d = self._get_sigma_2d(fiber, f_grid, pump_freqs, df)  # np (N_f, N_p)
         n_f = f_grid.size
+        n_p = active_idx.size
         n_l = L_values.size
 
         sigma_gpu = xp.asarray(sigma_2d)
         alpha_np = np.asarray(fiber.get_loss_at_freq(f_grid), dtype=np.float64)
         alpha1_gpu = xp.asarray(alpha_np).reshape(-1, 1, 1)   # (N_f, 1, 1)
-        alpha2_gpu = xp.asarray(alpha_np).reshape(1, -1, 1)   # (1, N_f, 1)
-        base_gpu = xp.asarray(G_pump, dtype=xp.float64).reshape(1, -1) * sigma_gpu  # (N_f, N_f)
+        alpha2_gpu = xp.asarray(alpha_np[active_idx]).reshape(1, -1, 1)  # (1, N_p, 1)
+        base_gpu = xp.asarray(pump_psd, dtype=xp.float64).reshape(1, -1) * sigma_gpu  # (N_f, N_p)
         L_gpu = xp.asarray(L_values, dtype=xp.float64).reshape(1, 1, -1)            # (1, 1, N_L)
 
         # Memory-aware batching
@@ -756,7 +767,7 @@ class DiscreteSPRSSolver(NoiseSolver):
             budget = 1024 * 1024 * 1024  # 1 GB fallback
         _fixed_slices = 4   # sigma + base + d_alpha + safe_d_alpha
         _per_batch_slices = 3  # exp + integral + batch_t (forward worst case)
-        budget_slices = budget // max(n_f * n_f * 8, 1)
+        budget_slices = budget // max(n_f * n_p * 8, 1)
         max_l_batch = max(1, min(
             n_l,
             (budget_slices - _fixed_slices) // max(_per_batch_slices, 1),

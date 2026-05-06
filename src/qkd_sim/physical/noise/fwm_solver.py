@@ -819,8 +819,8 @@ class DiscreteFWMSolver(NoiseSolver):
             if L_arr is None:
                 out_fwd = _zeros(n_f)
                 out_bwd = _zeros(n_f)
-                for start in range(0, n_f, chunk_size):
-                    end = min(start + chunk_size, n_f)
+                for start in range(idx_lo, idx_hi, chunk_size):
+                    end = min(start + chunk_size, idx_hi)
                     fwd_c, bwd_c = _batch_fwm(start, end)
                     if use_gpu:
                         out_fwd[start:end] = to_host(fwd_c)
@@ -834,8 +834,8 @@ class DiscreteFWMSolver(NoiseSolver):
                 N_L = L_values_arr.shape[0]
                 out_fwd = _zeros((n_f, N_L))
                 out_bwd = _zeros((n_f, N_L))
-                for start in range(0, n_f, chunk_size):
-                    end = min(start + chunk_size, n_f)
+                for start in range(idx_lo, idx_hi, chunk_size):
+                    end = min(start + chunk_size, idx_hi)
                     fwd_c, bwd_c = _batch_fwm(start, end)
                     if use_gpu:
                         out_fwd[start:end, :] = to_host(fwd_c)
@@ -848,8 +848,8 @@ class DiscreteFWMSolver(NoiseSolver):
         # Single direction
         if L_arr is None:
             out = _zeros(n_f)
-            for start in range(0, n_f, chunk_size):
-                end = min(start + chunk_size, n_f)
+            for start in range(idx_lo, idx_hi, chunk_size):
+                end = min(start + chunk_size, idx_hi)
                 chunk_res = _batch_fwm(start, end)
                 if use_gpu:
                     out[start:end] = to_host(chunk_res)
@@ -859,8 +859,8 @@ class DiscreteFWMSolver(NoiseSolver):
 
         N_L = L_values_arr.shape[0]
         out = _zeros((n_f, N_L))
-        for start in range(0, n_f, chunk_size):
-            end = min(start + chunk_size, n_f)
+        for start in range(idx_lo, idx_hi, chunk_size):
+            end = min(start + chunk_size, idx_hi)
             chunk_res = _batch_fwm(start, end)
             if use_gpu:
                 out[start:end, :] = to_host(chunk_res)
