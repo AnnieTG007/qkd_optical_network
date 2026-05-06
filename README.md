@@ -78,11 +78,15 @@ print("SpRS 前向噪声:", noise["sprs_fwd"])
 |------|------|
 | `--type` | 噪声类型：`fwm`, `sprs`, `both`, `only_signal`, `with_signal` |
 | `--modulation` | 调制格式：`dp-16qam`（默认，DP-16QAM Raised Cosine + OSA），`ook`（NRZ-OOK + OSA OOK） |
-| `--resolution` | 噪声频率网格分辨率 [Hz]，默认 1e9（1 GHz，仅 `plot_noise_dash_ch.py`） |
+| `--resolution` | 噪声频率网格分辨率 [Hz]，默认 1e8（100 MHz，仅 `plot_noise_dash_ch.py`） |
 | `--data-rate` | 比特率 [bps]，默认 200e9（DP-16QAM）/ 10.3e9（OOK） |
 | `--active-threshold-db` | FWM 活跃频率 bin 阈值 [dB]，默认 -50 |
 | `--skr-profile` | SKR 配置 profile：`custom`（默认）/ `reference` |
 | `--skr-model` | SKR 模型：`approx_finite`（默认），`infinite`，`strict_finite` |
+| `--profile-only` | 仅跑 0 dBm profile 后退出 |
+| `--profile-length-count` | `--profile-only` 的采样长度数，默认 3 |
+| `--models` | 逗号分隔的模型 key，如 `rc_beta05,osa`（默认全部） |
+| `--power-levels` | 逗号分隔的功率级别 dBm，如 `-5,0,5`（默认 -15..0） |
 | `--export-excel` | 预计算后导出 Excel 文件并退出（不启动 Dash 服务器） |
 | `--export-only` | `--export-excel` 的简写 |
 
@@ -182,7 +186,22 @@ python scripts/plot_noise_dash_ch.py \
 
 修改 `fiber_para/fiber_smf.yaml` 中的任意字段（衰减系数 $\alpha$、非线性系数 $\gamma$、色散参数 $D$ 等）。
 
-### 5. BB84 SKR 参数
+#### 量子接收带宽
+
+`wdm_100ghz.yaml` 中 `B_q`（量子接收带宽，默认 1 GHz）独立于 `B_s`（经典符号速率 25 GBaud）：
+```yaml
+B_s: 2.5e+10   # 经典符号速率 25 GBaud
+B_q: 1.0e+9    # 量子接收带宽 1 GHz（用于噪声积分）
+```
+
+### 5. SKR 分析脚本
+
+```bash
+# SKR 批量分析（参数扫描）
+python scripts/analyze_skr_variation.py
+```
+
+### 6. BB84 SKR 参数
 
 BB84 安全码率配置统一管理于 `skr_para/bb84_config.yaml`，支持两种预设：
 
@@ -271,9 +290,10 @@ src/qkd_sim/
     ├── units.py           # 单位转换
     └── gpu_utils.py       # CuPy/NumPy 自动切换
 scripts/
-├── plot_noise_dash_len.py # Dash App 1
-├── plot_noise_dash_ch.py  # Dash App 2
-└── dash_utils.py          # 共享常量和辅助函数
+├── plot_noise_dash_len.py     # Dash App 1
+├── plot_noise_dash_ch.py      # Dash App 2
+├── analyze_skr_variation.py   # SKR 批量参数分析
+└── dash_utils.py              # 共享常量和辅助函数
 docs/
 ├── formulas_signal.md     # 信号建模公式
 ├── formulas_fwm.md        # FWM 噪声公式
